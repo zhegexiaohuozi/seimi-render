@@ -1,0 +1,270 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1f2329;
+  --muted: #8a9099;
+  --border: #e5e8eb;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-disabled: #b4c7f5;
+  --success: #16a34a;
+  --success-bg: #dcfce7;
+  --danger: #dc2626;
+  --danger-bg: #fee2e2;
+  --row-hover: #f5f7fa;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+.app {
+  width: 380px;
+  max-height: 560px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- 头部 ---------- */
+.header {
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 语言切换按钮 */
+.lang-btn {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  background: #f1f3f5;
+  border: 1px solid transparent;
+  padding: 2px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  line-height: 1.6;
+  transition: background 0.15s, color 0.15s;
+}
+.lang-btn:hover {
+  background: #e7eaee;
+  color: var(--fg);
+}
+.lang-btn:active {
+  background: #dfe3e8;
+}
+.header h1 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 500;
+}
+.badge-unknown { background: #f1f3f5; color: var(--muted); }
+.badge-ok      { background: var(--success-bg); color: var(--success); }
+.badge-err     { background: var(--danger-bg); color: var(--danger); }
+.badge-warn    { background: #fef3c7; color: #b45309; animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+.endpoint input:focus { border-color: var(--primary); }
+
+.endpoint { display: flex; flex-direction: column; gap: 3px; }
+.endpoint-label { font-size: 11px; color: var(--muted); }
+.endpoint-label .hint { font-weight: normal; color: var(--muted); }
+.endpoint input {
+  font-size: 12px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+.endpoint input:focus { border-color: var(--primary); }
+
+/* ---------- 工具栏 ---------- */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.select-all {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.search {
+  flex: 1;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  min-width: 0;
+}
+.search:focus { border-color: var(--primary); }
+.summary {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ---------- 列表 ---------- */
+.list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 120px;
+  max-height: 360px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  cursor: pointer;
+  border-bottom: 1px solid #f3f5f7;
+}
+.row:hover { background: var(--row-hover); }
+.row input[type="checkbox"] { flex-shrink: 0; cursor: pointer; }
+.row .domain {
+  flex: 1;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row .count {
+  font-size: 11px;
+  color: var(--muted);
+  background: #f1f3f5;
+  padding: 1px 7px;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.empty-hint {
+  padding: 24px 14px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---------- 底部 ---------- */
+.footer {
+  position: relative;       /* 建立 stacking context，让 tooltip 能盖住上方列表 */
+  z-index: 50;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;          /* 状态文字过长时换行，避免挤压按钮 */
+}
+.sync-btn {
+  flex: 1;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.sync-btn:hover:not(:disabled) { background: var(--primary-hover); }
+.sync-btn:disabled {
+  background: var(--primary-disabled);
+  cursor: not-allowed;
+}
+.sync-btn.loading {
+  background: var(--primary-disabled);
+  cursor: progress;
+}
+.clear-btn {
+  background: #fff;
+  color: var(--danger);
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.clear-btn:hover { background: var(--danger-bg); }
+
+/* ---------- 清空按钮的 tooltip ---------- */
+.clear-wrap {
+  position: relative;       /* tooltip 锚点；tooltip 绝对定位，不影响按钮布局 */
+  display: inline-flex;
+  align-items: center;
+}
+.clear-wrap .tooltip {
+  /* 默认隐藏，hover 时显示 —— 比 title 属性响应更快且可样式化。
+     向上弹出（按钮在底部），靠右对齐避免横向溢出 popup 边界。 */
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: -4px;
+  width: 210px;
+  padding: 7px 9px;
+  background: #2c3338;
+  color: #fff;
+  font-size: 11.5px;
+  line-height: 1.5;
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(4px);
+  transition: opacity 0.12s ease, transform 0.12s ease, visibility 0.12s;
+  pointer-events: none;     /* tooltip 不挡 hover */
+  z-index: 100;             /* 盖住列表/工具栏 */
+}
+.clear-wrap .tooltip b { color: #ffd66b; }   /* 强调"seimi-render"/"不会" */
+.clear-wrap:hover .tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+/* tooltip 小三角（指向按钮） */
+.clear-wrap .tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  right: 18px;
+  border: 6px solid transparent;
+  border-top-color: #2c3338;
+}
+.status {
+  width: 100%;
+  margin-top: 6px;
+  font-size: 12px;
+  text-align: center;
+  min-height: 16px;
+}
+.status.success { color: var(--success); }
+.status.error   { color: var(--danger); }
+.status.info    { color: var(--muted); }
+
+/* 滚动条美化 */
+.list::-webkit-scrollbar { width: 8px; }
+.list::-webkit-scrollbar-thumb { background: #d0d4d9; border-radius: 4px; }
+.list::-webkit-scrollbar-thumb:hover { background: #b8bdc3; }

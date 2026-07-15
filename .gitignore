@@ -1,0 +1,93 @@
+# ---- Build output & intermediate files ----
+# CMake / Ninja
+build/
+[Bb]uild/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+cmake.check_cache
+rules.ninja
+build.ninja
+.ninja_deps
+.ninja_log
+install_manifest.txt
+compile_commands.json
+
+# Compiled objects / archives / binaries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Qt / AUTOMOC / AUTOUIC / AUTORCC intermediate
+moc_*.cpp
+moc_*.h
+ui_*.h
+qrc_*.cpp
+*_autogen/
+*.autogen/
+AutogenInfo.json
+ParseCache.txt
+
+# macOS app bundle & code-signing artifacts
+*.app/
+*.dSYM/
+*.ipa
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- OS ----
+Thumbs.db
+/AGENTS.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+# Packaging / build artifacts (note: *.so / build/ already covered by C++ section above)
+dist/
+*.egg
+*.egg-info/
+.eggs/
+develop-eggs/
+sdist/
+wheels/
+pip-log.txt
+pip-delete-this-directory.txt
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ---- Logs / local runtime ----
+*.log
+*.iml
+/nul
+/docs/*.bkp
+

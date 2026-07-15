@@ -1,0 +1,10 @@
+{
+  "name": {
+    "message": "seimi-render Cookie Sync",
+    "description": "Extension name"
+  },
+  "description": {
+    "message": "Sync your Chrome login state (cookies) to the local seimi-render rendering service in one click, so renders carry your login state.",
+    "description": "Extension description"
+  }
+}

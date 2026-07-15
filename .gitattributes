@@ -1,0 +1,7 @@
+# Windows 批处理脚本必须是 CRLF 行尾，否则 cmd 解析异常
+#（LF 行尾会导致多行被拼成一行，产生 "xxx 不是内部命令" 的乱码错误）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# shell 脚本必须是 LF 行尾（Unix 规范）
+*.sh text eol=lf

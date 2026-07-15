@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- seimi-render favicon：渐变方块底 + 居中大闪电。
+       设计原则：16px favicon 可识别 —— 单一主视觉、大色块、高对比。
+       闪电既代表"渲染/快速"，也是高辨识度图形，居中填充 ~70% 画面。 -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- 居中大闪电：顶宽底尖，占据画面主体，白填充 + 蓝描边强化轮廓 -->
+  <path d="M72 18 L34 74 H60 L54 110 L94 50 H68 Z"
+        fill="#fff" stroke="#1e3a8a" stroke-width="3" stroke-linejoin="round"/>
+</svg>

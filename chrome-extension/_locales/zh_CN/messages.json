@@ -1,0 +1,10 @@
+{
+  "name": {
+    "message": "seimi-render Cookie 同步",
+    "description": "扩展名称"
+  },
+  "description": {
+    "message": "一键把 Chrome 的登录态（cookies）同步到本地的 seimi-render 渲染服务，让渲染能带上你的登录状态。",
+    "description": "扩展描述"
+  }
+}

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>seimi-render Cookie Sync</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app">
+    <!-- 固定顶部：标题 + 语言切换 + 端点 -->
+    <header class="header">
+      <div class="title-row">
+        <h1 data-i18n="headerTitle">Cookie 同步</h1>
+        <div class="header-actions">
+          <button id="lang-btn" class="lang-btn" type="button" data-i18n="langToggle" title="Switch language / 切换语言">English</button>
+          <span id="conn-badge" class="badge badge-unknown" data-i18n-title="connBadgeTitle" title="seimi-render 连接状态"><span data-i18n="connChecking">检测中</span></span>
+        </div>
+      </div>
+      <label class="endpoint">
+        <span class="endpoint-label" data-i18n="endpointLabel">seimi-render 端点</span>
+        <input id="endpoint" type="text" data-i18n-ph="endpointPh" placeholder="http://localhost:8088" spellcheck="false">
+      </label>
+      <label class="endpoint">
+        <span class="endpoint-label" data-i18n-html="tokenLabel">访问 token <span class="hint">（设了 --password 才需填，否则留空）</span></span>
+        <input id="token" type="password" data-i18n-ph="tokenPlaceholder" placeholder="（未设密码则留空）" spellcheck="false" autocomplete="off">
+      </label>
+    </header>
+
+    <!-- 工具栏：全选 + 搜索 + 统计 -->
+    <div class="toolbar">
+      <label class="select-all">
+        <input id="select-all" type="checkbox">
+        <span data-i18n="selectAll">全选</span>
+      </label>
+      <input id="search" type="text" class="search" data-i18n-ph="searchPlaceholder" placeholder="搜索域名…">
+      <span id="summary" class="summary" data-i18n="summaryLoading">载入中…</span>
+    </div>
+
+    <!-- 域名列表（滚动） -->
+    <div id="list" class="list">
+      <div class="empty-hint" data-i18n="listLoadingHint">正在读取浏览器 cookie…</div>
+    </div>
+
+    <!-- 固定底部：同步按钮 + 状态 -->
+    <footer class="footer">
+      <button id="sync-btn" class="sync-btn" disabled data-i18n="syncBtn">一键同步</button>
+      <span class="clear-wrap">
+        <button id="clear-btn" class="clear-btn" data-i18n="clearBtn">清空服务端</button>
+        <span class="tooltip" data-i18n-html="tooltip">清除 <b>seimi-render 渲染服务</b>上已同步的登录态 cookie。<br>
+        <b>不会</b>影响你 Chrome 浏览器本身的 cookie。</span>
+      </span>
+      <div id="status" class="status"></div>
+    </footer>
+  </div>
+  <script src="i18n.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

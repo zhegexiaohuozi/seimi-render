@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title data-i18n="brand.title">seimi-render 控制台</title>
+  <link rel="icon" type="image/svg+xml" href="/ui/favicon.svg">
+  <link rel="icon" type="image/x-icon" href="/ui/favicon.ico">
+  <link rel="apple-touch-icon" href="/ui/favicon.svg">
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <!-- 登录遮罩（仅密码模式显示） -->
+  <div id="login-overlay" class="login-overlay hidden">
+    <div class="login-card">
+      <h2>seimi-render</h2>
+      <p class="login-hint" data-i18n="login.hint">控制台安全访问验证</p>
+      <form id="login-form">
+        <input id="login-password" type="password" data-i18n-placeholder="login.placeholder" placeholder="请输入管理密码" autocomplete="current-password" autofocus>
+        <button type="submit" data-i18n="login.submit">登录系统</button>
+        <div id="login-error" class="login-error"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div class="brand">
+        <svg viewBox="0 0 128 128" width="22" height="22" role="img" aria-label="seimi-render">
+          <defs>
+            <linearGradient id="brand-bg" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#3b82f6"/>
+              <stop offset="1" stop-color="#1d4ed8"/>
+            </linearGradient>
+          </defs>
+          <rect width="128" height="128" rx="28" fill="url(#brand-bg)"/>
+          <path d="M72 18 L34 74 H60 L54 110 L94 50 H68 Z" fill="#fff" stroke="#1e3a8a" stroke-width="3" stroke-linejoin="round"/>
+        </svg>
+        seimi-render <span class="brand-sub" data-i18n="brand.sub">控制台</span>
+      </div>
+      <nav class="tabs">
+        <button class="tab active" data-tab="stats">
+          <svg viewBox="0 0 24 24"><path d="M3 3v18h18M7 14l4-4 4 4 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+          <span data-i18n="tab.stats">运行时统计</span>
+        </button>
+        <button class="tab" data-tab="render">
+          <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-18 0 9 9 0 0118 0zM12 8v4l3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+          <span data-i18n="tab.render">渲染测试台</span>
+        </button>
+        <button class="tab" data-tab="cookies">
+          <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 010 16zm-1-11a1 1 0 112 0 1 1 0 01-2 0zm0 4a1 1 0 112 0 1 1 0 01-2 0z" fill="currentColor"/></svg>
+          <span data-i18n="tab.cookies">Cookie 状态</span>
+        </button>
+        <button class="tab" data-tab="mcp">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+          <span data-i18n="tab.mcp">配置示例</span>
+        </button>
+        <button class="tab" data-tab="docs">
+          <svg viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 016.5 17H20M4 19.5A2.5 2.5 0 004 4h16v13H6.5A2.5 2.5 0 004 19.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+          <span data-i18n="tab.docs">接口文档</span>
+        </button>
+      </nav>
+      <div class="topbar-right">
+        <button id="lang-toggle" class="lang-toggle" data-i18n-title="lang.title" title="切换语言 / Switch language">
+          <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 0c3 3 3 17 0 20M2 12h20M4 7h16M4 17h16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>
+          <span data-i18n="lang.toggle">EN</span>
+        </button>
+        <span id="conn-indicator" class="conn-dot" data-i18n-title="conn.title" title="连接状态"></span>
+      </div>
+    </header>
+
+    <main class="content">
+      <!-- 页签 1：运行时统计 -->
+      <section id="tab-stats" class="tab-panel active">
+        <div class="cards" id="stats-cards"></div>
+        <div class="section">
+          <h3><span data-i18n="stats.title">渲染负载</span> <span class="muted small" style="font-weight:normal; margin-left:4px;" data-i18n="stats.realtime">(实时)</span></h3>
+          <div id="stats-workload" class="proxy-body">
+            <p class="muted small" data-i18n="common.loading">加载中…</p>
+          </div>
+        </div>
+        <div class="section proxy-section" id="stats-proxy-section">
+          <h3>
+            <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 010 16zm-1-12h2v5h-2zm0 7h2v2h-2z" fill="currentColor"/></svg>
+            <span data-i18n="proxy.title">网络代理</span>
+            <span id="stats-proxy-badge" class="proxy-badge proxy-badge-off" data-i18n="proxy.off">未启用</span>
+          </h3>
+          <div id="stats-proxy-body" class="proxy-body">
+            <p class="muted small" data-i18n="common.loading">加载中…</p>
+          </div>
+        </div>
+        <div class="section">
+          <h3><span data-i18n="stats.latency.title">延迟分布</span> <span class="muted small" style="font-weight:normal; margin-left:4px;" data-i18n="stats.latency.subtitle">(成功任务 / ms)</span></h3>
+          <div id="stats-latency" class="latency-bars"></div>
+        </div>
+        <div class="section">
+          <h3 data-i18n="stats.outputs.title">输出类型需求</h3>
+          <div id="stats-outputs" class="output-bars"></div>
+        </div>
+        <div class="section">
+          <h3><span data-i18n="stats.domains.title">域名分布 Top</span> <span class="muted small" style="font-weight:normal; margin-left:4px;" data-i18n="stats.domains.subtitle">(按请求数)</span></h3>
+          <div class="table-wrap">
+            <table id="stats-domains" class="data-table">
+              <thead><tr><th data-i18n="stats.domains.colDomain">目标域名</th><th class="num" data-i18n="stats.domains.colTotal">总请求</th><th class="num" data-i18n="stats.domains.colSuccess">成功</th><th class="num" data-i18n="stats.domains.colFail">失败</th><th class="num" data-i18n="stats.domains.colRate">成功率</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="section">
+          <h3>
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6h16V4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2H4zm16 12H4V8h16v10zM6 10h8v2H6zm0 4h8v2H6zm10-4h2v6h-2z" fill="currentColor"/></svg>
+            <span data-i18n="stats.env.title">运行环境</span>
+            <span id="stats-env-sampled" class="muted small" style="font-weight:normal; margin-left:4px;"></span>
+            <button id="env-copy-btn" class="copy-btn" type="button" data-i18n="stats.env.copy">📋 拷贝</button>
+            <span id="env-copy-status" class="copy-status"></span>
+          </h3>
+          <div id="stats-env" class="env-grid">
+            <p class="muted small" data-i18n="common.loading">加载中…</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 页签 2：渲染测试台 -->
+      <section id="tab-render" class="tab-panel">
+        <form id="render-form" class="render-form">
+          <label class="field">
+            <span data-i18n="render.url">目标 URL</span>
+            <input id="render-url" type="text" placeholder="https://example.com/" required>
+          </label>
+          <div class="field-row">
+            <label class="field">
+              <span data-i18n="render.settle">等待延迟 (Settle MS)</span>
+              <input id="render-settle" type="number" value="2000" min="0" max="30000">
+            </label>
+            <label class="field">
+              <span data-i18n="render.longpoll">长轮询超时 (Long Poll MS)</span>
+              <input id="render-longpoll" type="number" value="30000" min="0" max="60000">
+            </label>
+          </div>
+          <div class="field" style="margin-top: 8px;">
+            <span data-i18n="render.outputs">输出格式选择</span>
+            <div class="checks">
+              <label><input type="checkbox" id="out-html" checked> <span data-i18n="render.outHtml">HTML 结构</span></label>
+              <label><input type="checkbox" id="out-markdown"> <span data-i18n="render.outMd">Markdown 文本</span></label>
+              <label><input type="checkbox" id="out-pdf"> <span data-i18n="render.outPdf">页面 PDF</span></label>
+              <label><input type="checkbox" id="out-screenshot"> <span data-i18n="render.outShot">截图</span></label>
+            </div>
+          </div>
+          <div class="field" style="margin-top: 8px;">
+            <span><span data-i18n="render.shotFmt">截图编码格式</span> <small class="muted" data-i18n="render.shotFmtHint">（仅勾选截图时生效）</small></span>
+            <div class="checks">
+              <label><input type="radio" name="shot-fmt" value="auto" checked> <span data-i18n="render.shotFmt.auto">自动</span> <small class="muted" data-i18n="render.shotFmt.autoHint">（按图片占比智能选择）</small></label>
+              <label><input type="radio" name="shot-fmt" value="png"> <span data-i18n="render.shotFmt.png">PNG</span> <small class="muted" data-i18n="render.shotFmt.pngHint">（无损）</small></label>
+              <label><input type="radio" name="shot-fmt" value="jpg"> <span data-i18n="render.shotFmt.jpg">JPEG</span> <small class="muted" data-i18n="render.shotFmt.jpgHint">（照片页体积小）</small></label>
+            </div>
+          </div>
+          <div class="field" style="margin-top: 8px;">
+            <span><span data-i18n="render.mdAlg">Markdown 正文算法</span> <small class="muted" data-i18n="render.mdAlgHint">（仅勾选 Markdown 时生效）</small></span>
+            <div class="checks">
+              <label><input type="radio" name="md-alg" value="conservative" checked> <span data-i18n="render.mdAlg.conservative">保守</span> <small class="muted" data-i18n="render.mdAlg.conservativeHint">（默认，零误伤）</small></label>
+              <label><input type="radio" name="md-alg" value="readability"> <span data-i18n="render.mdAlg.readability">Readability</span> <small class="muted" data-i18n="render.mdAlg.readabilityHint">（正文定位，剔除非正文）</small></label>
+            </div>
+          </div>
+          <div class="field" style="margin-top: 8px;">
+            <span><span data-i18n="render.extract">站点特定提取</span> <small class="muted" data-i18n="render.extractHint">（结构化提取搜索结果，与 Markdown 互斥）</small></span>
+            <div class="checks">
+              <label><input type="radio" name="extract" value="" checked> <span data-i18n="render.extract.off">关闭</span> <small class="muted" data-i18n="render.extract.offHint">（默认）</small></label>
+              <label><input type="radio" name="extract" value="baidu_serp"> <span data-i18n="render.extract.baidu">百度搜索结果</span> <small class="muted" data-i18n="render.extract.baiduHint">（去广告，结构化）</small></label>
+              <label><input type="radio" name="extract" value="bing_serp"> <span data-i18n="render.extract.bing">必应搜索结果</span> <small class="muted" data-i18n="render.extract.bingHint">（结构化）</small></label>
+              <label><input type="radio" name="extract" value="google_serp"> <span data-i18n="render.extract.google">Google 搜索结果</span> <small class="muted" data-i18n="render.extract.googleHint">（结构化）</small></label>
+            </div>
+          </div>
+          <div class="render-actions">
+            <button type="submit" id="render-submit" data-i18n="render.submit">提交渲染任务</button>
+            <button type="button" id="render-copy-curl" data-i18n="render.copyCurl">拷贝 curl</button>
+          </div>
+        </form>
+        <div id="render-status" class="render-status"></div>
+        <div id="render-result" class="render-result">
+          <div class="muted" style="text-align: center; padding: 40px 0;" data-i18n="render.placeholder">等待执行渲染...</div>
+        </div>
+      </section>
+
+      <!-- 页签 3：Cookie 状态 -->
+      <section id="tab-cookies" class="tab-panel">
+        <div class="section-head">
+          <div>
+            <h3 data-i18n="cookies.title">已同步 Cookie 概览</h3>
+            <p class="muted small" style="margin-top: 4px;" data-i18n="cookies.desc">服务端持有的渲染用登录态凭证（仅展示域名与数量，不涉及敏感明文）。</p>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <button id="cookie-clear" class="btn-danger" data-i18n="cookies.clear">清空当前会话</button>
+            <button id="cookie-purge" class="btn-danger" data-i18n="cookies.purge">永久删除</button>
+          </div>
+        </div>
+        <p class="muted small" style="margin-bottom:16px;" data-i18n-html="cookies.encrypted">🔒 已加密持久化到 <code>data/cookies.dat</code>（AES-256-CBC + HMAC），重启自动恢复登录态。</p>
+        <div class="table-wrap">
+          <table id="cookies-table" class="data-table">
+            <thead><tr><th data-i18n="cookies.colDomain">域名 (Domain)</th><th class="num" data-i18n="cookies.colCount">携带 Cookie 数量</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="note">
+          <h4 data-i18n="cookies.howto.title">如何同步浏览器登录态？</h4>
+          <ol>
+            <li data-i18n-html="cookies.howto.step1">安装配套的 Chrome 插件：<code>chrome-extension/</code>（详见项目代码仓库）</li>
+            <li data-i18n-html="cookies.howto.step2">在浏览器中正常登录目标网站，点击插件图标，勾选当前域名进行一键同步</li>
+            <li data-i18n-html="cookies.howto.step3">同步完成后，列表将会实时刷新，seimi-render 在抓取这些域名时将自动携带有效身份</li>
+          </ol>
+        </div>
+      </section>
+
+      <!-- 页签 4：配置示例 -->
+      <section id="tab-mcp" class="tab-panel">
+        <h3 data-i18n="mcp.token.title">访问 Token</h3>
+        <div id="token-card" class="token-card">
+          <div id="token-status-text" class="token-status"></div>
+          <div class="token-value-row">
+            <input id="token-value" type="text" readonly data-i18n-placeholder="mcp.token.placeholder" placeholder="（未启用密码，无 token）">
+            <button id="token-copy" class="btn-copy-inline" data-copy-target="token-value" data-i18n="mcp.token.copy">复制</button>
+          </div>
+          <p id="token-desc" class="muted small"></p>
+        </div>
+
+        <div style="margin-top: 28px;">
+          <h3 data-i18n="mcp.title">MCP 接入配置</h3>
+          <p class="muted" style="margin-top: 6px;" data-i18n="mcp.intro">将以下配置参数注入对应 AI Agent 的工具链，即可赋予模型实时渲染解析网页的能力。</p>
+          <p id="mcp-auth-hint" class="muted small" style="margin-top: 4px;"></p>
+        </div>
+
+        <div class="field-row" style="margin-top: 16px;">
+          <label class="field">
+            <span data-i18n="mcp.endpoint">当前 MCP 服务 Endpoint</span>
+            <input id="mcp-url" type="text" readonly>
+          </label>
+        </div>
+        <div class="section">
+          <h4><span data-i18n="mcp.claude">Claude Code</span> <span class="muted small" style="font-weight:normal; margin-left:4px;" data-i18n="mcp.claudeHint">(位于 ~/.claude.json 或项目 .mcp.json)</span></h4>
+          <div class="code-block">
+            <pre id="mcp-claude"></pre>
+            <button class="btn-copy" data-copy-target="mcp-claude" data-i18n="mcp.token.copy">复制</button>
+          </div>
+        </div>
+        <div class="section">
+          <h4><span data-i18n="mcp.cursor">Cursor</span> <span class="muted small" style="font-weight:normal; margin-left:4px;" data-i18n="mcp.cursorHint">(Settings → MCP Servers)</span></h4>
+          <div class="code-block">
+            <pre id="mcp-cursor"></pre>
+            <button class="btn-copy" data-copy-target="mcp-cursor" data-i18n="mcp.token.copy">复制</button>
+          </div>
+        </div>
+
+        <h3 style="margin-top:40px; padding-top: 32px; border-top: 1px solid var(--border);" data-i18n="mcp.httpTitle">HTTP 接口调用示例</h3>
+        <p class="muted" id="api-hint" style="margin-top: 6px;"></p>
+        <div class="api-tabs">
+          <button class="api-tab active" data-api="render" data-i18n="api.tab.render">渲染 /render</button>
+          <button class="api-tab" data-api="status" data-i18n="api.tab.status">状态 /status</button>
+          <button class="api-tab" data-api="cookies" data-i18n="api.tab.cookies">Cookie /cookies</button>
+          <button class="api-tab" data-api="pdf" data-i18n="api.tab.pdf">PDF /pdf</button>
+          <button class="api-tab" data-api="screenshot" data-i18n="api.tab.screenshot">截图 /image</button>
+          <button class="api-tab" data-api="markdown" data-i18n="api.tab.markdown">Markdown</button>
+        </div>
+        <div class="code-block" style="margin-top:12px">
+          <pre id="api-example"></pre>
+          <button class="btn-copy" data-copy-target="api-example" data-i18n="mcp.token.copy">复制</button>
+        </div>
+      </section>
+
+      <!-- 页签 5：接口文档 -->
+      <section id="tab-docs" class="tab-panel">
+        <div class="docs-layout">
+          <aside class="docs-sidebar" id="docs-nav"></aside>
+          <div class="docs-detail" id="docs-detail">
+            <div class="muted" style="padding:40px;text-align:center" data-i18n="docs.loading">加载接口文档中...</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/ui/i18n.js"></script>
+  <script src="/ui/app.js"></script>
+  <script src="/ui/docs.js"></script>
+</body>
+</html>
