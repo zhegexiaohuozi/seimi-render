@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+// SPDX-License-Identifier: Apache-2.0
+
 // seimi-render Cookie 同步插件
 //
 // 流程：chrome.cookies.getAll({}) -> 按 domain 聚合 -> 渲染勾选列表（默认全选）

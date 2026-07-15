@@ -1,3 +1,6 @@
+REM SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+REM SPDX-License-Identifier: Apache-2.0
+
 @echo off
 REM Runtime resources not covered by import-table scan (Qt/Chromium
 REM load these dynamically via LoadLibrary / file paths at runtime, so

@@ -1,0 +1,50 @@
+seimi-render
+Copyright 2026 wanghaomiao.cn (et.tw@163.com)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+
+------------------------------------------------------------------------------
+THIRD-PARTY DEPENDENCIES
+------------------------------------------------------------------------------
+
+This product includes software developed by third parties. Their licenses
+are reproduced or referenced below; all copyright notices are retained in
+their respective source files under third_party/.
+
+  Qt 6 (Qt WebEngine, Qt Network, Qt WebSockets, ...)
+    Copyright (c) The Qt Company Ltd and its contributors.
+    License: GNU LGPL v3 (open-source option) / Commercial.
+    Web: https://www.qt.io/
+    Notes: Qt WebEngine embeds Chromium, which is licensed under BSD-style
+           terms (see qtwebengine-licensing.html). The Qt-specific parts of
+           Qt WebEngine are dual-licensed under Commercial / LGPL v3.
+
+  cpp-mcp  (third_party/cpp-mcp/)
+    Copyright (c) 2024-2025 The cpp-mcp authors.
+    License: MIT.
+
+  cpp-httplib  (third_party/httplib.h)
+    Copyright (c) 2026 Yuji Hirose. All rights reserved.
+    License: MIT.
+
+  html2md + table  (third_party/html2md.{h,cpp}, third_party/table.{h,cpp})
+    Copyright (c) Tim Gromeyer.
+    License: MIT.
+
+  qaes  (third_party/qaes/)
+    License: Public Domain (unlicensed).
+
+  Mozilla Readability  (third_party/readability/Readability.js, extract.js)
+    Copyright (c) Mozilla Corporation and individual contributors.
+    License: Apache License 2.0.

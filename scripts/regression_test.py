@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+# SPDX-License-Identifier: Apache-2.0
+
 """
 seimi-render 全接口自动回测脚本。
 

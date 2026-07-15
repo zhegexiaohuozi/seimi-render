@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+# SPDX-License-Identifier: Apache-2.0
+
 # =============================================================
 # seimi-render macOS 构建环境准备脚本
 #

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+// SPDX-License-Identifier: Apache-2.0
+
 #include "Metrics.h"
 #include "RenderTask.h"
 

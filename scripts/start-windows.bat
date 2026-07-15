@@ -1,3 +1,6 @@
+REM SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+REM SPDX-License-Identifier: Apache-2.0
+
 @echo off
 cd /d "%~dp0"
 

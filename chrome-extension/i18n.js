@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+// SPDX-License-Identifier: Apache-2.0
+
 // seimi-render Cookie 同步插件 —— 国际化（i18n）
 //
 // 支持中文（zh）和英文（en）。默认跟随 Chrome 界面语言：中文（任意 zh-*）→ zh，其余 → en。

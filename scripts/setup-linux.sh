@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+# SPDX-License-Identifier: Apache-2.0
+
 # =============================================================
 # seimi-render Linux/WSL 构建环境准备脚本（Ubuntu 22.04）
 #

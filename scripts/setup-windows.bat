@@ -1,3 +1,6 @@
+REM SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+REM SPDX-License-Identifier: Apache-2.0
+
 @echo off
 REM =============================================================
 REM seimi-render Windows build environment setup (Windows 10/11 x64)

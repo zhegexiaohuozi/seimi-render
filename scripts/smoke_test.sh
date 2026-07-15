@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+# SPDX-License-Identifier: Apache-2.0
+
 # =============================================================
 # seimi-render 冒烟测试脚本
 # 验证：健康检查、单任务渲染、长轮询、并发、WebSocket 推送

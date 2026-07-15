@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+# SPDX-License-Identifier: Apache-2.0
+
 """一次性：用 seimi-render 渲染媒体站点首页，提取文章链接组成压测 URL 池。
 输出 Python 字面量到 stdout，便于直接内嵌进 soak_test.py。"""
 import json

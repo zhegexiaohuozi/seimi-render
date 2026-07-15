@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+ SPDX-License-Identifier: Apache-2.0
+-->
 # seimi-render Cookie 同步插件
 
 一键把 Chrome 的登录态（cookies）同步到本地的 [seimi-render](../README.md) 渲染服务，让渲染带上你的登录状态——这样 seimi-render 就能渲染需要登录的页面（你已登录的后台、付费内容、个人主页等）。

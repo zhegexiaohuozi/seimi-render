@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+# SPDX-License-Identifier: Apache-2.0
+
 # Helper: download + extract a Qt 6.7.2 addon module archive into the Qt tree.
 # Works around the aqtinstall v3.3.0 metadata bug for addon modules
 # (qtwebsockets / qtwebchannel / qtpdf / qtpositioning) by fetching the

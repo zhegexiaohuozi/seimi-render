@@ -980,3 +980,21 @@ sequenceDiagram
     Note over WC: 再用 HTTP /result/:id 取产物
 ```
 
+## License
+
+本项目（seimi-render 自有源码，位于 [`src/`](./src/)、[`scripts/`](./scripts/)、[`chrome-extension/`](./chrome-extension/)）采用 **Apache License 2.0** 开源，版权所有 © 2026 [wanghaomiao.cn](mailto:et.tw@163.com)。协议全文见 [`LICENSE`](./LICENSE)，归属声明见 [`NOTICE`](./NOTICE)。
+
+### 第三方依赖
+
+本项目使用以下第三方组件，其许可协议各自独立、版权声明保留在对应源文件中：
+
+| 依赖 | 用途 | 协议 |
+|------|------|------|
+| [Qt 6](https://www.qt.io/)（Qt WebEngine / Network / WebSockets 等） | Chromium 渲染核心、网络栈 | **LGPL v3**（开源选项）/ 商业双授权 |
+| [cpp-mcp](./third_party/cpp-mcp/) | MCP 协议实现 | MIT |
+| [cpp-httplib](./third_party/httplib.h) | HTTP 服务 | MIT |
+| [html2md](./third_party/html2md.cpp) / [table](./third_party/table.cpp) | HTML→Markdown 转换 | MIT |
+| [qaes](./third_party/qaes/) | AES 加密 | Public Domain |
+| [Mozilla Readability](./third_party/readability/) | 正文提取 | Apache License 2.0 |
+
+

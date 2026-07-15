@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+// SPDX-License-Identifier: Apache-2.0
+
 // seimi-render: Qt WebEngine 渲染服务。
 // 提交 URL -> WebEngine 渲染 -> 返回 HTML/Markdown/PDF/截图，支持长轮询与 WebSocket 推送。
 //
