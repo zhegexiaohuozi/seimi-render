@@ -24,7 +24,7 @@ This project is the modern successor to [SeimiAgent](https://github.com/zhegexia
 
 ## Architecture
 
-![Architecture](architecture.drawio.png)
+![Architecture](architecture.en.png)
 
 ## Build & Run
 

@@ -3,6 +3,12 @@
 
 #include "McpServer.h"
 
+// 版本号统一来自 CMakeLists.txt 的 project(VERSION)，编译期由 SEIMI_VERSION 宏注入。
+// 这里补 fallback：不经过 CMake 直接编译本文件时（如单文件 lint/IDE 分析）也能解析。
+#ifndef SEIMI_VERSION
+#define SEIMI_VERSION "unknown"
+#endif
+
 #include "TokenCompare.h"
 
 #include <httplib.h>
@@ -149,7 +155,7 @@ bool McpServer::start(const std::string& host, int port,
     conf.session_timeout = 3600;
 
     m_impl->srv = std::make_unique<mcp::server>(conf);
-    m_impl->srv->set_server_info("seimi-render", "1.0.0");
+    m_impl->srv->set_server_info("seimi-render", SEIMI_VERSION);
 
     // [seimi patch] 接入层鉴权：启用密码时 MCP 端口每个请求都要带 token。
     // cpp-mcp 上游 set_auth_handler 是空 stub，已在 fork 的 mcp_server.cpp 补上 enforce_auth_。
