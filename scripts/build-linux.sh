@@ -1,21 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 # SPDX-License-Identifier: Apache-2.0
-
-# =============================================================
+#
 # seimi-render Linux 裸编译脚本（Ninja + Qt6）
-#
-# 用法（在 WSL / Linux 内）:
-#   bash scripts/build-linux.sh              # 默认 Release
-#   bash scripts/build-linux.sh Debug
-#   sh scripts/build-linux.sh                # 也行——脚本会自动用 bash 重跑
-#
-# 可调环境变量：
-#   QT_PREFIX=/opt/Qt/6.7.2/gcc_64   Qt 安装路径（setup-linux.sh 默认值）
-#   BUILD_DIR=build                  构建目录
-#   BUILD_TYPE=Release               默认构建类型（被位置参数覆盖）
-# =============================================================
-# 兼容：若被 sh(dash) 调用，自动用 bash 重跑自身（脚本用了 pipefail 等 bash 特性）。
+#   bash scripts/build-linux.sh [Release|Debug]
+# 环境变量: QT_PREFIX, BUILD_DIR, BUILD_TYPE
+# 若被 sh 调用，自动用 bash 重跑（脚本用了 pipefail 等 bash 特性）。
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
@@ -39,17 +29,12 @@ if [[ ! -x "$QT_PREFIX/bin/qmake" ]]; then
     exit 1
 fi
 
-# 缓存一致性检查：若 build/CMakeCache.txt 里记的源码路径与当前 ROOT_DIR 不一致
-# （典型场景：项目目录在 Windows/WSL 或不同机器间共享、拷贝），CMake 会直接报错
-# 拒绝复用缓存。这里提前检测并清掉脏缓存，自动重新 configure。
+# 脏缓存检测：项目目录移动/拷贝后 CMakeCache 记录的源码路径失效，CMake 会拒绝复用。
 if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
     CACHE_SRC="$(grep -m1 '^CMAKE_HOME_DIRECTORY:' "$BUILD_DIR/CMakeCache.txt" \
                  | sed 's/^CMAKE_HOME_DIRECTORY:[^=]*=//')"
     if [[ -n "$CACHE_SRC" && "$CACHE_SRC" != "$ROOT_DIR" ]]; then
-        echo "[WARN] stale CMake cache detected:"
-        echo "         cache recorded source : $CACHE_SRC"
-        echo "         current  source       : $ROOT_DIR"
-        echo "       wiping $BUILD_DIR to reconfigure."
+        echo "[WARN] stale CMake cache detected, wiping $BUILD_DIR to reconfigure."
         rm -rf "$BUILD_DIR"
         mkdir -p "$BUILD_DIR"
     fi

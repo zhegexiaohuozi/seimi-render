@@ -2,16 +2,14 @@ REM SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 REM SPDX-License-Identifier: Apache-2.0
 
 @echo off
-REM Runtime resources not covered by import-table scan (Qt/Chromium
-REM load these dynamically via LoadLibrary / file paths at runtime, so
-REM dumpbin /dependents can't see them -- windeployqt copies them by convention).
+REM 检查 dumpbin 看不到的运行时资源（Qt/Chromium 经 LoadLibrary/路径动态加载，
+REM windeployqt 按约定拷贝）。
 setlocal enabledelayedexpansion
 set "DIST=%~1"
 if "%DIST%"=="" set "DIST=%~dp0..\build\dist\seimi-render-win-x64"
 cd /d "%DIST%" || exit /b 1
 
 echo === WebEngine runtime resources ===
-REM Qt 6.7+ uses *_100p.pak / *_200p.pak (older was *_100_percent.pak)
 for %%R in (
     resources\icudtl.dat
     resources\qtwebengine_resources.pak
