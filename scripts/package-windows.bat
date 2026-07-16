@@ -65,7 +65,18 @@ set "QT_INSTALL_DIR=%QT_PREFIX%\%QT_VERSION%\%QT_ARCH_DIR%"
 REM SCRIPT_DIR/ROOT_DIR 已在 shift 循环之前钉死，这里直接复用变量，
 REM 不再使用 %~dp0（shift 后已退化指向调用方 cwd）。
 set "BUILD_DIR=%ROOT_DIR%\build"
-set "DIST_NAME=seimi-render-win-x64"
+
+REM 产物名带版本 + 架构（对齐 macOS package.sh / Linux package-linux.sh）。
+REM 版本从 CMakeLists.txt 的 project(VERSION) 读；架构从 QT_ARCH_DIR 提取
+REM （_64 -> x64, _32 -> x86），对齐 Linux 从二进制读架构的思路。
+REM findstr 精确匹配缩进的 "    VERSION "（4 空格），避开 cmake_minimum_required 行。
+set "APP_VERSION=unknown"
+for /f "tokens=2" %%v in ('findstr /b /c:"    VERSION " "%ROOT_DIR%\CMakeLists.txt" 2^>nul') do (
+    set "APP_VERSION=%%v"
+)
+set "WIN_ARCH=x64"
+if /i "%QT_ARCH_DIR:~-3%"=="_32" set "WIN_ARCH=x86"
+set "DIST_NAME=seimi-render-%APP_VERSION%-win-%WIN_ARCH%"
 set "DIST_DIR=%BUILD_DIR%\dist\%DIST_NAME%"
 
 echo == seimi-render packaging (Windows) ==

@@ -57,7 +57,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 DIST_ROOT="${DIST_ROOT:-$BUILD_DIR/dist}"
-DIST_NAME="${DIST_NAME:-seimi-render-linux-x64}"
+
+# 产物名带版本 + OS + 架构（对齐 macOS package.sh）。
+# 版本从 CMakeLists.txt 文本解析；架构在构建后从主二进制 ELF 头读（见 [1/5] 后），
+# 避免 uname 骗人（32 位容器/交叉编译）。DIST_NAME 可整体覆盖。
+APP_VERSION="$(tr '\n' ' ' < "$ROOT_DIR/CMakeLists.txt" \
+    | grep -oE 'project\([^)]*VERSION[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+[[ -z "$APP_VERSION" ]] && APP_VERSION="unknown"
+DIST_NAME="${DIST_NAME:-seimi-render-${APP_VERSION}-linux}"  # 架构后缀在 [1/5] 构建后追加
 DIST_DIR="$DIST_ROOT/$DIST_NAME"
 
 echo "== seimi-render packaging (Linux) =="
@@ -102,6 +110,17 @@ if [[ ! -x "$BIN_SRC" ]]; then
     echo "ERROR: binary not found at $BIN_SRC" >&2
     exit 1
 fi
+
+# 从主二进制 ELF 头读架构（比 uname 可靠：32 位容器/交叉编译下 uname 会骗人）。
+# file 输出形如 "... ELF 64-bit LSB ... x86-64" 或 "... aarch64"。
+case "$(file -b "$BIN_SRC" 2>/dev/null)" in
+    *x86-64*)   ARCH="x64" ;;
+    *aarch64*|*arm64*) ARCH="arm64" ;;
+    *)          ARCH="$(uname -m)" ;;
+esac
+# 仅当 DIST_NAME 是默认值（未整体覆盖）时才追加架构后缀。
+[[ "$DIST_NAME" == seimi-render-${APP_VERSION}-linux ]] && DIST_NAME="${DIST_NAME}-${ARCH}"
+DIST_DIR="$DIST_ROOT/$DIST_NAME"
 
 # ---- 2. 准备 bundle 目录结构 ----
 echo "== [2/5] assemble bundle layout =="
