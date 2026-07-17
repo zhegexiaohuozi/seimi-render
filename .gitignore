@@ -91,3 +91,35 @@ coverage.xml
 /nul
 /docs/*.bkp
 
+# ---- AI Agents & AI IDEs Private Directories ---
+.claude/
+claude.log
+.claude_profile/
+.zcode/
+.zcode_cache/
+.kiro/
+.kiro_cache/
+.cursor/
+.cursorrules
+.cursor_history/
+.windsurf/
+.copilot/
+.copilot-chat/
+.continue/
+.roo/
+.cline/
+roo-code-settings.json
+.aider*
+!.aider.conf.yml
+.langchain/
+.llamaindex/
+.autogen/
+.crewai/
+.openinterpreter/
+.gpteng/
+.devin/
+.deepseek/
+.chroma/
+.chromadb/
+.faiss/
+.qdrant/
