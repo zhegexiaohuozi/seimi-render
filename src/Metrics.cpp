@@ -32,10 +32,17 @@ void Metrics::addToHistogram(std::int64_t ms) {
     if (ms > m_latencyMaxMs) m_latencyMaxMs = ms;
 }
 
-void Metrics::record(std::string host, bool succeeded, std::int64_t elapsedMs, std::uint8_t outputs) {
+void Metrics::record(std::string host, bool succeeded, std::int64_t elapsedMs, std::uint8_t outputs,
+                     int blockAttempts, bool blockedFinal) {
     QMutexLocker locker(&m_mutex);
 
     ++m_total;
+
+    // 反爬拦截计数：事件总数（含重试中每次命中）/ 恢复 / 耗尽三态分开记。
+    m_blockedTotal += blockAttempts;
+    if (succeeded && blockAttempts > 0) ++m_blockedRecovered;
+    if (blockedFinal) ++m_blockedExhausted;
+
     if (succeeded) {
         ++m_succeeded;
         if (elapsedMs > 0) addToHistogram(elapsedMs);
@@ -64,6 +71,7 @@ void Metrics::record(std::string host, bool succeeded, std::int64_t elapsedMs, s
     }
     ++it->second.total;
     if (succeeded) ++it->second.succeeded; else ++it->second.failed;
+    it->second.blocked += blockAttempts;
 }
 
 Metrics::Snapshot Metrics::snapshot(int maxDomains) const {
@@ -77,6 +85,9 @@ Metrics::Snapshot Metrics::snapshot(int maxDomains) const {
     s.succeeded = m_succeeded;
     s.failed = m_total - m_succeeded;
     s.successRate = (m_total == 0) ? 0.0 : double(m_succeeded) / double(m_total);
+    s.blockedTotal = m_blockedTotal;
+    s.blockedRecovered = m_blockedRecovered;
+    s.blockedExhausted = m_blockedExhausted;
 
     // 延迟分位数：按桶累计，找到对应百分位落入的桶，桶内用线性插值。
     std::int64_t succCount = 0;
@@ -124,7 +135,7 @@ Metrics::Snapshot Metrics::snapshot(int maxDomains) const {
     std::vector<DomainStat> all;
     all.reserve(m_domains.size());
     for (const auto& kv : m_domains) {
-        all.push_back({kv.first, kv.second.total, kv.second.succeeded, kv.second.failed});
+        all.push_back({kv.first, kv.second.total, kv.second.succeeded, kv.second.failed, kv.second.blocked});
     }
     std::sort(all.begin(), all.end(), [](const DomainStat& a, const DomainStat& b) {
         return a.total > b.total;   // 按 total 倒序

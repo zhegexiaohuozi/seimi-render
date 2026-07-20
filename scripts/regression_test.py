@@ -2,23 +2,7 @@
 # SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-seimi-render 全接口自动回测脚本。
-
-一键：构建 → 起双实例（有/无密码）→ 跑 9 组约 60 条接口用例 → 终端彩色报告 + JSON 报告。
-
-用法:
-    python scripts/regression_test.py                 # 全套（构建+双实例+全测）
-    python scripts/regression_test.py --clean         # 从零清理后全量重建再测
-    python scripts/regression_test.py --skip-build    # 复用上次构建产物
-    python scripts/regression_test.py --no-auth       # 跳过 F 鉴权组
-    python scripts/regression_test.py --group B       # 只跑某组
-    python scripts/regression_test.py --case B1,B6    # 只跑指定用例
-    python scripts/regression_test.py --keep-servers  # 测完不杀进程（调试）
-    python scripts/regression_test.py --verbose       # 打印每请求/响应详情
-
-依赖: requests, websocket-client
-    pip install requests websocket-client
+"""seimi-render 全接口自动回测脚本：构建 → 起双实例(有/无密码) → 跑 9 组接口用例 → 报告。
 
 设计文档: docs/superpowers/specs/2026-06-28-regression-test-design.md
 """
@@ -57,20 +41,18 @@ NO_AUTH_PORTS = {"http": 18088, "ws": 18089, "mcp": 18090}
 AUTH_PORTS = {"http": 18188, "ws": 18189, "mcp": 18190}
 
 AUTH_PASSWORD = "testpass_2024"
-# token = sha256("seimi-render:" + password) 的 hex，与服务端 HttpServer::computeToken 一致。
+# token = sha256("seimi-render:" + password) 的 hex，须与服务端 HttpServer::computeToken 一致。
 EXPECTED_TOKEN = hashlib.sha256(("seimi-render:" + AUTH_PASSWORD).encode()).hexdigest()
 
 # 真实渲染目标（内容足够丰富，能验证 markdown/截图质量）。
 URL_SOHU = "https://www.sohu.com/"
 URL_BING_SEARCH = "https://www.bing.com/search?q=seimi+render"
 
-# 渲染等待窗口。
 RENDER_LONG_POLL_MS = 45000   # B 系列长轮询
 RENDER_HTTP_TIMEOUT = 50      # HTTP 读超时（秒），略大于长轮询窗口
 RETRY_POLL_TIMEOUT_MS = 25000 # 超时补取一次的窗口
 RETRY_POLL_HTTP_TIMEOUT = 30  # 补取的 HTTP 读超时
 
-# 实例就绪探测上限。
 BOOT_TIMEOUT = 60
 
 # 临时 cookie 测试域名（不会与真实站点冲突）。
@@ -79,16 +61,13 @@ COOKIE_TEST_DOMAIN = "regression-test.example"
 HOST = "127.0.0.1"
 
 # 构建目录（与三平台构建脚本约定一致：build/）。
-# --clean 时按平台策略清空：Windows 构建脚本自带每次清空（无需再清）；
-# Linux/macOS 直接 rm -rf 后由构建脚本重新 configure。
 BUILD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build")
 
-# 脚本自己的退出码。
 EXIT_OK = 0
 EXIT_FAIL = 1          # 有用例失败（功能回归）
 EXIT_ENV = 2           # 构建或启动失败（环境问题）
 
-# 终端颜色（非 TTY 时退化为空串，避免乱码）。
+# 非 TTY 时退化为空串，避免乱码。
 if sys.stdout.isatty():
     GREEN = "\033[32m"; RED = "\033[31m"; YELLOW = "\033[33m"
     CYAN = "\033[36m"; DIM = "\033[2m"; BOLD = "\033[1m"; RESET = "\033[0m"
@@ -97,12 +76,10 @@ else:
 
 
 def binary_candidates():
-    """按平台返回二进制候选路径列表（按优先级）。"""
     if IS_WINDOWS:
         return ["build/seimi-render.exe", "build/Release/seimi-render.exe"]
     if IS_MACOS:
-        # MACOSX_BUNDLE：二进制在 .app/Contents/MacOS/ 内。
-        # CMake 输出固定此路径（见 CMakeLists.txt add_executable + MACOSX_BUNDLE）。
+        # MACOSX_BUNDLE：CMake 固定输出到 .app/Contents/MacOS/。
         return ["build/seimi-render.app/Contents/MacOS/seimi-render"]
     return ["build/seimi-render"]
 
@@ -110,16 +87,12 @@ def binary_candidates():
 def build_script(clean=False):
     """按平台返回 (构建脚本相对路径, [额外参数])。
 
-    clean=True 时：
-      - Windows: build-windows.bat 每次自带清空，无需额外参数（参数仅用于日志提示）。
-      - macOS:   package.sh 接受 clean 关键字参数（清空 build 后全量重建 + 强制重部署）。
-      - Linux:   build-linux.sh 无 clean 参数；由 build() 在调用前 rm -rf build/。
+    clean 模式各平台差异：Windows 脚本自带每次清空；macOS package.sh 接受 clean 关键字
+    （rm -rf build + 强制重部署）；Linux build-linux.sh 无 clean 参数，由 build() 调用前 rm -rf。
     """
     if IS_WINDOWS:
         return "scripts/build-windows.bat", []
     if IS_MACOS:
-        # 复用 package.sh：clean 模式下它会 rm -rf build + 强制 macdeployqt 重部署，
-        # 产出的 .app 框架完整、二进制可直接运行。否则增量构建（~10s）。
         return "scripts/package.sh", ["clean"] if clean else []
     return "scripts/build-linux.sh", []
 
@@ -128,12 +101,10 @@ def build_script(clean=False):
 # §2 客户端封装
 # ============================================================
 class HttpResponse:
-    """轻量响应封装，便于断言与诊断。"""
     def __init__(self, status, body, headers, raw_body_bytes=None):
         self.status = status
-        self.headers = headers          # dict（小写键）
+        self.headers = headers
         self._raw_body_bytes = raw_body_bytes  # 原始字节（用于二进制魔数校验）
-        # JSON 解析（失败则存原始文本）
         try:
             self.json = json.loads(body) if body else {}
             self.text = body
@@ -150,7 +121,7 @@ class HttpResponse:
 
 
 class HttpClient:
-    """seimi-render HTTP 客户端。token 非空时自动注入 Authorization: Bearer。"""
+    """token 非空时自动注入 Authorization: Bearer。"""
 
     def __init__(self, port, token=None, verbose=False):
         self.base = f"http://{HOST}:{port}"
@@ -199,7 +170,7 @@ class HttpClient:
 
 
 class WsClient:
-    """seimi-render WebSocket 客户端。token 非空时连接 URL 带 ?token=。"""
+    """token 非空时连接 URL 带 ?token=。"""
 
     def __init__(self, port, token=None):
         url = f"ws://{HOST}:{port}/"
@@ -217,14 +188,14 @@ class WsClient:
         self.ws.send(json.dumps(obj))
 
     def recv_json(self):
-        """带超时接收一条消息并解析 JSON。超时抛 WebSocketTimeoutException。"""
+        """超时抛 WebSocketTimeoutException。"""
         if self.ws is None:
             raise RuntimeError("WsClient not connected")
         msg = self.ws.recv()
         return json.loads(msg)
 
     def recv_with_timeout(self, timeout_s):
-        """设定超时后接收一条消息，返回 (got: bool, obj_or_None)。超时返回 (False, None)。"""
+        """返回 (got: bool, obj_or_None)。超时或连接关闭均返回 (False, None)。"""
         if self.ws is None:
             return False, None
         self.ws.settimeout(timeout_s)
@@ -233,7 +204,6 @@ class WsClient:
         except websocket.WebSocketTimeoutException:
             return False, None
         except websocket.WebSocketConnectionClosedException:
-            # 服务端关闭连接
             return False, None
 
     def close(self):
@@ -246,7 +216,6 @@ class WsClient:
 
 
 class McpError(Exception):
-    """MCP JSON-RPC error。"""
     def __init__(self, err):
         self.code = err.get("code")
         self.message = err.get("message", "")
@@ -254,10 +223,9 @@ class McpError(Exception):
 
 
 class McpClient:
-    """seimi-render MCP 客户端（Streamable HTTP，raw JSON-RPC，无需 async SDK）。
+    """MCP Streamable HTTP 客户端（raw JSON-RPC）。
 
-    协议层只用到 initialize / tools/list / tools/call，直接 POST /mcp 即可。
-    Streamable HTTP 要求 initialize 后所有请求带服务端返回的 Mcp-Session-Id 头。
+    Streamable HTTP 要求 initialize 后所有请求回传服务端返回的 Mcp-Session-Id 头。
     """
 
     def __init__(self, port, verbose=False):
@@ -294,15 +262,13 @@ class McpClient:
         return j.get("result")
 
     def initialize(self):
-        """必须先调，建立 session。"""
         result = self.call("initialize", {
             "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": {"name": "regression-test", "version": "1.0"},
         })
-        # cpp-mcp Streamable HTTP 严格要求 initialize 后发一个 notifications/initialized
-        # 完成握手，否则后续 tools/list 等返回 "Session not initialized"。
-        # 该通知无 id（JSON-RPC notification），不带 result/error。
+        # cpp-mcp Streamable HTTP 严格要求 initialize 后发一个 notifications/initialized 完成握手，
+        # 否则后续 tools/list 等返回 "Session not initialized"（该通知无 id，是 JSON-RPC notification）。
         notify = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
         if self.verbose:
             print(f"    {DIM}MCP notifications/initialized{RESET}")
@@ -328,7 +294,6 @@ def _log(tag, msg):
 
 
 def find_binary():
-    """返回存在的二进制路径，找不到返回 None。"""
     for c in binary_candidates():
         if os.path.isfile(c):
             return c
@@ -338,11 +303,8 @@ def find_binary():
 def build(skip=False, clean=False):
     """调平台构建脚本。成功返回二进制路径，失败返回 None。
 
-    clean=True：从零清理后全量重建。
-      - Windows: build-windows.bat 每次自带清空，clean 仅影响日志（不重复清，免得 robocopy 跑两遍）。
-      - Linux:   build-linux.sh 无 clean 参数；这里直接 rm -rf build/，再让脚本重新 configure。
-      - macOS:   传 clean 给 package.sh（它内部 rm -rf build + 强制 macdeployqt 重部署）。
-    skip=True 优先级高于 clean（复用产物时不清理）。
+    clean=True：Linux 直接 rm -rf build/（脚本本身无 clean 参数）；Windows/macOS 由各自脚本处理。
+    skip 优先级高于 clean（复用产物时不清理）。
     """
     if skip:
         b = find_binary()
@@ -363,8 +325,7 @@ def build(skip=False, clean=False):
     t0 = time.monotonic()
     try:
         if IS_WINDOWS:
-            # .bat 必须用 shell=True 才能被 cmd 解析；正斜杠会被 cmd 误解析成参数开关
-            # （scripts/build-windows.bat → 命令 "scripts" + 开关 /b /u...），故转反斜杠。
+            # .bat 必须 shell=True；正斜杠会被 cmd 误解析成参数开关，故转反斜杠。
             rc = subprocess.call(script.replace("/", "\\"), shell=True)
         else:
             rc = subprocess.call(["bash", script] + extra)
@@ -384,7 +345,7 @@ def build(skip=False, clean=False):
 
 
 def _no_sandbox_needed():
-    """是否需要 --no-sandbox：Linux 下 root/WSL/容器需要。"""
+    """是否需要 --no-sandbox：root/WSL/容器需要。"""
     if IS_WINDOWS:
         return False
     # root 必须加；WSL/容器也常需要，保守起见非 Windows 一律加。
@@ -392,11 +353,10 @@ def _no_sandbox_needed():
 
 
 def find_qt_bin():
-    """返回 Qt bin 目录（含 Qt6*.dll），供启动未部署的二进制时加入 PATH。
+    """返回 Qt bin 目录加入 PATH。
 
-    未部署的 seimi-render.exe 启动会因找不到 Qt DLL 而报
-    STATUS_DLL_NOT_FOUND（exit 0xC0000135）。把 Qt bin 前置到子进程 PATH 即可解析。
-    仅 Windows 需要（Linux 二进制 RPATH/ldconfig 通常已就绪）。返回 None 表示无需/未找到。
+    未部署的 seimi-render.exe 会因找不到 Qt DLL 报 STATUS_DLL_NOT_FOUND（exit 0xC0000135），
+    前置 Qt bin 到子进程 PATH 即可解析。仅 Windows 需要。
     """
     if not IS_WINDOWS:
         return None
@@ -415,7 +375,6 @@ def find_qt_bin():
 
 
 def start_instance(binary, ports, password=None, tag="instance"):
-    """启动一个 seimi-render 实例。返回 subprocess.Popen 或 None。"""
     args = [
         binary,
         "--host", HOST,
@@ -457,7 +416,7 @@ def start_instance(binary, ports, password=None, tag="instance"):
 
 
 def wait_ready(http_port, tag="instance", timeout=BOOT_TIMEOUT):
-    """轮询 /health 直到就绪。成功返回 True。"""
+    """轮询 /health 直到就绪。"""
     deadline = time.time() + timeout
     url = f"http://{HOST}:{http_port}/health"
     while time.time() < deadline:
@@ -474,12 +433,11 @@ def wait_ready(http_port, tag="instance", timeout=BOOT_TIMEOUT):
 
 
 def _kill_proc(proc):
-    """杀掉一个实例进程树。"""
     if proc is None:
         return
     try:
         if proc.poll() is not None:
-            return  # 已退出
+            return
     except Exception:
         pass
     pid = proc.pid
@@ -504,11 +462,7 @@ def _kill_proc(proc):
 
 
 def cleanup_all(keep=None):
-    """收尾：杀掉所有已启动实例。
-
-    keep=None（atexit 调用）：按模块级 _keep_servers 决定。
-    keep=True/False（main 显式调用）：按给定值决定。
-    """
+    """收尾：杀掉所有已启动实例。keep=None 时按模块级 _keep_servers 决定。"""
     if keep is None:
         keep = _keep_servers
     if keep:
@@ -533,7 +487,6 @@ class AssertionFailure(Exception):
 
 
 def check(cond, msg):
-    """断言 cond 为真，否则抛 AssertionFailure(msg)。"""
     if not cond:
         raise AssertionFailure(msg)
 
@@ -562,7 +515,6 @@ class CaseResult:
 
 
 class Case:
-    """一个用例。func(ctx) 执行；失败抛 AssertionFailure 或其它异常。"""
     def __init__(self, cid, name, group, assertion, func, needs_auth=False):
         self.id = cid
         self.name = name
@@ -573,10 +525,9 @@ class Case:
 
 
 class CaseContext:
-    """传给每个用例的执行上下文，封装两个实例的客户端。"""
     def __init__(self, no_auth_http, no_auth_ws_port, no_auth_mcp_port,
                  auth_http=None, auth_ws_port=None):
-        self.http = no_auth_http                       # 无密码 HttpClient
+        self.http = no_auth_http
         self.ws_port = no_auth_ws_port
         self.mcp_port = no_auth_mcp_port
         self.auth_http = auth_http                     # 有密码 HttpClient（带 token），可能 None
@@ -590,8 +541,8 @@ class Runner:
         self.only_cases = set(only_cases) if only_cases else None
         self.no_auth = no_auth
         self.verbose = verbose
-        self.cases = []        # Case 列表
-        self.results = []      # CaseResult 列表
+        self.cases = []
+        self.results = []
 
     def add(self, case):
         self.cases.append(case)
@@ -604,7 +555,6 @@ class Runner:
         return True
 
     def run_all(self):
-        # 按用例定义顺序执行（用例本身按组有序注册）。
         last_group_printed = None
         for case in self.cases:
             res = CaseResult(case.id, case.name, case.group, case.assertion)
@@ -612,7 +562,6 @@ class Runner:
                 res.status = "skip"
                 self.results.append(res)
                 continue
-            # --no-auth 跳过需要密码实例的用例
             if self.no_auth and case.needs_auth:
                 res.status = "skip"
                 self.results.append(res)
@@ -634,10 +583,8 @@ class Runner:
             except Exception as e:
                 res.status = "fail"
                 res.error = f"{type(e).__name__}: {e}"
-                # 捕获诊断详情（若有）
             res.duration_ms = int((time.monotonic() - t0) * 1000)
 
-            # 实时打印
             mark = (GREEN + "✓" + RESET) if res.status == "pass" else (
                     RED + "✗" + RESET if res.status == "fail" else (DIM + "·" + RESET))
             dur = f"({res.duration_ms}ms)"
@@ -671,7 +618,6 @@ def print_summary(results, started_at_iso, duration_ms, build_info, instances):
 def write_json_report(results, started_at_iso, duration_ms, build_info, instances,
                       report_dir):
     os.makedirs(report_dir, exist_ok=True)
-    # 按组聚合
     groups = {}
     for r in results:
         groups.setdefault(r.group, []).append(r)
@@ -765,10 +711,7 @@ def group_a(ctx):
 
 def _render_and_get(ctx, url, output, fmt=None, md_alg=None, long_poll_ms=RENDER_LONG_POLL_MS,
                     expect_success=True, allow_retry=True):
-    """提交渲染 + 长轮询。返回 HttpResponse。
-
-    expect_success=True 且首次返回 running 时，自动用 /result/:id 补取一次（allow_retry）。
-    """
+    """提交渲染 + 长轮询。expect_success=True 且首次仍 running 时用 /result/:id 补取一次。"""
     body = {"url": url, "output": output, "long_poll_ms": long_poll_ms}
     if fmt:
         body["format"] = fmt
@@ -793,7 +736,6 @@ def _render_and_get(ctx, url, output, fmt=None, md_alg=None, long_poll_ms=RENDER
 
 
 def _check_succeeded(r, label="render"):
-    """断言渲染成功，返回 task_id。"""
     if not r.json:
         raise AssertionFailure(f"{label}: 非 JSON 响应 {r.text[:200]}")
     state = r.json.get("state")
@@ -804,7 +746,6 @@ def _check_succeeded(r, label="render"):
 
 
 def _magic_ok(data, magic):
-    """二进制首字节魔数校验。"""
     return data[:len(magic)] == magic
 
 
@@ -832,7 +773,6 @@ def group_b(ctx):
         r = _render_and_get(c, URL_SOHU, "pdf")
         tid = _check_succeeded(r, "B3")
         check(r.json.get("has_pdf") is True, f"B3: 缺 has_pdf: {r.text[:200]}")
-        # 下载 PDF 校验魔数
         pdf = c.http.get(f"/pdf/{tid}", timeout=30)
         check(pdf.status == 200, f"B3: /pdf 状态 {pdf.status}")
         check(_magic_ok(pdf.body_bytes, b"%PDF"), "B3: PDF 魔数不对")
@@ -895,8 +835,7 @@ def group_b(ctx):
                       "POST /render 不带 long_poll_ms → 立即返回 + task_id + state∈{pending,running,succeeded}", b8))
 
     def b9(c):
-        # long_poll_ms:1 → 几乎必超时，返回非 succeeded（pending 或 running）。
-        # 提交瞬间可能还没进 running（仍 pending）；二者都符合「未阻塞到成功」。
+        # long_poll_ms:1 → 几乎必超时。提交瞬间可能仍 pending（未进 running），二者都符合「未阻塞到成功」。
         r = _render_and_get(c, URL_SOHU, "html", long_poll_ms=1, expect_success=False, allow_retry=False)
         state = (r.json or {}).get("state")
         check(state in ("running", "pending"),
@@ -912,10 +851,8 @@ def group_c(ctx):
     cases = []
 
     def c1(c):
-        # 先渲染一个成功任务，拿 task_id
         r = _render_and_get(c, URL_SOHU, "markdown")
         tid = _check_succeeded(r, "C1-setup")
-        # GET /status/:id 不含 html
         s = c.http.get(f"/status/{tid}")
         check(s.status == 200, f"/status/:id 状态 {s.status}")
         check(s.json.get("state") == "succeeded", f"C1: state={s.json.get('state')}")
@@ -952,7 +889,7 @@ def group_c(ctx):
                       "GET /result/<不存在> → 404", c4))
 
     def c5(c):
-        # B1 风格的 markdown-only 任务，GET /pdf/:id 应 404 并提示
+        # markdown-only 任务，GET /pdf/:id 应 404 并提示
         r = _render_and_get(c, URL_SOHU, "markdown")
         tid = _check_succeeded(r, "C5-setup")
         pdf = c.http.get(f"/pdf/{tid}")
@@ -1015,12 +952,10 @@ def group_d(ctx):
 
 
 def ctx_ws_port(c):
-    """从 CaseContext 取无密码实例 ws 端口。"""
     return c.ws_port
 
 
 def ctx_http(c):
-    """从 CaseContext 取无密码 HttpClient。"""
     return c.http
 
 
@@ -1033,12 +968,11 @@ def group_e(ctx):
         ws.connect(timeout=10)
         try:
             ws.send_json({"action": "render", "url": URL_SOHU, "settle_ms": 2500})
-            # 收 created
             got, ev = ws.recv_with_timeout(10)
             check(got and ev.get("event") == "created", f"E1: 未收到 created: {ev}")
             tid = ev.get("task_id") if ev else None
             check(bool(tid), "E1: created 无 task_id")
-            # 收 finished（渲染需时间，给足）
+            # 渲染需时间，给足超时等 finished
             got2, ev2 = ws.recv_with_timeout(60)
             check(got2 and ev2.get("event") == "finished", f"E1: 未收到 finished: {ev2}")
             check(ev2.get("state") == "succeeded", f"E1: finished state={ev2.get('state') if ev2 else None}")
@@ -1048,7 +982,6 @@ def group_e(ctx):
                       "WS render → created + finished(succeeded)", e1))
 
     def e2(c):
-        # HTTP 提交（非长轮询），拿 tid，再 WS 订阅
         r = ctx_http(c).post("/render", json_body={"url": URL_SOHU, "output": "markdown"})
         check(r.status == 200, f"E2: /render 状态 {r.status}")
         tid = r.json.get("task_id")
@@ -1060,7 +993,6 @@ def group_e(ctx):
             got, ev = ws.recv_with_timeout(10)
             check(got and ev.get("event") in ("subscribed", "finished"),
                   f"E2: 未收到 subscribed/finished: {ev}")
-            # 若先收到 subscribed，再等 finished
             if got and ev.get("event") == "subscribed":
                 got2, ev2 = ws.recv_with_timeout(60)
                 check(got2 and ev2.get("event") == "finished", f"E2: 未收到 finished: {ev2}")
@@ -1074,14 +1006,12 @@ def group_e(ctx):
         ws.connect(timeout=10)
         try:
             ws.send_json({"action": "unknown_action"})
-            # 3s 内不应崩溃或主动关闭连接；收到 error 帧也算通过（只要连接没断）
+            # 3s 内不应崩溃或主动关闭连接；超时无消息（静默忽略）或收到 error 帧均算通过
             got, ev = ws.recv_with_timeout(3)
-            # got=False（超时无消息）→ 服务端静默忽略，连接存活 → 通过
-            # got=True 且是 error 事件 → 也通过
             if got:
                 check(ev.get("event") in ("error",) or "error" not in (ev.get("event") or ""),
                       f"E3: 收到意外事件 {ev}")
-            # 无论哪种，再发一条合法 render 确认连接仍活
+            # 再发一条合法 render 确认连接仍活
             ws.send_json({"action": "render", "url": URL_SOHU})
             got2, ev2 = ws.recv_with_timeout(10)
             check(got2 and ev2.get("event") == "created", f"E3: 连接已不响应 render: {ev2}")
@@ -1091,13 +1021,12 @@ def group_e(ctx):
                       "WS action:unknown → 不崩溃，连接存活", e3))
 
     def e4(c):
-        # 一个连接连发多个 render，验证「同时关注多个任务」：
+        # 回归：单连接连发多个 render，验证「同时关注多个任务」。
         # 旧代码（单值订阅映射）这里会收不到第一个任务的 finished。
         N = 3
         ws = WsClient(ctx_ws_port(c))
         ws.connect(timeout=10)
         try:
-            # 连发 N 个 render，先各收一条 created
             created_ids = []
             for _ in range(N):
                 ws.send_json({"action": "render", "url": URL_SOHU, "settle_ms": 2500})
@@ -1107,9 +1036,8 @@ def group_e(ctx):
                 tid = ev.get("task_id") if ev else None
                 check(bool(tid), f"E4: created 无 task_id: {ev}")
                 created_ids.append(tid)
-            # 三个 task_id 互不相同
             check(len(set(created_ids)) == N, f"E4: task_id 不唯一: {created_ids}")
-            # 收齐 N 个 finished（完成顺序不定，按 task_id 集合核对）
+            # 完成顺序不定，按 task_id 集合核对
             finished_ids = set()
             for _ in range(N):
                 got, ev = ws.recv_with_timeout(60)
@@ -1139,7 +1067,6 @@ def group_f(ctx):
                       "GET /auth-status → password_enabled:true", f1, needs_auth=True))
 
     def f2(c):
-        # 用无 token 的裸 client（临时构造）
         bare = HttpClient(AUTH_PORTS["http"])
         r = bare.get("/stats")
         check(r.status == 401, f"F2: 期望 401，实际 {r.status}")
@@ -1161,7 +1088,7 @@ def group_f(ctx):
         check(r.status == 200, f"F4: 期望 200，实际 {r.status}")
         token = (r.json or {}).get("token")
         check(bool(token), f"F4: 无 token: {r.text}")
-        # 存到 context 供后续用例（虽然 auth_http 已带 EXPECTED_TOKEN，这里验证登录返回的与之一致）
+        # 验证登录返回 token 与本地 EXPECTED_TOKEN 一致
         check(token == EXPECTED_TOKEN, f"F4: token 与 EXPECTED_TOKEN 不一致")
     cases.append(Case("F4", "正确密码换 token", "F",
                       "POST /api/login correct → 200 + token == sha256(seimi-render:pwd)", f4, needs_auth=True))
@@ -1173,7 +1100,6 @@ def group_f(ctx):
                       "Authorization: Bearer <token> /stats → 200", f5, needs_auth=True))
 
     def f6(c):
-        # query token：用不带 Authorization 的 client，走 ?token=
         bare = HttpClient(AUTH_PORTS["http"])
         r = bare.get("/stats", params={"token": EXPECTED_TOKEN})
         check(r.status == 200, f"F6: 期望 200，实际 {r.status}")
@@ -1188,7 +1114,6 @@ def group_f(ctx):
                       "Bearer wrongtoken → 401", f7, needs_auth=True))
 
     def f8(c):
-        # F4 已验证登录返回 token == EXPECTED_TOKEN；这里再独立校验算法确定性
         computed = hashlib.sha256(("seimi-render:" + AUTH_PASSWORD).encode()).hexdigest()
         check(computed == EXPECTED_TOKEN, "F8: sha256 算法结果与 EXPECTED_TOKEN 不一致")
     cases.append(Case("F8", "token 确定性算法", "F",
@@ -1200,8 +1125,8 @@ def group_f(ctx):
         for path in ("/health", "/auth-status", "/"):
             r = bare.get(path)
             check(r.status != 401, f"F10: {path} 应免鉴权，实际 {r.status}")
-        # /api/login 免 token 守卫（无需先登录即可调用）：错误密码返回 401 "invalid password"，
-        # 但绝不应是 401 "unauthorized"（后者才表示被 token 守卫拦截）。
+        # /api/login 免 token 守卫：错误密码应返回 401 "invalid password"，
+        # 而非 401 "unauthorized"（后者才表示被 token 守卫拦截）。
         r = bare.post("/api/login", json_body={"password": "x"})
         check(r.status in (200, 401, 429), f"F10: /api/login 状态异常 {r.status}")
         check(not ("unauthorized" in r.text and "invalid password" not in r.text),
@@ -1216,7 +1141,6 @@ def group_f(ctx):
         try:
             ws.send_json({"action": "render", "url": URL_SOHU})
             got, ev = ws.recv_with_timeout(5)
-            # 被拒：收到 error 或连接关闭（got=False）
             if got:
                 check(ev.get("event") == "error", f"F11: 无 token 应被拒，收到 {ev}")
             else:
@@ -1225,8 +1149,7 @@ def group_f(ctx):
             pass  # 连接被关也算通过
         finally:
             ws.close()
-        # 带 token 连 WS → render 成功。注意：带 token 连接后服务端先回 authorized，
-        # 再回 created；需连读直到拿到 created。
+        # 带 token 连接后服务端先回 authorized 再回 created，需连读直到拿到 created。
         ws2 = WsClient(AUTH_PORTS["ws"], token=EXPECTED_TOKEN)
         ws2.connect(timeout=10)
         try:
@@ -1252,9 +1175,9 @@ def group_f(ctx):
     cases.append(Case("F12", "Cookie token", "F",
                       "Cookie: seimi_token=<token> /stats → 200", f12, needs_auth=True))
 
-    # F9 登录限流：必须排在 F4-F8 之后（确保已拿到 token）。F9 之后再不调 /api/login。
+    # F9 登录限流：必须排在 F4-F8 之后（确保已拿到 token），F9 之后再不调 /api/login。
     # 注意：F3/F10 已对同一源 IP（127.0.0.1）做过失败登录，失败计数会被累加，
-    # 故这里不能假定「恰好第 11 次锁定」。改为持续打错误密码直到命中 429，断言「最终被锁」。
+    # 故不能假定「恰好第 11 次锁定」，改为持续打错误密码直到命中 429。
     def f9(c):
         bare = HttpClient(AUTH_PORTS["http"])
         # kLoginMaxFailures=10；扣掉此前 F3/F10 的失败计数后，再补打若干次必触发锁定。
@@ -1305,7 +1228,6 @@ def group_g(ctx):
         mcp.initialize()
         result = mcp.call_tool("render_url", {"url": URL_SOHU, "output": "screenshot"})
         contents = result.get("content", [])
-        # 应含 image content（type=image）
         imgs = [x for x in contents if x.get("type") == "image"]
         check(len(imgs) > 0, f"G3: 无 image content: {[x.get('type') for x in contents]}")
         check("mimeType" in imgs[0] and "data" in imgs[0], "G3: image content 缺字段")
@@ -1316,10 +1238,8 @@ def group_g(ctx):
     def g4(c):
         mcp = McpClient(c.mcp_port)
         mcp.initialize()
-        # 先渲染拿 task_id
         r1 = mcp.call_tool("render_url", {"url": URL_SOHU, "output": "markdown"})
         text1 = r1.get("content", [{}])[0].get("text", "")
-        # 提取 task_id
         m = re.search(r"task_id=(\S+)", text1)
         check(m is not None, f"G4: 无法从 render_url 结果提取 task_id: {text1[:200]}")
         tid = m.group(1)
@@ -1332,7 +1252,7 @@ def group_g(ctx):
     def g5(c):
         mcp = McpClient(c.mcp_port)
         mcp.initialize()
-        # 缺 url：MCP 工具错误以 result.isError=true 的 content 返回（非 JSON-RPC error）。
+        # MCP 工具错误以 result.isError=true 的 content 返回（非 JSON-RPC error）。
         result = mcp.call_tool("render_url", {})
         check(result.get("isError") is True, f"G5: 缺 url 未报错: {result}")
         contents = result.get("content", [])
@@ -1358,10 +1278,10 @@ def group_h(ctx):
                       "POST /cookies → stored>=1 + applied:true", h1))
 
     def h2(c):
-        # 先注入（H1 可能因执行顺序先跑，这里自注入保证有数据）
+        # H1 可能因执行顺序先跑，这里自注入保证有数据
         ctx_http(c).post("/cookies", json_body={"cookies": [
             {"name": "k2", "domain": COOKIE_TEST_DOMAIN, "value": "v2", "path": "/"}]})
-        # cookie 注入经 GUI 线程异步 apply，轮询直到能看到测试域名。
+        # cookie 注入经 GUI 线程异步 apply，需轮询直到能看到测试域名。
         seen = False
         r = None
         for _ in range(20):  # 最多等 ~10s
@@ -1383,7 +1303,7 @@ def group_h(ctx):
         r = ctx_http(c).delete("/cookies")
         check(r.status == 200, f"H3: DELETE 状态 {r.status}")
         check((r.json or {}).get("cleared") is True, f"H3: 非 cleared: {r.text}")
-        # cookie 清空经 GUI 线程异步 apply，DELETE 返回后未必即时生效。轮询直到 total=0。
+        # cookie 清空经 GUI 线程异步 apply，DELETE 返回后未必即时生效，轮询直到 total=0。
         cleared_ok = False
         for _ in range(20):  # 最多等 ~10s
             r2 = ctx_http(c).get("/cookies")
@@ -1413,7 +1333,6 @@ def group_i(ctx):
         r = ctx_http(c).post("/proxy", json_body={"type": "socks5", "host": "127.0.0.1", "port": 1080})
         check(r.status == 200, f"I2: POST 状态 {r.status}")
         check((r.json or {}).get("ok") is True, f"I2: 非 ok: {r.text}")
-        # GET 回显
         r2 = ctx_http(c).get("/proxy")
         check((r2.json or {}).get("type") == "socks5", f"I2: 回显 type!=socks5: {r2.text}")
         check(r2.json.get("host") == "127.0.0.1", f"I2: 回显 host 不对")
@@ -1470,14 +1389,11 @@ def main():
           f"verbose: {args.verbose} | no-auth: {args.no_auth} | clean: {args.clean}{RESET}")
     t0 = time.monotonic()
 
-    # 1. 构建
     binary = build(skip=args.skip_build, clean=args.clean)
     if not binary:
-        # 构建失败：仍要清理已起进程（无），直接退出 2
         return EXIT_ENV
     build_info = {"ok": True, "binary": binary}
 
-    # 2. 起实例
     no_auth_proc = start_instance(binary, NO_AUTH_PORTS, tag="实例A(无密码)")
     if not no_auth_proc or not wait_ready(NO_AUTH_PORTS["http"], tag="实例A"):
         cleanup_all(keep=args.keep_servers)
@@ -1498,7 +1414,6 @@ def main():
         instances["auth"] = {"http_port": AUTH_PORTS["http"], "ws_port": AUTH_PORTS["ws"],
                              "mcp_port": AUTH_PORTS["mcp"], "pid": auth_proc.pid, "ready": True}
 
-    # 3. 构造上下文
     no_auth_http = HttpClient(NO_AUTH_PORTS["http"], verbose=args.verbose)
     auth_http = HttpClient(AUTH_PORTS["http"], token=EXPECTED_TOKEN, verbose=args.verbose) if auth_proc else None
     ctx = CaseContext(
@@ -1509,14 +1424,12 @@ def main():
         auth_ws_port=AUTH_PORTS["ws"] if auth_proc else None,
     )
 
-    # 4. 注册用例（按组顺序）
     only_groups = args.group.split(",") if args.group else None
     only_cases = args.case.split(",") if args.case else None
     runner = Runner(ctx, only_groups=only_groups, only_cases=only_cases,
                     no_auth=args.no_auth, verbose=args.verbose)
 
     print()
-    # 只打印「至少有一个用例会被执行（非 skip）」的组标题，避免冗余空标题。
     all_cases_by_group = []
     for group_name, group_fn in [
         ("A. 健康与元信息", group_a),
@@ -1534,8 +1447,7 @@ def main():
         for case in cases:
             runner.add(case)
 
-    # 标注每组首个将被执行的用例位置，打印到该组标题后即停。
-    # 简化：遍历注册结果，按 _should_run + 非强制 skip 的组才打印标题。
+    # 只打印「至少有一个用例会被执行（非 skip）」的组标题，避免冗余空标题。
     def _group_will_run(group_letter):
         for case in runner.cases:
             if case.group == group_letter and runner._should_run(case) \
@@ -1543,22 +1455,18 @@ def main():
                 return True
         return False
 
-    # 重新组织：在执行前打印「会跑」的组标题
     runner._pending_group_headers = {
         gn.split(".")[0]: gn for gn, _ in all_cases_by_group if _group_will_run(gn.split(".")[0])
     }
 
-    # 5. 执行
     runner.run_all()
 
-    # 6. 报告
     duration_ms = int((time.monotonic() - t0) * 1000)
     passed, failed, skipped = print_summary(
         runner.results, started_at_iso, duration_ms, build_info, instances)
     write_json_report(runner.results, started_at_iso, duration_ms, build_info, instances,
                       args.report_dir)
 
-    # 7. 收尾 + 退出码
     cleanup_all(keep=args.keep_servers)
     if failed > 0:
         return EXIT_FAIL
@@ -1572,4 +1480,3 @@ if __name__ == "__main__":
         print("\n中断，清理进程...")
         cleanup_all()
         sys.exit(EXIT_FAIL)
-

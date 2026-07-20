@@ -1,23 +1,11 @@
 # SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 # SPDX-License-Identifier: Apache-2.0
-
-# ============================================================
-# Dist self-containment checker for seimi-render-win-x64
 #
-# Scans every .exe/.dll in the dist dir, reports:
-#   [MISS]  imported DLL not present anywhere in dist
-#           -> would break on a clean machine (no Qt / VS installed)
-#   [PATH]  import is in path form (absolute / relative)
-#           -> bad, breaks when the folder is moved
-#   [SYS]   ignored: OS / CRT DLL (always present on Windows)
-#
-# Usage:
-#   powershell -File scripts\check-deps.ps1
-#   powershell -File scripts\check-deps.ps1 -Dist path\to\dist
-#   powershell -File scripts\check-deps.ps1 -Dumpbin "C:\...\dumpbin.exe"
-#
-# Auto-locates dumpbin via vswhere; override with -Dumpbin.
-# ============================================================
+# dist 自包含检查器：扫描 dist 内每个 .exe/.dll 的导入表，报告：
+#   [MISS] 导入的 DLL 不在 dist 内（干净机器上缺）
+#   [PATH] 导入用了路径形式（移动后失效）
+#   [SYS]  忽略：OS/CRT DLL（Windows 总有）
+# 用法: powershell -File scripts\check-deps.ps1 [-Dist path] [-Dumpbin path]
 [CmdletBinding()]
 param(
     [string]$Dist    = '',
@@ -26,7 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# resolve script dir (PSScriptRoot empty when invoked via -File on old PS)
+# resolve script dir（旧版 PS 的 -File 调用下 PSScriptRoot 为空）
 if (-not $PSScriptRoot) {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 } else {
@@ -72,14 +60,14 @@ if (-not $Dumpbin -or -not (Test-Path -LiteralPath $Dumpbin)) {
 Write-Host "== checking dist: $Dist"
 Write-Host "   dumpbin   : $Dumpbin"
 
-# --- gather all PE files in dist (recursive) ---
+# --- dist 内所有 PE 文件（递归）---
 $pes = Get-ChildItem -LiteralPath $Dist -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Extension -in '.exe', '.dll' }
-$have = $pes | ForEach-Object { $_.Name }          # filenames present anywhere in dist
+$have = $pes | ForEach-Object { $_.Name }
 Write-Host "   PE files  : $($pes.Count)"
 Write-Host ""
 
-# system / CRT dll prefixes to ignore (always present on Windows)
+# 忽略的系统/CRT DLL 前缀
 $sysPrefix = @(
     'api-ms-','vcruntime','msvcp','ucrt','kernel32','user32','advapi32','ole32',
     'shell32','gdi32','ntdll','comctl32','shlwapi','winmm','ws2_32','oleaut32',
@@ -96,36 +84,32 @@ $checkedCount = 0
 
 foreach ($pe in $pes) {
     $checkedCount++
-    # run dumpbin, capture stdout
     $out = & $Dumpbin /dependents $pe.FullName 2>$null
-    # parse lines after "Image has the following dependencies:" up to blank line
     $inDeps = $false
     foreach ($line in $out) {
         $t = "$line".Trim()
         if ($t -match '^Image has the following dependencies') { $inDeps = $true; continue }
         if (-not $inDeps) { continue }
         if ([string]::IsNullOrWhiteSpace($t)) { $inDeps = $false; continue }
-        if ($t -notmatch '\.dll$') { continue }     # not a dll line
+        if ($t -notmatch '\.dll$') { continue }
 
         $dep = $t
 
-        # path-form? (backslash or colon)
+        # 路径形式（含 \ 或 :）→ 移动后失效
         if ($dep -match '[\\:]') {
             Write-Host ("  [PATH] {0} -> {1}" -f $pe.Name, $dep) -ForegroundColor Red
             $pathCount++
             continue
         }
 
-        $bare = Split-Path $dep -Leaf      # strip any directory portion just in case
+        $bare = Split-Path $dep -Leaf
 
-        # system dll?
         $isSys = $false
         foreach ($p in $sysPrefix) {
             if ($bare -like "$p*") { $isSys = $true; break }
         }
         if ($isSys) { continue }
 
-        # present in dist?
         if ($have -notcontains $bare) {
             Write-Host ("  [MISS] {0} -> {1}" -f $pe.Name, $bare) -ForegroundColor Yellow
             $missCount++

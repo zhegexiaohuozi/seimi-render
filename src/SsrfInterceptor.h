@@ -20,6 +20,7 @@
 // 仅依赖 Qt，header-only，无 Q_OBJECT。
 //
 
+#include "StealthProfile.h"
 #include "UrlGuard.h"
 
 #include <QWebEngineUrlRequestInfo>
@@ -45,14 +46,28 @@ public:
         const QString scheme = url.scheme();
 
         // stealth 指纹头统一：对 http(s) 注入 Chrome 桌面一致头（与 JS 层 userAgentData 一致）。
+        // 值全部引自 StealthProfile（单一事实源），含高熵 Client Hints（堵 Accept-CH 旁路）。
         if (m_stealthHeaders && (scheme == QLatin1String("http")
                                  || scheme == QLatin1String("https"))) {
             info.setHttpHeader(QByteArrayLiteral("Accept-Language"),
-                               QByteArrayLiteral("zh-CN,zh;q=0.9,en;q=0.8"));
+                               QByteArray(StealthProfile::acceptLanguage()));
             info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA"),
-                               QByteArrayLiteral("\"Google Chrome\";v=\"142\", \"Chromium\";v=\"142\", \"Not_A Brand\";v=\"24\""));
+                               QByteArray(StealthProfile::secChUa()));
             info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Mobile"), QByteArrayLiteral("?0"));
-            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Platform"), QByteArrayLiteral("\"Windows\""));
+            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Platform"),
+                               QByteArray(StealthProfile::secChUaPlatform()));
+            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Full-Version-List"),
+                               QByteArray(StealthProfile::secChUaFullVersionList()));
+            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Arch"),
+                               QByteArray(StealthProfile::secChUaArch()));
+            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Bitness"),
+                               QByteArray(StealthProfile::secChUaBitness()));
+            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Platform-Version"),
+                               QByteArray(StealthProfile::secChUaPlatformVersion()));
+            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-Model"),
+                               QByteArray(StealthProfile::secChUaModel()));
+            info.setHttpHeader(QByteArrayLiteral("Sec-CH-UA-WoW64"),
+                               QByteArray(StealthProfile::secChUaWow64()));
         }
 
         // 方案白名单：仅放行有网络/内联语义的安全方案，其余（file/ftp/chrome 等）拦截。

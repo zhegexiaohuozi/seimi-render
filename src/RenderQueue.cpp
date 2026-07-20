@@ -116,6 +116,8 @@ void RenderQueue::setTerminal(const QString& id,
     qint64 elapsedMs = 0;
     OutputMask outputs = 0;
     bool shouldRecord = false;
+    int blockAttempts = 0;
+    bool blockedFinal = false;
     {
         QMutexLocker locker(&m_mutex);
         auto it = m_tasks.find(id);
@@ -135,6 +137,8 @@ void RenderQueue::setTerminal(const QString& id,
         const qint64 start = task->startedAtMsec ? task->startedAtMsec : task->createdAtMsec;
         elapsedMs = nowMsec > start ? (nowMsec - start) : 0;
         outputs = task->outputs;
+        blockAttempts = task->blockAttempts;
+        blockedFinal = task->blocked;
         shouldRecord = true;
 
         // 借终态变更淘汰过期/超量旧终态任务（刚完成的任务不会被淘汰，WS/长轮询回取安全）。
@@ -145,7 +149,7 @@ void RenderQueue::setTerminal(const QString& id,
     }
 
     if (shouldRecord) {
-        m_metrics.record(std::move(host), succeeded, elapsedMs, outputs);
+        m_metrics.record(std::move(host), succeeded, elapsedMs, outputs, blockAttempts, blockedFinal);
     }
 }
 
@@ -213,6 +217,7 @@ RenderQueue::Snapshot RenderQueue::snapshot(const QString& id) const {
     s.id = t.id;            // const 字段，但拷贝无妨
     s.url = t.url;
     s.error = t.error;
+    s.blocked = t.blocked;
     s.html = t.html;
     s.markdown = t.markdown;
     s.pdfData = t.pdfData;

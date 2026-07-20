@@ -32,6 +32,18 @@ struct StealthProfile {
     static const char* acceptLanguage() { return "zh-CN,zh;q=0.9,en;q=0.8"; }
     static const char* acceptEncoding() { return "gzip, deflate, br"; }
 
+    // 高熵 Client Hints：站点经 Accept-CH 反向索取时，真实 Chromium 会报 Qt 底层版本
+    //（≠142）造成版本矛盾。主动注入后与 stealth.js userAgentData.getHighEntropyValues
+    // 永远一致（值保持对齐，改 UA 版本时三处同步：本文件 / stealth.js / 拦截器引用处）。
+    static const char* secChUaFullVersionList() {
+        return "\"Google Chrome\";v=\"142.0.7444.110\", \"Chromium\";v=\"142.0.7444.110\", \"Not_A Brand\";v=\"24.0.0.0\"";
+    }
+    static const char* secChUaArch() { return "\"x86\""; }
+    static const char* secChUaBitness() { return "\"64\""; }
+    static const char* secChUaPlatformVersion() { return "\"15.0.0\""; }
+    static const char* secChUaModel() { return "\"\""; }
+    static const char* secChUaWow64() { return "?0"; }
+
     // 统一窗口尺寸（与 screen.width/height 指纹一致）
     static constexpr int viewportWidth() { return 1920; }
     static constexpr int viewportHeight() { return 1080; }

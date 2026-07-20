@@ -3,6 +3,7 @@
 
 #include "RenderPool.h"
 
+#include "BlockDetect.h"
 #include "CookieStore.h"
 #include "ProxyConfig.h"
 #include "SsrfInterceptor.h"
@@ -16,10 +17,8 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QNetworkProxy>
 #include <QPainter>
-#include <QProcess>
-#include <QNetworkProxy>
+#include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QStringList>
 #include <QStringView>
@@ -89,10 +88,16 @@ void RenderWorker::assign(RenderTaskPtr task) {
     m_busy = true;
     m_collectStarted = false;
     m_pendingCollect = 0;
+    m_retryCount = 0;
+    m_sorryHits = 0;
     m_task->startedAtMsec = nowMsec();
+    startAttempt();
+}
 
-    // 每任务一个全新 view（持有 page）。用 view 而非裸 page 是为了 QWidget::grab() 截图
-    //（QWebEnginePage 在 Qt6 无 grabToImage）。
+// assign/retry 共用：创建全新 view/page（铁律 3）并发起 load。
+// 每任务/每尝试一个全新 view（持有 page）。用 view 而非裸 page 是为了 QWidget::grab() 截图
+//（QWebEnginePage 在 Qt6 无 grabToImage）。
+void RenderWorker::startAttempt() {
     m_view = new QWebEngineView(m_profile, nullptr);
     // 视口尺寸：stealth 开启时统一 1920×1080（与 screen 指纹一致），否则 1280×2000。
     if (s_stealthViewport) {
@@ -108,30 +113,27 @@ void RenderWorker::assign(RenderTaskPtr task) {
     m_view->show();
     m_page = m_view->page();
     connect(m_page, &QWebEnginePage::loadFinished, this, &RenderWorker::onLoadFinished);
-    connect(m_view, &QWebEngineView::destroyed, this, [this](QObject*) {
-        m_view = nullptr;
-        m_page = nullptr;
+    // destroyed 回调按对象身份置空：retry 路径会先 deleteLater 旧 view 再建新 view，
+    // 旧 view 的 destroyed 晚到，若不加 obj==m_view 守卫会把新 view 指针误清空。
+    connect(m_view, &QWebEngineView::destroyed, this, [this](QObject* obj) {
+        if (obj == m_view) {
+            m_view = nullptr;
+            m_page = nullptr;
+        }
     });
 
-    // 重置预取降级状态（每任务独立）。
-    m_prefetchedHtml.clear();
-    m_effectivePrefetchUrl.clear();
-    m_prefetchDone = false;
-    m_prefetchUsed = false;
-
     m_loadTimer.start(int(m_loadTimeoutMsec));
-
-    // 搜索引擎 URL：并行启动预取绕 TLS 风控（详见 startPrefetch）。
-    const QString targetUrl = m_task->url;
-    if (isSearchEngineUrl(targetUrl)) {
-        startPrefetch(targetUrl);
-    }
-
-    m_page->load(QUrl(targetUrl));
+    m_page->load(QUrl(m_task->url));
 }
 
 void RenderWorker::onLoadFinished(bool ok) {
     if (!m_busy || !m_task || !m_page) return;
+
+    // Google 反爬 sorry 页：最终 URL 命中 /sorry 即判定（先于一切其他分支，零额外异步）。
+    if (isGoogleSorryUrl(m_page->url())) {
+        handleSorryDetected();
+        return;
+    }
 
     // Chromium 网络错误页检测：目标不可达时 Chromium 加载 chrome-error:// 内置错误页，
     // 该页 loadFinished(ok=true) 且 body 远超 512 字节，不拦截会被误判为渲染成功，
@@ -141,8 +143,6 @@ void RenderWorker::onLoadFinished(bool ok) {
         curUrl.scheme() == QLatin1String("chrome-error")
         || curUrl.scheme() == QLatin1String("chrome-network-error");
     if (isChromeErrorPage) {
-        // TLS 风控降级：Chromium 被加载错误页，但若预取成功，用预取 HTML 经 setHtml 重渲染。
-        if (tryPrefetchFallback()) return;
         finishFailure(QStringLiteral(
             "page load failed: target unreachable (Chromium network error page). "
             "Likely DNS/connection/SSL failure. url=%1")
@@ -163,7 +163,6 @@ void RenderWorker::onLoadFinished(bool ok) {
                 if (bodyLen >= kMinViableBodyLen) {
                     m_settleTimer.start(m_task->settleDelayMsec);
                 } else {
-                    if (tryPrefetchFallback()) return;
                     finishFailure(QStringLiteral(
                         "page load finished with error (http 4xx/5xx or network); "
                         "body too small (%1 bytes)").arg(bodyLen));
@@ -176,116 +175,7 @@ void RenderWorker::onLoadFinished(bool ok) {
 
 void RenderWorker::onLoadTimeout() {
     if (!m_busy || !m_task) return;
-    // 搜索引擎 TLS 风控降级：超时可能是 Chromium 反复重试被 RST 的连接。
-    // 若预取已完成且有结果，用 setHtml 重渲染（预取用 OpenSSL 不被风控）。
-    if (tryPrefetchFallback()) return;
     finishFailure(QStringLiteral("render timed out after %1 ms").arg(m_loadTimeoutMsec));
-}
-
-// —— 搜索引擎 TLS 风控降级 ——
-// Google/Bing 基于 TLS 指纹(JA3/JA4) 在握手层 RST Chromium 的 BoringSSL 连接，
-// 而 curl(系统 OpenSSL) 不被识别能正常预取。搜索引擎结果页高度 JS 化，curl 预取后
-// 直接 html2md 转不出内容，故需 setHtml 让 Chromium 执行 JS。
-
-bool RenderWorker::isSearchEngineUrl(const QString& url) {
-    // 仅对主流搜索引擎结果页启用降级（精准匹配，避免误伤普通页面）。
-    static const QRegularExpression re(
-        QStringLiteral("https?://(?:www\\.)?(?:google|bing|duckduckgo)\\.[^/]+/(?:search|webhp)\\?"),
-        QRegularExpression::CaseInsensitiveOption);
-    return re.match(url).hasMatch();
-}
-
-void RenderWorker::startPrefetch(const QString& url) {
-    // 用系统 curl 预取：curl 的 TLS 栈与 Chromium BoringSSL 指纹不同，能绕过 Google TLS 风控；
-    // QNAM 在某些 Qt 构建下首请求报 err=99 TLS initialization failed，curl 最可靠。
-    auto* proc = new QProcess(this);
-    // 走应用代理（与 Chromium 一致）、伪装 Chrome UA、跟随重定向。
-    // -w "\n%{url_effective}"：响应体末尾追加最终 URL，供 setHtml 降级前的同源校验。
-    QStringList args = {
-        QStringLiteral("-s"), QStringLiteral("--max-time"), QStringLiteral("12"),
-        QStringLiteral("-L"),  // 跟随重定向
-        QStringLiteral("-A"), QString::fromLatin1(StealthProfile::userAgent()),
-        QStringLiteral("-H"), QStringLiteral("Accept-Language: en-US,en;q=0.9"),
-        QStringLiteral("-w"), QStringLiteral("\n%{url_effective}"),
-        url
-    };
-    // 走应用代理（与 Chromium 一致）。
-    QNetworkProxy appProxy = QNetworkProxy::applicationProxy();
-    if (appProxy.type() == QNetworkProxy::HttpProxy || appProxy.type() == QNetworkProxy::Socks5Proxy) {
-        QString proxyUrl = appProxy.type() == QNetworkProxy::Socks5Proxy
-            ? QStringLiteral("socks5h://%1:%2").arg(appProxy.hostName()).arg(appProxy.port())
-            : QStringLiteral("http://%1:%2").arg(appProxy.hostName()).arg(appProxy.port());
-        args.prepend(QStringLiteral("-x"));
-        args.insert(1, proxyUrl);
-    }
-    qWarning("[prefetch] curl start: %s", sanitizeForLog(url).left(60).toUtf8().constData());
-    proc->setProcessChannelMode(QProcess::MergedChannels);
-    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, proc](int code, QProcess::ExitStatus) {
-        proc->deleteLater();
-        if (!m_busy || !m_task) return;
-        if (code != 0) {
-            m_prefetchDone = true;
-            qWarning("[prefetch] curl failed: exit=%d", code);
-            return;
-        }
-        QByteArray out = proc->readAll();
-        // curl 末尾以 -w 追加了最终 URL（无换行），故最后一个换行之后是 effective URL，之前是响应体。
-        const int lastNl = out.lastIndexOf('\n');
-        if (lastNl >= 0) {
-            m_effectivePrefetchUrl = QString::fromUtf8(out.mid(lastNl + 1)).trimmed();
-            out = out.left(lastNl);
-        }
-        // 体积上限：异常/攻击性超大响应丢弃。
-        if (out.size() > kMaxPrefetchBytes) {
-            m_prefetchedHtml.clear();
-            m_effectivePrefetchUrl.clear();
-            m_prefetchDone = true;
-            qWarning("[prefetch] curl output too large (%lld bytes), discarding",
-                     static_cast<long long>(out.size()));
-        } else {
-            m_prefetchedHtml = QString::fromUtf8(out);
-            m_prefetchDone = true;
-            qWarning("[prefetch] curl success: %lld chars, effective=%s",
-                     static_cast<long long>(m_prefetchedHtml.size()),
-                     sanitizeForLog(m_effectivePrefetchUrl).left(80).toUtf8().constData());
-        }
-        // 预取晚于 Chromium 失败完成的兜底：若任务仍在进行且未用过降级，主动触发。
-        if (m_busy && !m_prefetchUsed && !m_prefetchedHtml.isEmpty()) {
-            QMetaObject::invokeMethod(this, &RenderWorker::tryPrefetchFallback, Qt::QueuedConnection);
-        }
-    });
-    proc->start(QStringLiteral("curl"), args);
-}
-
-bool RenderWorker::tryPrefetchFallback() {
-    if (m_prefetchUsed || !m_prefetchDone || m_prefetchedHtml.isEmpty() || !m_page) {
-        qWarning("[prefetch-fallback] skip: used=%d done=%d htmlEmpty=%d page=%d",
-                 m_prefetchUsed, m_prefetchDone, m_prefetchedHtml.isEmpty(), m_page != nullptr);
-        return false;
-    }
-    m_prefetchUsed = true;
-    // 同源校验：curl -L 可能跟随重定向到别的域，而 setHtml 第二参以原始 URL 为安全 origin，
-    // 这会让跨站 HTML 继承目标域的 cookie scope 执行。落点 host 与请求 host 不同则拒绝降级。
-    if (!m_effectivePrefetchUrl.isEmpty()) {
-        const QUrl req(m_task->url);
-        const QUrl eff(m_effectivePrefetchUrl);
-        if (!req.host().isEmpty() && !eff.host().isEmpty()
-            && req.host().compare(eff.host(), Qt::CaseInsensitive) != 0) {
-            qWarning("[prefetch-fallback] skip cross-origin redirect: effective host %s != requested %s",
-                     eff.host().toUtf8().constData(), req.host().toUtf8().constData());
-            return false;
-        }
-    }
-    qWarning("[prefetch-fallback] ACTIVATED: setHtml %lld chars", static_cast<long long>(m_prefetchedHtml.size()));
-    m_page->setHtml(m_prefetchedHtml, QUrl(m_task->url));
-    m_loadTimer.start(int(m_loadTimeoutMsec));
-    return true;
-}
-
-void RenderWorker::onPrefetched(const QString& html) {
-    // 保留接口（未来可用于预取完成的额外处理），当前 startPrefetch 的 lambda 已处理。
-    Q_UNUSED(html);
 }
 
 void RenderWorker::onSettleElapsed() {
@@ -679,6 +569,41 @@ void RenderWorker::finishFailure(const QString& reason) {
     emit taskFinished(id);
 }
 
+// 命中 Google sorry 页：退避重试（全新 page），耗尽则标记 blocked 失败。
+void RenderWorker::handleSorryDetected() {
+    ++m_sorryHits;
+    m_task->blockAttempts = m_sorryHits;   // 写入任务表，待 Metrics blocked 计数消费（设计文档 C4，Task 4）
+
+    if (m_retryCount >= kAntibotMaxRetries) {
+        m_task->blocked = true;
+        finishFailure(QStringLiteral("blocked: google /sorry/ page (%1 retries exhausted)")
+                          .arg(m_retryCount));
+        return;
+    }
+    ++m_retryCount;
+    // 分段退避 2s -> 6s（base × 1, base × 3），±30% 抖动（防多实例同步重试形成节律指纹）。
+    const int base = kAntibotRetryBaseDelayMsec * (m_retryCount == 1 ? 1 : 3);
+    const int jitterPct = QRandomGenerator::global()->bounded(61) - 30;  // [-30,+30]
+    const int delayMs = base * (100 + jitterPct) / 100;
+    qWarning("[antibot] google /sorry/ detected, retry %d/%d in %d ms: %s",
+             m_retryCount, kAntibotMaxRetries, delayMs,
+             sanitizeForLog(m_task->url).left(60).toUtf8().constData());
+
+    m_loadTimer.stop();  // 退避期不计入加载超时（startAttempt 会重启总超时）
+    m_settleTimer.stop();
+    QTimer::singleShot(delayMs, this, [this]() {
+        if (!m_busy || !m_task) return;  // abort/超时已收尾
+        // 全新 page 重试（铁律 3）。旧 view 断开信号后 deleteLater；destroyed 守卫
+        //（startAttempt 内 obj==m_view）确保其晚到回调不清空新 view 指针。
+        if (m_page) {
+            disconnect(m_page, &QWebEnginePage::loadFinished,
+                       this, &RenderWorker::onLoadFinished);
+        }
+        if (m_view) m_view->deleteLater();
+        startAttempt();
+    });
+}
+
 void RenderWorker::abort() {
     // 静默化（不销毁 view/page，避免与 Chromium 异步回调重入）：停定时器、中止加载、
     // 置非忙并清任务引用。迟到的回调经守卫早退，destroyPage/析构再统一回收 view。
@@ -972,9 +897,9 @@ void RenderPool::start() {
     m_queue->setConcurrency(m_concurrency);
 
     // 分发节流：高频检查空闲 worker 并派发队列任务。
+    // dispatch timer 不在此立即启动：交由 startDispatch() 在预热完成或 --no-warmup 路径下幂等启动。
     m_dispatchTimer.setInterval(20); // ms
     connect(&m_dispatchTimer, &QTimer::timeout, this, &RenderPool::dispatch);
-    m_dispatchTimer.start();
 
     // Cookie 同步：周期把待注入 cookie apply 到共享 profile（须 GUI 线程）。500ms 足够实时。
     if (m_cookies) {
@@ -994,12 +919,32 @@ void RenderPool::start() {
         m_proxyConfig->apply();  // 启动时立即 apply（让 --proxy 初始代理生效）
         m_proxyApplyTimer.start();
     }
+
+    // Google 会话预热：完成/超时后才放行分发；--no-warmup 立即放行。
+    m_warmupGuardTimer.setSingleShot(true);
+    // guard 超时视为失败（onWarmupFinished(false)）：与 loadFinished(false) 同路径。
+    connect(&m_warmupGuardTimer, &QTimer::timeout, this, [this]() { onWarmupFinished(false); });
+    if (m_warmupEnabled) {
+        connect(&m_warmupRewarmTimer, &QTimer::timeout, this, &RenderPool::startWarmup);
+        m_warmupRewarmTimer.setInterval(kWarmupIntervalMsec);
+        // 探活 timer：暂停态用，触发时跑一次 startWarmup（成功路径里会 resumeFromSuspension）。
+        m_warmupProbeTimer.setSingleShot(true);
+        connect(&m_warmupProbeTimer, &QTimer::timeout, this, &RenderPool::startWarmup);
+        m_warmupRewarmTimer.start();
+        startWarmup();
+    } else {
+        startDispatch();
+    }
 }
 
 void RenderPool::stop() {
     m_dispatchTimer.stop();
     m_cookieApplyTimer.stop();
     m_proxyApplyTimer.stop();
+    m_warmupRewarmTimer.stop();
+    m_warmupProbeTimer.stop();
+    m_warmupGuardTimer.stop();
+    if (m_warmupPage) { m_warmupPage->deleteLater(); m_warmupPage = nullptr; }
     // aboutToQuit 时事件循环仍在转，提前 abort 让在途异步回调命中早退守卫，
     // 不在析构窗口触碰半销毁状态。
     for (auto& w : m_workers) w->abort();
@@ -1015,6 +960,67 @@ void RenderPool::dispatch() {
             w->assign(task);
         }
     }
+}
+
+void RenderPool::startDispatch() {
+    if (m_dispatchStarted) return;
+    m_dispatchStarted = true;
+    m_dispatchTimer.start();
+}
+
+// 预热：渲染 warmup URL 拿 NID/SOCS。加载失败同样放行分发（不在启动期死锁）。
+void RenderPool::startWarmup() {
+    if (m_warmupPage) return;  // 上一次预热未完成，跳过本轮（重暖定时器重叠保护）
+    qWarning("[warmup] start: %s", sanitizeForLog(m_warmupUrl).left(80).toUtf8().constData());
+    m_warmupPage = new QWebEnginePage(m_profile, this);
+    // loadFinished 经 onWarmupFinished 分流：成功/失败决定是否暂停周期重暖。
+    connect(m_warmupPage, &QWebEnginePage::loadFinished, this, &RenderPool::onWarmupFinished);
+    m_warmupGuardTimer.start(kWarmupTimeoutMsec);
+    m_warmupPage->load(QUrl(m_warmupUrl));
+}
+
+void RenderPool::finishWarmup() {
+    if (!m_warmupPage) return;
+    qWarning("[warmup] finalize (page destroyed, dispatch ensured)");
+    m_warmupGuardTimer.stop();
+    m_warmupPage->deleteLater();
+    m_warmupPage = nullptr;
+    startDispatch();
+}
+
+// loadFinished 回调（guard 超时也走这里，ok=false）：
+//   - 成功：清失败计数；若处于暂停态，恢复 30min 正常周期
+//   - 失败：失败计数++；达到阈值则暂停 30min 周期、改用 5min 探活
+// 无论成功失败都调 finishWarmup 销毁 page 并放行 dispatch（业务不受影响）。
+void RenderPool::onWarmupFinished(bool ok) {
+    if (!m_warmupPage) return;  // 已被 finishWarmup 收尾（幂等保护）
+    if (ok) {
+        if (m_warmupFailures > 0 || m_warmupSuspended) {
+            qWarning("[warmup] OK after %d failures (suspended=%d), resuming normal cycle",
+                     m_warmupFailures, m_warmupSuspended);
+        }
+        if (m_warmupSuspended) resumeFromSuspension();
+        m_warmupFailures = 0;
+    } else {
+        ++m_warmupFailures;
+        qWarning("[warmup] FAILED (%d/%d consecutive)", m_warmupFailures, kWarmupMaxFailures);
+        if (m_warmupFailures >= kWarmupMaxFailures && !m_warmupSuspended) {
+            qWarning("[warmup] SUSPENDED after %d consecutive failures, probing every %d ms",
+                     m_warmupFailures, kWarmupProbeIntervalMsec);
+            m_warmupSuspended = true;
+            m_warmupRewarmTimer.stop();              // 停 30min 周期
+            m_warmupProbeTimer.start(kWarmupProbeIntervalMsec);  // 启 5min 探活
+        }
+    }
+    finishWarmup();
+}
+
+// 探活成功恢复：清暂停标志 + 停探活 + 重启 30min 正常周期。
+void RenderPool::resumeFromSuspension() {
+    m_warmupSuspended = false;
+    m_warmupProbeTimer.stop();
+    m_warmupRewarmTimer.start(kWarmupIntervalMsec);
+    qWarning("[warmup] RESUMED normal cycle (%lld ms)", qint64(kWarmupIntervalMsec));
 }
 
 } // namespace seimi

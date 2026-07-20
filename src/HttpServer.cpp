@@ -242,6 +242,7 @@ std::string HttpServer::jsonStateResp(const RenderQueue::Snapshot& s, OutputMask
                       "\"";
     if (s.done && s.state == TaskState::Failed) {
         out += ",\"error\":\"" + esc(s.error) + "\"";
+        if (s.blocked) out += ",\"blocked\":true";   // 反爬拦截类型化标记（C3）
     }
     out += ",\"elapsed_ms\":" + std::to_string(elapsed < 0 ? 0 : elapsed);
 
@@ -341,6 +342,9 @@ std::string HttpServer::jsonRuntimeStatus(const httplib::Request& req) {
     s += ",\"totals\":{\"requests\":" + std::to_string(m.total) +
          ",\"succeeded\":" + std::to_string(m.succeeded) +
          ",\"failed\":" + std::to_string(m.failed) +
+         ",\"blocked_total\":" + std::to_string(m.blockedTotal) +
+         ",\"blocked_recovered\":" + std::to_string(m.blockedRecovered) +
+         ",\"blocked_exhausted\":" + std::to_string(m.blockedExhausted) +
          ",\"success_rate\":" + fmtDouble(m.successRate) + "}";
 
     // —— 延迟分布（仅成功任务，渲染耗时）——
@@ -370,6 +374,7 @@ std::string HttpServer::jsonRuntimeStatus(const httplib::Request& req) {
              ",\"total\":" + std::to_string(m.domains[i].total) +
              ",\"succeeded\":" + std::to_string(m.domains[i].succeeded) +
              ",\"failed\":" + std::to_string(m.domains[i].failed) +
+             ",\"blocked\":" + std::to_string(m.domains[i].blocked) +
              ",\"success_rate\":" + fmtDouble(
                  m.domains[i].total == 0 ? 0.0
                  : double(m.domains[i].succeeded) / double(m.domains[i].total)) +
