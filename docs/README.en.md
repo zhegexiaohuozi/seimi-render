@@ -1,8 +1,8 @@
-# seimi-render
+# <img src="../admin-ui/favicon.svg" width="32" align="top"> seimi-render
 
 > 📖 **Documentation languages:** [简体中文](../README.md) | **English**
 
-A Chromium-based web rendering service. Submit a URL and seimi-render loads the page with a real Chromium browser (executing JS, waiting for async content), then returns the fully rendered HTML, PDF, PNG, or structured JSON search results. Results can be fetched via long polling or WebSocket push. Runs silently in the background. Supports the MCP protocol, making it a perfect fit for AI agent tools — extending your harness's data-acquisition reach.
+A Chromium-based web rendering service. Submit a URL and seimi-render loads the page with a real Chromium browser (executing JS, waiting for async content), then returns the fully rendered HTML, PDF, PNG, or structured JSON search results. Results can be fetched via long polling or WebSocket push. Runs silently in the background. Supports the MCP protocol, making it a perfect fit for AI agent tools — extending your harness's data-acquisition reach. It can also serve as the underlying infrastructure for AI-driven reinforcement-learning iteration during vibe coding.
 
 This project is the modern successor to [SeimiAgent](https://github.com/zhegexiaohuozi/SeimiAgent).
 
@@ -126,6 +126,8 @@ Measured: rendering the Sohu homepage (`https://www.sohu.com/`) took **~8.5s**, 
 | `--trusted-proxy <list>` | — | Comma-separated trusted reverse-proxy IPs/CIDRs (e.g. `10.8.0.0/16,127.0.0.1`). When set, `/api/login` rate-limiting is based on the real client IP extracted from `X-Forwarded-For`; otherwise the TCP peer address is used (XFF ignored, to prevent spoofing) |
 | `--proxy <url>` | — | Upstream proxy for all Chromium traffic. Format `http://[user:pass@]host:port` or `socks5://[user:pass@]host:port`. Set via `QNetworkProxy::setApplicationProxy`; supports runtime `POST /proxy` hot-swap without restart. `type=direct` clears it |
 | `--no-stealth` | off (stealth on) | Disable browser fingerprint unification. Stealth is on by default, disguising every render instance as the same Chrome desktop environment (UA/screen/WebGL/canvas) to blend into the crowd and evade basic anti-bot detection (e.g. Google) |
+| `--no-warmup` | off (warmup on) | Disable startup Google session warm-up. On by default: at startup the service loads `--warmup-url` once in a hidden page (default https://www.google.com/) to acquire NID/CONSENT session cookies, **then** starts the dispatch timer to serve business requests — a cold start with zero cookies hitting /search directly is Google's highest-risk window for triggering a sorry page, and warm-up significantly lowers the sorry probability on the first search |
+| `--warmup-url <url>` | `https://www.google.com/` | Warm-up target URL (must be http/https). Only used when warm-up is on; usually no need to change it. In special environments (e.g. google.com unreachable through your proxy) you can swap in a mirror that reliably returns google-domain cookies. Warm-up has built-in failure adaptation: 3 consecutive warm-up failures (about 90min, Google unreachable) auto-suspend the 30min cycle and switch to a 5min low-frequency probe; on probe success it immediately resumes the normal cycle. State changes are logged as `[warmup] SUSPENDED` / `[warmup] RESUMED` |
 | `--help` | — | Show help |
 
 ### Concurrency & throughput (`--concurrency`)
@@ -153,7 +155,7 @@ See the table below for each console tab:
 |--------|------|:----------------:|
 | **Runtime stats** | Monitoring dashboard: uptime, total requests/success/fail/success-rate, throughput (req/s), latency distribution (min/avg/p50/p90/p99/max), output-type demand, per-domain request volume & success rate Top-N, queue snapshot. Good for capacity planning and locating high-failure-rate sites. | <a href="images/runtime-info.png" target="_blank"><img src="images/runtime-info.png" width="420" alt="Runtime stats"></a> |
 | **Render test bench** (Chinese) | Core debugging tool: enter a URL, tune settle_ms / long-poll, pick output formats (HTML/Markdown/PDF/screenshot), choose screenshot encoding and markdown algorithm, **site-specific extraction** (Baidu/Bing/Google SERP). The image shows Bing search results yielding 10 de-ads'd results. | <a href="images/bing-search-render.png" target="_blank"><img src="images/bing-search-render.png" width="420" alt="Render test bench - Bing result extraction"></a> |
-| **Render test bench** (English) | The same UI switched to English (top-right "中" toggles back to Chinese), demonstrating Google structured extraction (`extract=google_serp`). A direct way to verify that stealth fingerprint unification + prefetch downgrade are working. | <a href="images/google-search-extract-en.png" target="_blank"><img src="images/google-search-extract-en.png" width="420" alt="English UI - Google result extraction"></a> |
+| **Render test bench** (English) | The same UI switched to English (top-right "中" toggles back to Chinese), demonstrating Google structured extraction (`extract=google_serp`). A direct way to verify stealth fingerprint unification end-to-end. | <a href="images/google-search-extract-en.png" target="_blank"><img src="images/google-search-extract-en.png" width="420" alt="English UI - Google result extraction"></a> |
 | **Cookie status** | View the login-state cookies the render service holds, shown per-domain as "cookie count carried" (no values, to prevent leakage), to reconcile with the browser extension. "Clear current session" / "Permanently delete" clear in-memory session cookies and the encrypted persistent store (`data/cookies.dat`) respectively. | <a href="images/cookies.png" target="_blank"><img src="images/cookies.png" width="420" alt="Cookie status"></a> |
 | **Config example** | One-click copy of Agent integration & invocation config: the `mcpServers` JSON for Claude Code / Cursor, a curl-to-`/render` example, a WebSocket example, and the current access token (shown when `--password` is enabled). | <a href="images/config-show.png" target="_blank"><img src="images/config-show.png" width="420" alt="Config example"></a> |
 | **API docs** | Interactive API docs: the left tree groups by "HTTP REST / MCP tools / WebSocket" (16 HTTP endpoints + 4 MCP tools + WS render/subscribe/auth); the right pane has parameter tables, curl/JSON examples, response examples and error codes, all one-click copyable. | <a href="images/api-docs.png" target="_blank"><img src="images/api-docs.png" width="420" alt="API docs"></a> |
@@ -226,7 +228,8 @@ After syncing, you can view the cookies the render service currently holds on th
 | `url` | The submitted URL |
 | `state` | `pending` / `running` / `succeeded` / `failed` |
 | `html` | The fully rendered HTML (present only on `succeeded`) |
-| `error` | Failure reason (present only on `failed`) |
+| `error` | Failure reason (present only on `failed`). **Anti-bot-block failures** have an `error` starting with `blocked:`, typically `blocked: google /sorry/ page (2 retries exhausted)` (hit Google's verification page → automatic backoff retry → retries exhausted → blocked) |
+| `blocked` | Boolean, `true` only when `state=failed` and the failure was caused by an anti-bot block (typical scenario: Google `/sorry/` verification page with retries exhausted). Together with the `blocked:` prefix on `error` above, callers can explicitly distinguish "anti-bot block" from "timeout / network error" |
 | `elapsed_ms` | Elapsed time from render start to now (ms) |
 
 ### Submit a task (async)
@@ -271,7 +274,11 @@ curl "http://localhost:8088/result/a3f1...?timeout=30000"
 # complete: {"task_id":"...","state":"succeeded","html":"<!DOCTYPE html>...","elapsed_ms":8550}
 # timed out, still running: {"task_id":"...","state":"running","elapsed_ms":30000}
 # failed: {"task_id":"...","state":"failed","error":"...","elapsed_ms":...}
+# anti-bot block (Google /sorry/ retries exhausted):
+#   {"task_id":"...","state":"failed","error":"blocked: google /sorry/ page (2 retries exhausted)","blocked":true,"elapsed_ms":...}
 ```
+
+> **Anti-bot failure typing**: when rendering Google and similar sites hits a verification page (typically `/sorry/`), seimi-render automatically retries with backoff (fresh page, 2 attempts); if retries keep hitting the page it's typed as a `blocked` failure — the response carries both the `blocked:` prefix on `error` and `blocked:true`, letting callers explicitly distinguish "anti-bot block" from "timeout / network error". For the former, switch engine / use a proxy / IP pool; for the latter, just retry. The stats layer (`/status`) also accumulates `blocked_exhausted` (see below).
 
 ### Runtime status (`GET /status`)
 
@@ -294,7 +301,8 @@ Response (formatted):
     "total": 2, "pending": 0, "running": 1, "done": 1
   },
   "totals": {
-    "requests": 1280, "succeeded": 1244, "failed": 36, "success_rate": 0.972
+    "requests": 1280, "succeeded": 1244, "failed": 36, "success_rate": 0.972,
+    "blocked_total": 14, "blocked_recovered": 9, "blocked_exhausted": 5
   },
   "latency_ms": {
     "min": 980, "avg": 5230.4, "p50": 4120, "p90": 8910, "p99": 15630, "max": 28010
@@ -304,12 +312,14 @@ Response (formatted):
   "domains": {
     "distinct": 87,
     "top": [
-      { "host": "www.sohu.com",   "total": 600, "succeeded": 598, "failed": 2,   "success_rate": 0.997 },
-      { "host": "example.com",    "total": 410, "succeeded": 385, "failed": 25,  "success_rate": 0.939 }
+      { "host": "www.google.com", "total": 210, "succeeded": 205, "failed": 5, "blocked": 14, "success_rate": 0.976 },
+      { "host": "www.sohu.com",   "total": 600, "succeeded": 598, "failed": 2, "blocked": 0,  "success_rate": 0.997 }
     ]
   }
 }
 ```
+
+> The `blocked`-carrying fields in `totals` and `domains.top[]` above are **anti-bot-block three-state counts** (orthogonal to `succeeded`/`failed`, accumulated once when a task reaches a terminal state):
 
 Field descriptions:
 
@@ -319,11 +329,15 @@ Field descriptions:
 | `queue` | Live queue snapshot (same as `/stats`) |
 | `totals.requests/succeeded/failed` | Cumulative terminal-state counts since start |
 | `totals.success_rate` | `succeeded / requests`, 0–1 |
+| `totals.blocked_total` | Total anti-bot-block page-detection events (includes each hit during retries — a task that hits sorry and retries and hits sorry again is counted 2 times) |
+| `totals.blocked_recovered` | Tasks that hit a block but **ultimately succeeded** (tasks that escaped sorry after retry; reflects the combined recovery power of stealth + warm-up + retry) |
+| `totals.blocked_exhausted` | Tasks that exhausted retries and were typed as `blocked` **failures** (corresponds to `blocked:true` in the response). Relationship: `blocked_recovered + blocked_exhausted` ≤ total tasks that ever hit a block; `blocked_total` ≥ `blocked_recovered + blocked_exhausted` (includes multiple hits during retries) |
 | `latency_ms` | Render-time distribution for **successful tasks only**; failures excluded. p50/p90/p99 approximated via a log-bucket histogram (fixed memory, no per-sample storage) |
 | `throughput_per_sec` | `requests / uptime(seconds)` |
 | `outputs.html/markdown/pdf` | How many times each output type was requested (bit-flag counting) |
 | `domains.distinct` | Total distinct hosts seen |
 | `domains.top[]` | Top-N domains by `total` descending, each with succeeded/failed/success_rate |
+| `domains.top[].blocked` | Cumulative block-page detection count for that domain (includes each hit during retries). Most useful for locating high-risk sites (e.g. `www.google.com`'s `blocked` is far higher than other domains) |
 
 > **Resource cost**: metrics are updated exactly once when a task reaches a terminal state (success/failure), never on the hot path; latency uses a fixed 32-bucket histogram (O(1) memory, O(1) update); the domain map is capped at 1000 hosts, evicting the coldest when exceeded, to stop the host map from growing unbounded under hostile/crawler scenarios. `GET /status` locks once to copy the snapshot; the top-N sort runs only over the returned N rows, negligible cost.
 
@@ -968,3 +982,20 @@ sequenceDiagram
     WS-->>WC: {"event":"finished","task_id":"...","state":"succeeded"}
     Note over WC: then fetch artifacts via HTTP /result/:id
 ```
+
+## License
+
+This project (seimi-render's own source, under [`../src/`](../src/), [`../scripts/`](../scripts/), [`../chrome-extension/`](../chrome-extension/)) is released under the **Apache License 2.0**, copyright © 2026 [wanghaomiao.cn](mailto:et.tw@163.com). See [`../LICENSE`](../LICENSE) for the full text and [`../NOTICE`](../NOTICE) for attribution.
+
+### Third-party dependencies
+
+This project uses the following third-party components, each under its own license (copyright notices preserved in the source files):
+
+| Dependency | Purpose | License |
+|------|------|------|
+| [Qt 6](https://www.qt.io/) (Qt WebEngine / Network / WebSockets etc.) | Chromium render core, network stack | **LGPL v3** (open-source option) / commercial dual-licensed |
+| [cpp-mcp](../third_party/cpp-mcp/) | MCP protocol implementation | MIT |
+| [cpp-httplib](../third_party/httplib.h) | HTTP service | MIT |
+| [html2md](../third_party/html2md.cpp) / [table](../third_party/table.cpp) | HTML→Markdown conversion | MIT |
+| [qaes](../third_party/qaes/) | AES encryption | Public Domain |
+| [Mozilla Readability](../third_party/readability/) | Body extraction | Apache License 2.0 |
