@@ -19,8 +19,8 @@ bad()  { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 echo "== seimi-render 冒烟测试 ($BASE) =="
 
 # 0. 健康检查
-if curl -sf --max-time 3 "$BASE/" | grep -q '"status":"ok"'; then
-    ok "健康检查 /"
+if curl -sf --max-time 3 "$BASE/health" | grep -q '"status":"ok"'; then
+    ok "健康检查 /health"
 else
     bad "健康检查失败（服务未运行？）"; exit 1
 fi
@@ -54,6 +54,21 @@ if [[ "$COK" -ge 3 ]]; then ok "并发渲染 $COK/4 成功"; else bad "并发渲
 
 # 4. 队列统计
 if curl -sf --max-time 3 "$BASE/stats" | grep -q "total"; then ok "统计 /stats"; else bad "统计失败"; fi
+
+# 4.5 反爬 blocked 类型化（Google /sorry/ 确定性触发；本环境可能挂起不命中则跳过）
+echo "- 反爬 blocked 检测（google /sorry/）..."
+RESP=$(curl -s --max-time 60 -X POST "$BASE/render" -H "Content-Type: application/json" \
+    -d '{"url":"https://www.google.com/sorry/","settle_ms":1000,"long_poll_ms":55000}')
+ST=$(echo "$RESP" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('state',''),d.get('blocked',False))" 2>/dev/null)
+if [[ "$ST" == "failed True" ]]; then
+    ok "blocked 类型化（failed + blocked:true）"
+elif echo "$RESP" | grep -q '"state":"succeeded"'; then
+    echo "  - Google /sorry/ 未命中拦截页（环境差异），跳过该断言"
+elif echo "$RESP" | grep -q '"state":"failed"'; then
+    echo "  - Google /sorry/ 失败但非 blocked 路径（可能 timeout/网络），跳过该断言"
+else
+    bad "blocked 类型化异常：$ST"
+fi
 
 # 5. WebSocket 推送
 echo "- WebSocket 推送..."

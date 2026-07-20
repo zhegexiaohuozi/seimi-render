@@ -114,6 +114,8 @@ struct RenderTask {
     MdAlgorithm mdAlgorithmUsed{MdAlgorithm::Conservative};
     QString serpJson;                  // SERP 结构化提取结果 JSON 字符串（extract!=None 且成功时填）
     QString error;                    // 失败原因
+    bool blocked{false};              // 终态失败是否因反爬拦截（google /sorry/ 重试耗尽）
+    int  blockAttempts{0};            // 渲染期间累计反爬拦截页检测次数（Metrics 用）
     bool done{false};                 // 终态标志（Succeeded 或 Failed）
 
     // 计时（受锁保护），用于观测

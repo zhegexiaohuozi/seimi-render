@@ -73,6 +73,7 @@ env/
 ENV/
 .python-version
 # Test / coverage / type-check caches
+docs/superpowers/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
