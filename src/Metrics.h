@@ -29,7 +29,10 @@ public:
     //   succeeded : 是否成功
     //   elapsedMs : 从开始渲染到完成的耗时（含排队前的渲染耗时；不含排队等待）
     //   outputs   : 请求的输出类型位标记（用于统计 html/markdown/pdf 需求分布）
-    void record(std::string host, bool succeeded, std::int64_t elapsedMs, std::uint8_t outputs);
+    //   blockAttempts : 该任务渲染期间累计反爬拦截页检测次数（0=未触发）
+    //   blockedFinal  : 终态是否因反爬拦截耗尽重试而失败
+    void record(std::string host, bool succeeded, std::int64_t elapsedMs, std::uint8_t outputs,
+                int blockAttempts, bool blockedFinal);
 
     // ====== 运行时快照（GET /status 用）======
 
@@ -38,6 +41,7 @@ public:
         std::int64_t total = 0;
         std::int64_t succeeded = 0;
         std::int64_t failed = 0;
+        std::int64_t blocked = 0;   // 该域累计反爬拦截页检测次数（含重试中的每次命中）
     };
 
     struct Snapshot {
@@ -58,6 +62,10 @@ public:
         std::int64_t latencyP99Ms = 0;
         // 吞吐
         double throughputPerSec = 0.0;      // 终态任务 / 运行时长(秒)
+        // 反爬拦截（自启动起）
+        std::int64_t blockedTotal = 0;      // 拦截页检测事件总数（含重试中的每次命中）
+        std::int64_t blockedRecovered = 0;  // 经历过拦截但最终成功的任务数
+        std::int64_t blockedExhausted = 0;  // 重试耗尽判 blocked 失败的任务数
         // 输出类型需求分布（请求次数）
         std::int64_t outputHtml = 0;
         std::int64_t outputMarkdown = 0;
@@ -82,6 +90,11 @@ private:
     std::int64_t m_total = 0;
     std::int64_t m_succeeded = 0;
 
+    // 反爬拦截三态计数（终态时累加，与 succeeded/failed 正交）
+    std::int64_t m_blockedTotal = 0;       // 拦截事件总数（每次命中都算，含重试）
+    std::int64_t m_blockedRecovered = 0;   // 经历过拦截但最终成功的任务数
+    std::int64_t m_blockedExhausted = 0;   // 重试耗尽判 blocked 失败的任务数
+
     // 成功延迟：直方图桶 + 总和（用于算 avg）
     // 桶按 2 的幂划分（powers-of-two style），ms -> bucket index = floor(log2(ms))+1
     // 落桶后用线性插值算分位数。固定大小，O(1) 更新。
@@ -99,11 +112,12 @@ private:
     std::int64_t m_outputPdf = 0;
     std::int64_t m_outputScreenshot = 0;
 
-    // 域名分布：host -> {total, succeeded, failed}
+    // 域名分布：host -> {total, succeeded, failed, blocked}
     struct HostCount {
         std::int64_t total = 0;
         std::int64_t succeeded = 0;
         std::int64_t failed = 0;
+        std::int64_t blocked = 0;
     };
     std::unordered_map<std::string, HostCount> m_domains;
     static constexpr int kMaxHosts = 1000;  // 域名映射上限，超限剔除最冷门者

@@ -64,6 +64,7 @@ public:
         QString id;
         QString url;
         QString error;                     // 失败原因（done 且 Failed 时有意义）
+        bool blocked = false;              // 失败是否因反爬拦截（google /sorry/ 重试耗尽）
         QString html;                      // 渲染后完整 HTML（成功时）
         QString markdown;                  // HTML 转 markdown（请求了 markdown 时）
         QByteArray pdfData;                // PDF 字节（请求了 pdf 时）

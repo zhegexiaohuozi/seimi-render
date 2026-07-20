@@ -65,6 +65,18 @@ private:
     void decCollect();          // 异步采集计数递减 + 收尾检查
     void tryFinishCollect();    // 检查采集是否全部到齐
     void finishFailure(const QString& reason);
+    // —— Google 反爬 sorry 页检测 + worker 内退避重试 ——
+    // loadFinished 后查最终 URL（BlockDetect::isGoogleSorryUrl）。命中则以全新 page 退避
+    // 重试（铁律 3：每次尝试全新 QWebEnginePage），耗尽后标记 blocked 失败透出（C3）。
+    void handleSorryDetected();      // 命中 sorry：重试或终结
+    void startAttempt();             // assign/retry 共用：建全新 view/page 并发起 load
+
+    // 重试参数（代码常量，不进 CLI——不够通用，需要时改这里，见设计文档配置项汇总）。
+    static constexpr int kAntibotMaxRetries = 2;
+    static constexpr int kAntibotRetryBaseDelayMsec = 2000;
+
+    int m_retryCount{0};             // 当前任务已重试次数
+    int m_sorryHits{0};              // 当前任务累计 sorry 检测次数（写回 task->blockAttempts）
     void destroyPage();         // 销毁当前 page 并复位状态
 
     // —— markdown Readability 正文提取（可选算法）——
@@ -86,16 +98,6 @@ private:
     // 结果 JSON 存 m_serpJsonResult，透传到 RenderResult.serpJson。失败则留空，降级正常渲染。
     void extractSerp();
     void readSerpChunks(int idx, int total, const QString& acc);
-
-    // —— 搜索引擎 TLS 风控降级（curl 预取 + setHtml 重渲染）——
-    // Google/Bing 等基于 TLS 指纹(JA3/JA4) 在握手层 RST Chromium 的 BoringSSL 连接，
-    // 而 QNetworkAccessManager(OpenSSL) 不被识别。对搜索引擎 URL，assign 时并行启动预取；
-    // Chromium load 失败则用预取 HTML 经 setHtml 重加载（搜索引擎结果高度 JS 化，需 JS 执行）。
-    // 预取走 ProxyConfig 配置的代理。非搜索引擎 URL 不启动预取。
-    static bool isSearchEngineUrl(const QString& url);
-    void startPrefetch(const QString& url);
-    void onPrefetched(const QString& html);
-    bool tryPrefetchFallback();
 
     // —— 截图（PNG，所见即所得，区别于 pdf 的打印输出）——
     // 异步状态机：
@@ -125,8 +127,6 @@ private:
     // 截图宽度上限。页面宽度取自 clientWidth（页面 JS 可控），不加钳制则恶意页报超大宽度会令
     // resize 与 QImage 分配爆炸式内存（OOM DoS）。4096 覆盖所有正常宽页。
     static constexpr int kMaxImageWidth = 4096;
-    // 预取 HTML 体积上限。搜索引擎结果页远小于此；超限视为异常/攻击，丢弃降级。
-    static constexpr int kMaxPrefetchBytes = 5 * 1024 * 1024;
 
     QWebEngineProfile* m_profile;
     RenderQueue* m_queue;
@@ -136,13 +136,6 @@ private:
 
     QTimer m_loadTimer;         // 从 assign 起，覆盖 load + 采集的总超时
     QTimer m_settleTimer;       // loadFinished 后的 JS 执行延时
-
-    // 搜索引擎预取降级（见 startPrefetch/tryPrefetchFallback）。QProcess 调 system curl
-    //（this 父子管理生命周期，无需单独成员持有）。
-    QString m_prefetchedHtml;                        // 预取成功后的 HTML（空=未预取/失败）
-    QString m_effectivePrefetchUrl;                  // curl -L 跟随重定向后的最终 URL（同源校验用）
-    bool m_prefetchDone = false;                     // 预取已完成（成功或失败）
-    bool m_prefetchUsed = false;                     // setHtml 降级已用过（防无限循环）
 
     RenderTaskPtr m_task;
     bool m_busy;
@@ -210,6 +203,12 @@ public:
     void setStealthEnabled(bool enabled) { m_stealthEnabled = enabled; }
     bool isStealthEnabled() const { return m_stealthEnabled; }
 
+    // Google 会话预热：start() 末尾先渲染 warmup URL 拿 NID/SOCS cookie，完成/超时后才
+    // 启动分发（实测：冷启动零 cookie 直打 /search 是最高风控窗口）。之后按
+    // kWarmupIntervalMsec 周期重暖。必须在 start() 前调用。
+    void setWarmupEnabled(bool enabled) { m_warmupEnabled = enabled; }
+    void setWarmupUrl(const QString& url) { m_warmupUrl = url; }
+
 signals:
     // 透传每个 worker 的任务完成事件。
     void taskFinished(const QString& id);
@@ -218,6 +217,12 @@ private slots:
     void dispatch();
 
 private:
+    void startWarmup();         // 发起一次预热（独立临时 page，不占 worker；GUI 线程，铁律 1）
+    void finishWarmup();        // 预热完成/超时收尾：销毁 page + 确保分发已启动（幂等）
+    void onWarmupFinished(bool ok);  // loadFinished 回调：成功/失败分流 + 失败计数 + 暂停/恢复
+    void resumeFromSuspension();     // 探活恢复：清失败计数 + 停探活 + 重启 30min 周期
+    void startDispatch();       // 启动分发定时器（幂等）
+
     RenderQueue* m_queue;
     int m_concurrency;
     qint64 m_loadTimeoutMsec;
@@ -232,6 +237,23 @@ private:
     // SSRF 二次防护：装到共享 profile 上，对 Chromium 实际发起的每个请求再判一次，
     // 堵住重定向 / DNS rebinding / 内嵌子框架等提交时校验无法覆盖的旁路（见 SsrfInterceptor.h）。
     SsrfRequestInterceptor* m_ssrfInterceptor = nullptr;
+    // 预热参数（重暖间隔为代码常量，不进 CLI——不够通用，见设计文档配置项汇总）。
+    static constexpr qint64 kWarmupIntervalMsec = 30 * 60 * 1000;
+    static constexpr int kWarmupTimeoutMsec = 10 * 1000;  // 单次预热上限（防启动卡死）
+    bool m_warmupEnabled = true;
+    QString m_warmupUrl = QStringLiteral("https://www.google.com/");
+    QWebEnginePage* m_warmupPage = nullptr;   // 预热专用临时 page
+    QTimer m_warmupGuardTimer;   // 预热超时守卫（singleShot）
+    QTimer m_warmupRewarmTimer;  // 周期重暖
+    // warmup 自适应暂停：连续失败阈值 + 失败计数 + 暂停标志 + 低频探活 timer。
+    // 设计：Google 不可达时 30min 周期浪费 10s 超时；3 次连续失败（≈90min）后暂停，
+    // 改用 5min 探活；探活成功立即恢复 30min 正常周期。
+    static constexpr int kWarmupMaxFailures = 3;           // 连续失败次数阈值
+    static constexpr int kWarmupProbeIntervalMsec = 5 * 60 * 1000;  // 暂停后探活间隔
+    int m_warmupFailures = 0;                              // 连续失败计数（成功则清零）
+    bool m_warmupSuspended = false;                        // 是否处于暂停态（探活模式）
+    QTimer m_warmupProbeTimer;                             // 暂停态低频探活（5min）
+    bool m_dispatchStarted = false;
 };
 
 } // namespace seimi

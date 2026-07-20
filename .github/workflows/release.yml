@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: '构建类型'
+        required: true
+        default: 'Release'
+        type: choice
+        options: [Release, Debug]
+
+env:
+  QT_VERSION: '6.8.2'
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt (arm64)
+        id: install-qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: arm64_darwin
+          modules: qtwebengine qtwebsockets qtwebchannel qtpdf qtpositioning
+          cache: true
+
+      - name: Package (.app → zip)
+        env:
+          QT_PREFIX: ${{ steps.install-qt.outputs.Qt6_DIR }}/../..
+        run: bash scripts/package.sh ${{ inputs.config }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seimi-render-macos-arm64
+          path: build/seimi-render-*-macos-*.zip
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    container: almalinux:8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled powertools || dnf config-manager --set-enabled crb
+          dnf install -y \
+            gcc gcc-c++ cmake ninja-build patchelf make \
+            mesa-libGL-devel nss-devel libxkbcommon-devel libxkbcommon \
+            dbus-devel alsa-lib-devel libXrandr-devel libXcomposite-devel \
+            libXcursor-devel libXi-devel libXtst-devel libXrender-devel \
+            libXext-devel libX11-devel libX11-xcb libXScrnSaver-devel \
+            libxcb-devel cups-devel pulseaudio-libs-devel \
+            fontconfig-devel freetype-devel libxkbfile-devel \
+            google-noto-sans-cjk-fonts-fonts python3 python3-pip
+
+      - name: Install Qt
+        run: |
+          pip3 install aqtinstall
+          aqt install-qt linux desktop ${{ env.QT_VERSION }} gcc_64 \
+            -m qtwebengine qtwebsockets qtwebchannel qtpdf qtpositioning \
+            -O /opt/Qt
+
+      - name: Package (tar.gz)
+        env:
+          QT_PREFIX: /opt/Qt/${{ env.QT_VERSION }}/gcc_64
+        run: bash scripts/package-linux.sh ${{ inputs.config }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seimi-render-linux-x64
+          path: build/seimi-render-*-linux-*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        id: install-qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          modules: qtwebengine qtwebsockets qtwebchannel qtpdf qtpositioning
+          cache: true
+
+      - name: Package (zip)
+        env:
+          QT_INSTALL_DIR: ${{ steps.install-qt.outputs.Qt6_DIR }}\..\..\..
+          QT_ARCH_DIR: msvc2022_64
+        shell: cmd
+        run: scripts\package-windows.bat ${{ inputs.config }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seimi-render-win-x64
+          path: build/seimi-render-*-win-*.zip
+          if-no-files-found: error

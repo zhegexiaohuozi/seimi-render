@@ -102,6 +102,8 @@ struct Config {
     // 初始代理可空（直连），运行时由 POST /proxy 动态更新，无需重启。
     ProxySpec initialProxy;       // 启动时 --proxy 指定的初始代理（默认 Direct 直连）
     bool stealthEnabled = true;   // 浏览器指纹统一（默认开启，--no-stealth 关闭）
+    bool warmupEnabled = true;    // Google 会话预热（默认开启，--no-warmup 关闭）
+    std::string warmupUrl = "https://www.google.com/";  // --warmup-url 自定义预热目标
 };
 
 static void printUsage() {
@@ -139,6 +141,10 @@ static void printUsage() {
         "                        Stealth unifies all render instances into a single Chrome\n"
         "                        desktop fingerprint (UA/screen/WebGL/canvas) to blend into\n"
         "                        the crowd and bypass basic anti-bot detection (e.g. Google).\n"
+        "  --no-warmup           disable Google session warm-up at startup (default: enabled).\n"
+        "                        Warm-up renders --warmup-url once to acquire Google cookies\n"
+        "                        (NID/SOCS) before dispatching render tasks; re-warms every 30min.\n"
+        "  --warmup-url <url>    warm-up target (default https://www.google.com/; must be http/https)\n"
         "  --help                show this help\n");
 }
 
@@ -231,6 +237,8 @@ static Config parseArgs(int argc, char** argv) {
         else if (a == "--trusted-proxy" && i + 1 < argc) c.trustedProxies = argv[++i];
         else if (a == "--proxy" && i + 1 < argc) c.initialProxy = parseProxyUrl(argv[++i]);
         else if (a == "--no-stealth") c.stealthEnabled = false;
+        else if (a == "--no-warmup") c.warmupEnabled = false;
+        else if (a == "--warmup-url" && i + 1 < argc) c.warmupUrl = argv[++i];
     }
     c.concurrency   = std::max(1, c.concurrency);
     c.httpThreads   = std::max(2, c.httpThreads);
@@ -257,6 +265,14 @@ int main(int argc, char** argv) {
     Config cfg = parseArgs(argc, argv);
     g_verboseChromium = cfg.verboseChromium;
     qInstallMessageHandler(noiseFilter);  // 安装降噪过滤器（在 QApplication 之前）
+
+    // warmup URL 校验：仅 http/https（运维配置项，不过 SSRF——同 --proxy 语义）。
+    if (cfg.warmupEnabled
+        && cfg.warmupUrl.rfind("http://", 0) != 0
+        && cfg.warmupUrl.rfind("https://", 0) != 0) {
+        std::fprintf(stderr, "FATAL: --warmup-url must be http/https: %s\n", cfg.warmupUrl.c_str());
+        return 1;
+    }
 
     // 平台选择：无头渲染服务默认 offscreen（无窗口、不依赖窗口系统、事件循环稳定）。
     // --windowed 强制原生平台（调试看真实窗口）。
@@ -369,6 +385,8 @@ int main(int argc, char** argv) {
     pool.setCookieStore(&cookies);
     pool.setProxyConfig(&proxyConfig);
     pool.setStealthEnabled(cfg.stealthEnabled);
+    pool.setWarmupEnabled(cfg.warmupEnabled);
+    pool.setWarmupUrl(QString::fromStdString(cfg.warmupUrl));
 
     // WebSocket 服务（GUI 线程）：支持 render 请求与 subscribe 订阅。
     // 启用密码时传入同一确定性 token，WS 端口同样受保护（见 WsServer 鉴权）。
@@ -393,7 +411,8 @@ int main(int argc, char** argv) {
             RenderTaskPtr t = queue.peek(id);
             QString state = t ? QString::fromLatin1(taskStateName(t->state))
                               : QStringLiteral("failed");
-            ws.notifyFinished(id, state);
+            bool blocked = t && t->blocked;   // 反爬拦截标记随推送透出
+            ws.notifyFinished(id, state, blocked);
         });
 
     // 管理 UI 资源目录定位：优先二进制同级 admin-ui/；开发模式（同级没有）回退到源码目录。

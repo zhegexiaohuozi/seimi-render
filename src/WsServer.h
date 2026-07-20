@@ -51,7 +51,7 @@ public:
 
 public slots:
     // 主线程收到 RenderPool::taskFinished 时调用，向所有订阅者推送 finished。
-    void notifyFinished(const QString& taskId, const QString& state);
+    void notifyFinished(const QString& taskId, const QString& state, bool blocked = false);
 
 private slots:
     void onNewConnection();

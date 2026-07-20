@@ -249,7 +249,7 @@ void WsServer::onSocketDisconnected() {
     sock->deleteLater();
 }
 
-void WsServer::notifyFinished(const QString& taskId, const QString& state) {
+void WsServer::notifyFinished(const QString& taskId, const QString& state, bool blocked) {
     auto it = m_subscriptions.find(taskId);
     if (it == m_subscriptions.end()) return;
 
@@ -257,6 +257,7 @@ void WsServer::notifyFinished(const QString& taskId, const QString& state) {
         {QStringLiteral("event"), QStringLiteral("finished")},
         {QStringLiteral("task_id"), taskId},
         {QStringLiteral("state"), state}};
+    if (blocked) msg.insert(QStringLiteral("blocked"), true);   // 反爬拦截类型化标记
 
     // 拷贝列表：发送可能触发对端关闭 → 修改原列表
     QList<QWebSocket*> subs = it.value();

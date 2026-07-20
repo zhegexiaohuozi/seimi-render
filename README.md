@@ -1,8 +1,8 @@
-# seimi-render
+# <img src="admin-ui/favicon.svg" width="32" align="top"> seimi-render
 
 > 📖 **文档语言：** **简体中文** | [English](docs/README.en.md)
 
-这个工程的更原始的版本是[SeimiAgent](https://github.com/zhegexiaohuozi/SeimiAgent)，SeimiRender是SeimiAgent的现代化升级版。基于Chromium的网页渲染服务。提交 URL，以真实的 Chromium 浏览器行为渲染页面（执行 JS、等待异步内容），然后返回渲染后的完整 HTML、pdf、png、json结构化搜素结果。支持长轮询与 WebSocket 推送获取结果。可在后台静默无打扰运行。支持MCP协议，完美适配各类Ai Agent工具，拓展你的Harness数据获取边界。
+这个工程的更原始的版本是[SeimiAgent](https://github.com/zhegexiaohuozi/SeimiAgent)，SeimiRender是SeimiAgent的现代化升级版。基于Chromium的网页渲染服务。提交 URL，以真实的 Chromium 浏览器行为渲染页面（执行 JS、等待异步内容），然后返回渲染后的完整 HTML、pdf、png、json结构化搜素结果。支持长轮询与 WebSocket 推送获取结果。可在后台静默无打扰运行。支持MCP协议，完美适配各类AI Agent工具，拓展你的Harness数据获取边界。也可以是Vibe Coding中AI进行RL迭代自动优化的基础设施。
 
 ## 特性
 
@@ -125,6 +125,8 @@ curl -X POST http://localhost:8088/render \
 | `--trusted-proxy <list>` | — | 逗号分隔的受信反向代理 IP/CIDR（如 `10.8.0.0/16,127.0.0.1`）。设置后 `/api/login` 限流基于从 `X-Forwarded-For` 提取的真实客户端 IP；未设置时使用 TCP 对端地址（忽略 XFF，防伪造） |
 | `--proxy <url>` | — | 所有 Chromium 流量的上游代理。格式 `http://[user:pass@]host:port` 或 `socks5://[user:pass@]host:port`。经 `QNetworkProxy::setApplicationProxy` 设置，支持运行时 `POST /proxy` 热切换无需重启。`type=direct` 清除 |
 | `--no-stealth` | 关闭（stealth 开启） | 禁用浏览器指纹统一。默认开启 stealth，将所有渲染实例伪装成同一 Chrome 桌面环境（UA/screen/WebGL/canvas），融入人群以绕过基础反爬（如 Google） |
+| `--no-warmup` | 关闭（warmup 开启） | 关闭启动 Google 会话预热。默认开启：进程启动时先以隐藏 page 加载一次 `--warmup-url`（默认 https://www.google.com/）拿到 NID/CONSENT 等会话 cookie，**再**启动 dispatch 定时器接业务请求——冷启动零 cookie 直打搜索是 Google 风控的最高危窗口，预热能显著降低首条搜索的 sorry 概率 |
+| `--warmup-url <url>` | `https://www.google.com/` | 会话预热目标 URL（必须 http/https）。仅在 warmup 开启时使用；一般无需改，特殊环境（如走代理时 google.com 不通）可换成能稳定返回 google 域 cookie 的镜像。warmup 自带失败自适应：连续 3 次预热失败（约 90min，Google 不可达）会自动暂停 30min 周期、改用 5min 低频探活；探活成功立即恢复正常周期。状态变化在服务日志里以 `[warmup] SUSPENDED` / `[warmup] RESUMED` 标记 |
 | `--help` | — | 显示帮助信息 |
 
 ### 并发与吞吐（`--concurrency`）
@@ -152,7 +154,7 @@ seimi-render 内置一个浏览器管理控制台(`GET /`,访问根路径即打�
 |--------|------|:----------------:|
 | **运行时统计** | 监控大盘:运行时长、总请求/成功/失败/成功率、吞吐(req/s)、延迟分布(min/avg/p50/p90/p99/max)、输出类型需求、按域名的请求量与成功率 Top-N、队列快照。适合容量规划、定位高失败率站点。 | <a href="docs/images/runtime-info.png" target="_blank"><img src="docs/images/runtime-info.png" width="420" alt="运行时统计"></a> |
 | **渲染测试台**(中文) | 核心调试工具:输入 URL,可调 settle_ms / 长轮询、勾选输出格式(HTML/Markdown/PDF/截图)、选截图编码与 markdown 算法、**站点特定提取**(百度/必应/Google SERP)。下图演示必应搜索结果提取出 10 条去广告结果。 | <a href="docs/images/bing-search-render.png" target="_blank"><img src="docs/images/bing-search-render.png" width="420" alt="渲染测试台 - Bing 搜索结果提取"></a> |
-| **渲染测试台**(English) | 同一界面切到 English(右上角「中」切回中文),演示 Google 搜索结果结构化提取(`extract=google_serp`)。可直观验证 stealth 指纹统一 + 预取降级是否生效。 | <a href="docs/images/google-search-extract-en.png" target="_blank"><img src="docs/images/google-search-extract-en.png" width="420" alt="英文界面 - Google 搜索结果提取"></a> |
+| **渲染测试台**(English) | 同一界面切到 English(右上角「中」切回中文),演示 Google 搜索结果结构化提取(`extract=google_serp`)。 | <a href="docs/images/google-search-extract-en.png" target="_blank"><img src="docs/images/google-search-extract-en.png" width="420" alt="英文界面 - Google 搜索结果提取"></a> |
 | **Cookie 状态** | 查看渲染服务持有的登录态 cookie,按域名展示「携带 cookie 数量」(不含 value,防泄露),与浏览器插件对账。「清空当前会话」/「永久删除」分别清内存会话与加密持久化存储(`data/cookies.dat`)。 | <a href="docs/images/cookies.png" target="_blank"><img src="docs/images/cookies.png" width="420" alt="Cookie 状态"></a> |
 | **配置示例** | 一键复制 Agent 接入与调用配置:Claude Code / Cursor 的 `mcpServers` JSON、curl 调 `/render` 示例、WebSocket 示例,以及当前访问 token(启用 `--password` 时显示)。 | <a href="docs/images/config-show.png" target="_blank"><img src="docs/images/config-show.png" width="420" alt="配置示例"></a> |
 | **接口文档** | 交互式 API 文档:左目录按「HTTP REST / MCP 工具 / WebSocket」分组(16 HTTP 端点 + 4 MCP 工具 + WS 的 render/subscribe/auth),右详情含参数表、curl/JSON 示例、响应示例与错误码,均可一键复制。 | <a href="docs/images/api-docs.png" target="_blank"><img src="docs/images/api-docs.png" width="420" alt="接口文档"></a> |
@@ -225,7 +227,8 @@ seimi-render 默认Chromum内核渲染,没有你的登录态。要渲染「登�
 | `url` | 提交的 URL |
 | `state` | `pending` / `running` / `succeeded` / `failed` |
 | `html` | 渲染后的完整 HTML（仅 `succeeded` 时有） |
-| `error` | 失败原因（仅 `failed` 时有） |
+| `error` | 失败原因（仅 `failed` 时有）。**反爬拦截类失败**的 `error` 以 `blocked:` 开头，典型形如 `blocked: google /sorry/ page (2 retries exhausted)`（命中 Google 验证页 → 自动退避重试 → 重试耗尽判 blocked） |
+| `blocked` | 布尔，仅在 `state=failed` 且失败因反爬拦截时为 `true`（典型场景：Google `/sorry/` 验证页重试耗尽）。配合上面的 `error` 前缀 `blocked:`，调用方可显式区分「反爬拦截」与「超时/网络错」两条失败路径 |
 | `elapsed_ms` | 从开始渲染到当前的耗时（ms） |
 
 ### 提交任务（异步）
@@ -270,7 +273,11 @@ curl "http://localhost:8088/result/a3f1...?timeout=30000"
 # 完成时: {"task_id":"...","state":"succeeded","html":"<!DOCTYPE html>...","elapsed_ms":8550}
 # 超时未完成: {"task_id":"...","state":"running","elapsed_ms":30000}
 # 失败: {"task_id":"...","state":"failed","error":"...","elapsed_ms":...}
+# 反爬拦截失败（Google /sorry/ 重试耗尽）:
+#   {"task_id":"...","state":"failed","error":"blocked: google /sorry/ page (2 retries exhausted)","blocked":true,"elapsed_ms":...}
 ```
+
+> **反爬失败类型化**：当渲染 Google 等站点命中验证页（典型为 `/sorry/`）时，seimi-render 会自动退避重试（全新 page，2 次），重试仍命中则判为 `blocked` 失败——响应里 `error` 前缀 `blocked:` + `blocked:true` 双标记，调用方可据此显式区分「反爬拦截」与「超时/网络错」，前者建议换引擎/走代理/IP 池，后者只需重试。统计层 `/status` 同时累加 `blocked_exhausted`（见下）。
 
 ### 运行时状态（`GET /status`）
 
@@ -293,7 +300,8 @@ curl 'http://localhost:8088/status?domains=50'
     "total": 2, "pending": 0, "running": 1, "done": 1
   },
   "totals": {
-    "requests": 1280, "succeeded": 1244, "failed": 36, "success_rate": 0.972
+    "requests": 1280, "succeeded": 1244, "failed": 36, "success_rate": 0.972,
+    "blocked_total": 14, "blocked_recovered": 9, "blocked_exhausted": 5
   },
   "latency_ms": {
     "min": 980, "avg": 5230.4, "p50": 4120, "p90": 8910, "p99": 15630, "max": 28010
@@ -303,12 +311,14 @@ curl 'http://localhost:8088/status?domains=50'
   "domains": {
     "distinct": 87,
     "top": [
-      { "host": "www.sohu.com",   "total": 600, "succeeded": 598, "failed": 2,   "success_rate": 0.997 },
-      { "host": "example.com",    "total": 410, "succeeded": 385, "failed": 25,  "success_rate": 0.939 }
+      { "host": "www.google.com", "total": 210, "succeeded": 205, "failed": 5, "blocked": 14, "success_rate": 0.976 },
+      { "host": "www.sohu.com",   "total": 600, "succeeded": 598, "failed": 2, "blocked": 0,  "success_rate": 0.997 }
     ]
   }
 }
 ```
+
+> 上面 `totals` / `domains.top[]` 中带 `blocked` 的字段是 **反爬拦截三态计数**（与 `succeeded`/`failed` 正交，仅在任务到达终态时累加一次）：
 
 字段说明：
 
@@ -318,11 +328,15 @@ curl 'http://localhost:8088/status?domains=50'
 | `queue` | 当前队列实时快照（同 `/stats`） |
 | `totals.requests/succeeded/failed` | 自启动以来的累计终态计数 |
 | `totals.success_rate` | `succeeded / requests`，0–1 |
+| `totals.blocked_total` | 反爬拦截页检测事件总数（含重试中的每次命中——一次任务命中 sorry 后退避重试，重试再次命中会被记 2 次） |
+| `totals.blocked_recovered` | 经历过拦截但**最终成功**的任务数（重试后跳出 sorry 的任务计入这里，体现 stealth + 预热 + 重试的综合修复力） |
+| `totals.blocked_exhausted` | 重试耗尽判 `blocked` **失败**的任务数（对应响应里的 `blocked:true`）。三者关系：`blocked_recovered + blocked_exhausted` ≤ 命中过拦截的任务总数；`blocked_total` ≥ `blocked_recovered + blocked_exhausted`（含重试中的多次命中） |
 | `latency_ms` | **仅成功任务**的渲染耗时分布；失败不计入。p50/p90/p99 用对数桶直方图近似（固定内存，不存逐样本） |
 | `throughput_per_sec` | `requests / uptime(秒)` |
 | `outputs.html/markdown/pdf` | 各输出类型被请求的次数（位标记统计） |
 | `domains.distinct` | 见过的不同 host 总数 |
 | `domains.top[]` | 按 `total` 倒序的 top-N 域名，含各自的 succeeded/failed/success_rate |
+| `domains.top[].blocked` | 该域名累计拦截页检测次数（含重试中的每次命中）。定位高风控站点（如 `www.google.com` 的 `blocked` 远高于其他域）时最有用 |
 
 > **资源开销**：指标只在任务到达终态（成功/失败）时更新一次，非热路径；延迟用固定 32 桶直方图（O(1) 内存、O(1) 更新）；域名映射设 1000 host 上限，超限剔除最冷门者，防止恶意/爬虫场景下 host map 无限膨胀。`GET /status` 查询时一次性加锁拷贝快照，top-N 排序仅对返回的 N 条做，开销可忽略。
 

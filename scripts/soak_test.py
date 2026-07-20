@@ -2,30 +2,7 @@
 # SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-seimi-render 持续压测脚本。
-
-场景：在指定时长内维持固定并发数，持续提交渲染任务，统计：
-  - 成功 / 失败 / 超时数量与比例
-  - 成功任务的耗时分布（min/p50/p90/p99/max）
-  - 失败任务的错误原因分布
-  - 每个站点的成功率（定位是某站点限流还是服务本身问题）
-  - 是否出现「非预期问题」：任务卡死（超出 load-timeout 仍未结束）、
-    进程崩溃、接口无响应、内存泄漏迹象等
-
-URL 池设计（避免限流假象）：
-  内嵌 4 个媒体站点（搜狐/网易/新浪/澎湃）各 20 条真实文章链接，共 80 条，
-  worker 轮转取用，避免反复请求同一 URL。同时按 host 限制并发在途数
- （--max-per-host），防止单站点瞬时并发过高触发其反爬/限流——
-  否则「并发↑→吞吐↓」可能只是站点限流，而非 seimi-render 的真实瓶颈。
-
-用法:
-  python3 scripts/soak_test.py --duration 600 --concurrency 10
-  python3 scripts/soak_test.py --url https://www.sohu.com/ --duration 600 --concurrency 10
-  python3 scripts/soak_test.py --shuffle --max-per-host 2 --duration 600
-
-前置：seimi-render 服务已在运行（默认 http://localhost:8088）。
-"""
+"""seimi-render 持续压测脚本：固定并发下统计成功率、耗时分布与卡死/限流等非预期问题。"""
 import argparse
 import collections
 import random
@@ -43,9 +20,7 @@ LONG_POLL_MS = 30000        # 长轮询窗口
 LONG_POLL_HTTP_TIMEOUT = 35 # HTTP 读超时（略大于长轮询窗口）
 LOAD_TIMEOUT_MS = 20000     # 服务端默认单任务超时，用于判定「卡死」
 
-# —— 渲染链接池：4 个媒体站点 × 20 条真实文章链接 ——
-# 抓取方式见 scripts/_fetch_url_pool.py（用 seimi-render 渲染各站首页后提取）。
-# 轮转使用避免对单 URL 的缓存/限流干扰；per-host 节流避免单站并发过高被反爬。
+# 真实文章链接池（4 站点 × 20 条），抓取脚本见 scripts/_fetch_url_pool.py
 URL_POOL = {
     'sohu': [
         'https://www.sohu.com/a/1044221136_220095',
@@ -139,7 +114,6 @@ URL_POOL = {
 
 
 def flatten_pool(pool):
-    """把按站点分组的池展平为单一列表（站点间交错，避免连续命中同站）。"""
     lists = list(pool.values())
     out = []
     for i in range(max(len(l) for l in lists)):
@@ -150,8 +124,7 @@ def flatten_pool(pool):
 
 
 def submit_and_wait(base, url, settle_ms):
-    """提交一个渲染任务并长轮询等待结果。
-    返回 (ok: bool, elapsed_ms: int|None, state: str, error: str|None)。"""
+    """返回 (ok, elapsed_ms, state, error)。"""
     body = ("{\"url\":\"%s\",\"settle_ms\":%d,\"long_poll_ms\":%d}"
             % (url, settle_ms, LONG_POLL_MS)).encode()
     req = urllib.request.Request(base + "/render", data=body,
@@ -177,19 +150,16 @@ def submit_and_wait(base, url, settle_ms):
 
 def worker(stop_evt, base, url_seq, idx_lock, idx_box, settle_ms, load_timeout_ms,
            host_sems, jitter_ms, stats, lock):
-    """持续提交任务直到 stop_evt 被设置。
-    url_seq/idx_lock/idx_box: 共享的轮转 URL 序列与其下标（线程安全取下一个）。
-    host_sems: host -> threading.Semaphore，限制每 host 在途并发，规避站点限流。"""
     while not stop_evt.is_set():
-        # 轮转取下一个 URL
         with idx_lock:
             i = idx_box[0] % len(url_seq)
             idx_box[0] += 1
         url = url_seq[i]
         host = urlparse(url).hostname or url
 
-        # per-host 并发节流：单 host 在途数受限，避免触发该站点的反爬/限流。
-        # acquire 可能阻塞（这是预期的 backpressure），不占用 seimi-render 槽位。
+        # per-host 节流：单 host 在途数受限，避免触发该站点反爬/限流——
+        # 否则「并发↑→吞吐↓」可能只是站点限流而非 seimi-render 真实瓶颈。
+        # acquire 可能阻塞（预期 backpressure），不占用 seimi-render 槽位。
         sem = host_sems.get(host)
         if sem is not None:
             sem.acquire()
@@ -208,7 +178,7 @@ def worker(stop_evt, base, url_seq, idx_lock, idx_box, settle_ms, load_timeout_m
                 stats["per_host"][host]["ok"] += 1
             else:
                 stats["fail"] += 1
-                # 区分「真失败」与「卡死」：耗时显著超 load-timeout 仍未终态视为疑似卡死。
+                # 区分「真失败」与「卡死」：超 load-timeout 仍未终态视为疑似卡死
                 if state == "running" and elapsed and elapsed > load_timeout_ms + 5000:
                     stats["stuck"] += 1
                     key = "STUCK(>load-timeout, no terminal state)"
@@ -217,7 +187,7 @@ def worker(stop_evt, base, url_seq, idx_lock, idx_box, settle_ms, load_timeout_m
                 stats["errors"][key] += 1
                 stats["per_host"][host]["fail"] += 1
 
-        # 请求间抖动：打散 worker 节奏，避免脉冲式突发触发限流，测的是稳态吞吐。
+        # 打散 worker 节奏，避免脉冲突发触发限流
         if jitter_ms > 0:
             time.sleep(random.uniform(0, jitter_ms) / 1000.0)
 
@@ -250,7 +220,6 @@ def main():
 
     base = f"http://{args.host}:{args.port}"
 
-    # 构建 URL 序列：--url 走单 URL；否则用内置池。
     if args.url:
         url_seq = [args.url]
         pool_desc = f"单 URL: {args.url}"
@@ -260,7 +229,7 @@ def main():
             random.shuffle(url_seq)
         pool_desc = f"链接池 {len(url_seq)} 条（搜狐/网易/新浪/澎湃 各 20）"
 
-    # per-host 信号量（仅池模式有意义；单 URL 模式下 host 唯一，信号量退化为全局并发限制）
+    # 单 URL 模式下 host 唯一，信号量退化为全局并发限制
     host_sems = {}
     if args.max_per_host > 0:
         hosts = {urlparse(u).hostname for u in url_seq if urlparse(u).hostname}
@@ -277,7 +246,6 @@ def main():
     print(f"  jitter    : {args.jitter_ms}ms")
     print()
 
-    # 健康检查
     try:
         with urllib.request.urlopen(base + "/health", timeout=5) as r:
             if b'"status":"ok"' not in r.read():
@@ -296,7 +264,7 @@ def main():
     lock = threading.Lock()
     stop_evt = threading.Event()
     idx_lock = threading.Lock()
-    idx_box = [0]  # 全局轮转下标（box 包一层以便闭包内修改）
+    idx_box = [0]
 
     threads = [threading.Thread(
         target=worker,
@@ -306,7 +274,6 @@ def main():
     for t in threads:
         t.start()
 
-    # 进度报告
     start = time.monotonic()
     last_report = start
     try:
@@ -331,7 +298,6 @@ def main():
     for t in threads:
         t.join(timeout=LONG_POLL_HTTP_TIMEOUT + 10)
 
-    # 汇总
     with lock:
         tot, ok, fail, stuck = stats["total"], stats["ok"], stats["fail"], stats["stuck"]
         lats = sorted(stats["latencies"])
@@ -363,7 +329,6 @@ def main():
         print("  （无成功任务）")
     print()
 
-    # per-host 成功率：定位是某站点限流还是服务端问题。
     if per_host and not args.url:
         print("  每站点成功率:")
         for h, c in sorted(per_host.items(), key=lambda kv: -kv[1]["total"]):
@@ -378,7 +343,6 @@ def main():
             print(f"    {cnt:>4}x  {reason}")
     print()
 
-    # 非预期问题判定
     print("-" * 56)
     problems = []
     if stuck > 0:

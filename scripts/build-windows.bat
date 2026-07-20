@@ -2,19 +2,9 @@ REM SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 REM SPDX-License-Identifier: Apache-2.0
 
 @echo off
-REM =============================================================
-REM seimi-render Windows build script (MSVC + Ninja + Qt6)
-REM
-REM Auto-initializes the MSVC environment (vcvarsall), so it runs in a
-REM normal cmd -- no Developer Prompt needed.
-REM
-REM Usage:
-REM   scripts\build-windows.bat           REM default Release
-REM   scripts\build-windows.bat Debug
-REM
-REM Env vars (optional):
-REM   set QT_PREFIX=C:\Qt && set QT_VERSION=6.7.2 && scripts\build-windows.bat
-REM =============================================================
+REM seimi-render Windows build (MSVC + Ninja + Qt6), auto-inits MSVC env.
+REM   scripts\build-windows.bat [Release|Debug]
+REM Env vars: QT_PREFIX, QT_VERSION, QT_ARCH_DIR
 setlocal enableextensions enabledelayedexpansion
 
 set "CONFIG=%~1"
@@ -39,7 +29,7 @@ if not exist "%QT_INSTALL_DIR%\bin\qmake.exe" (
     exit /b 1
 )
 
-REM ---- initialize MSVC environment (vcvarsall x64) ----
+REM ---- initialize MSVC environment ----
 REM NOTE: %ProgramFiles(x86)% has parens that break cmd parsing; use the call trick.
 call set "PF86=%%ProgramFiles(x86)%%"
 set "VSWHERE=%PF86%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -56,7 +46,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM ---- choose generator: prefer Ninja, else default (VS) ----
+REM generator: prefer Ninja, else default (VS)
 set "GEN="
 where ninja >nul 2>&1
 if not errorlevel 1 (
@@ -67,16 +57,9 @@ if not errorlevel 1 (
 )
 
 echo == [0/2] clean build dir ==
-REM Clean build dir contents before each build to avoid stale CMake cache / artifacts.
-REM Use robocopy /MIR (mirror empty source) instead of rmdir: some processes
-REM (mspdbsrv/vctip/file-watchers) keep a handle on the build dir as cwd, which
-REM makes rmdir fail with "access denied". robocopy can clear files even when
-REM the directory itself is locked.
+REM robocopy /MIR clears files even when dir cwd is locked (mspdbsrv etc.), unlike rmdir.
 if exist "%BUILD_DIR%" (
-    REM Handle stray "nul" device-name file (some shells create it via "> nul" redirect).
-    REM Use \\?\ prefix to bypass Win32 device-name reservation.
     del "\\?\%BUILD_DIR%\nul" 2>nul
-    REM Mirror an empty temp dir onto build to clear all contents.
     set "_EMPTY_TMP=%TEMP%\_seimi_empty_rb"
     if not exist "!_EMPTY_TMP!" mkdir "!_EMPTY_TMP!"
     robocopy "!_EMPTY_TMP!" "%BUILD_DIR%" /MIR /NFL /NDL /NJH /NJS /NP >nul 2>&1

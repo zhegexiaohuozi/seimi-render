@@ -102,7 +102,11 @@
   // navigator.plugins / mimeTypes —— Chrome 标配的 PDF Viewer
   try {
     function fakePlugin(name) {
-      return { name: name, filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1, 0: { type: 'application/pdf', suffixes: 'pdf', description: '' } };
+      var p = { name: name, filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1, 0: { type: 'application/pdf', suffixes: 'pdf', description: '' } };
+      // 原型链转真：普通对象字面量是硬 lie（sannysoft "Plugins is of type PluginArray" 项）。
+      try { Object.setPrototypeOf(p, Plugin.prototype); } catch (e) {}
+      try { Object.setPrototypeOf(p[0], MimeType.prototype); } catch (e) {}
+      return p;
     }
     var fplugs = [
       fakePlugin('PDF Viewer'), fakePlugin('Chrome PDF Viewer'),
@@ -114,16 +118,21 @@
     pa.item = function (n) { return this[n] || null; };
     pa.namedItem = function (n) { return this[n] || null; };
     pa.refresh = function () {};
+    try { Object.setPrototypeOf(pa, PluginArray.prototype); } catch (e) {}
     defineGetter(nav, 'plugins', function () { return pa; });
 
     var fms = [
       { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: fplugs[0] },
       { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: fplugs[0] }
     ];
+    for (var k = 0; k < fms.length; k++) {
+      try { Object.setPrototypeOf(fms[k], MimeType.prototype); } catch (e) {}
+    }
     var ma = { length: fms.length };
     for (var j = 0; j < fms.length; j++) { ma[j] = fms[j]; ma[fms[j].type] = fms[j]; }
     ma.item = function (n) { return this[n] || null; };
     ma.namedItem = function (n) { return this[n] || null; };
+    try { Object.setPrototypeOf(ma, MimeTypeArray.prototype); } catch (e) {}
     defineGetter(nav, 'mimeTypes', function () { return ma; });
   } catch (e) {}
 

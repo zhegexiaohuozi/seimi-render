@@ -1,0 +1,147 @@
+<mxfile host="Electron" agent="seimi-render">
+  <diagram id="seimi-arch" name="seimi-render Architecture">
+    <mxGraphModel dx="1548" dy="1055" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=22;fontStyle=1;" value="seimi-render Architecture" vertex="1">
+          <mxGeometry height="40" width="500" x="550" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="grp_entry" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999;fontSize=12;fontStyle=1;verticalAlign=top;spacingTop=4;dashed=1;" value="Entry Layer (3 endpoints)" vertex="1">
+          <mxGeometry height="150" width="1480" x="60" y="70" as="geometry" />
+        </mxCell>
+        <mxCell id="http" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;" value="HTTP Server&#xa;(cpp-httplib thread pool)&#xa;&#xa;POST /render&#xa;GET /result /pdf /image&#xa;GET /status&#xa;POST /cookies /proxy" vertex="1">
+          <mxGeometry height="105" width="240" x="120" y="105" as="geometry" />
+        </mxCell>
+        <mxCell id="ws" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;" value="WebSocket Server&#xa;(QWebSocketServer)&#xa;&#xa;action: render / subscribe / auth&#xa;push: created / finished" vertex="1">
+          <mxGeometry height="105" width="240" x="680" y="105" as="geometry" />
+        </mxCell>
+        <mxCell id="mcp" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=center;" value="MCP Server&#xa;(cpp-mcp, dedicated thread)&#xa;&#xa;render_url / get_render_result&#xa;web_search / web_reader&#xa;internal HTTP callback 127.0.0.1:8088" vertex="1">
+          <mxGeometry height="105" width="240" x="1240" y="105" as="geometry" />
+        </mxCell>
+        <mxCell id="guard" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;fontStyle=2;align=center;" value="&#128274; Auth / Intranet protection / Login rate-limit" vertex="1">
+          <mxGeometry height="50" width="600" x="500" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="e_http_g" edge="1" parent="1" source="http" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0.25;entryY=0;" target="guard">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_ws_g" edge="1" parent="1" source="ws" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="guard">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_mcp_g" edge="1" parent="1" source="mcp" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;dashed=1;exitX=0.5;exitY=1;entryX=0.75;entryY=0;" target="guard">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_g_q" edge="1" parent="1" source="guard" style="rounded=1;html=1;strokeColor=#d6b656;strokeWidth=2;endArrow=block;endFill=1;" target="queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="queue" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=14;fontStyle=1;align=center;verticalAlign=top;spacingTop=8;" value="RenderQueue (thread-safe hub)" vertex="1">
+          <mxGeometry height="130" width="700" x="450" y="330" as="geometry" />
+        </mxCell>
+        <mxCell id="queue_body" parent="1" style="text;html=1;align=left;fontSize=10;spacingLeft=12;spacingRight=12;" value="QMutex + two QWaitConditions (single lock serializes all cross-thread interaction)&#xa;&#xa;&#9656; submit(url, outputs, extract?, ...)  — enqueue from any thread, returns task_id (immediate)&#xa;&#9656; tryTakePending()  — GUI thread fetches pending task [NON-BLOCKING] (never blocks the event loop)&#xa;&#9656; waitForCompletion(id, timeout)  — HTTP long-poll thread blocks waiting for terminal state&#xa;&#9656; snapshot(id)  — copy result fields under lock (html/markdown/serp_json/pdf/image) for safe reads&#xa;&#9656; reportSucceeded / reportFailed  — GUI thread writes terminal state + wakes waiters" vertex="1">
+          <mxGeometry height="95" width="680" x="460" y="360" as="geometry" />
+        </mxCell>
+        <mxCell id="boundary" edge="1" parent="1" style="endArrow=none;html=1;strokeColor=#cc0000;strokeWidth=2;dashed=1;dashPattern=8 4;" value="">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="60" y="490" as="sourcePoint" />
+            <mxPoint x="1540" y="490" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="boundary_lbl" parent="1" style="text;html=1;align=center;fontSize=10;fontColor=#cc0000;fontStyle=1;" value="&#9888; GUI thread boundary — Chromium constraint" vertex="1">
+          <mxGeometry height="18" width="840" x="380" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="e_q_pool" edge="1" parent="1" source="queue" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#d79b00;strokeWidth=2;endArrow=block;endFill=1;" target="pool">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="pool" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;verticalAlign=top;" value="" vertex="1">
+          <mxGeometry height="200" width="1420" x="90" y="540" as="geometry" />
+        </mxCell>
+        <mxCell id="pool_title" parent="1" style="text;html=1;align=center;fontSize=12;fontStyle=1;fontColor=#b85450;" value="GUI thread event loop — RenderPool (N concurrent RenderWorkers, sharing one QWebEngineProfile for cookie/cache reuse)" vertex="1">
+          <mxGeometry height="20" width="1480" x="60" y="548" as="geometry" />
+        </mxCell>
+        <mxCell id="step1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#b85450;fontSize=10;" value="&#9312; Create page&#xa;load(url)" vertex="1">
+          <mxGeometry height="50" width="140" x="165" y="595" as="geometry" />
+        </mxCell>
+        <mxCell id="step2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#b85450;fontSize=10;" value="&#9313; loadFinished&#xa;&#8594; settle delay&#xa;wait for JS" vertex="1">
+          <mxGeometry height="50" width="140" x="370" y="595" as="geometry" />
+        </mxCell>
+        <mxCell id="step3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#b85450;fontSize=9;align=center;" value="&#9314; Content extraction branch&lt;br&gt;Search content structured extraction&lt;br&gt;Markdown format support&lt;br&gt;Main-body (readability) extraction" vertex="1">
+          <mxGeometry height="80" width="170" x="565" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="step4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#b85450;fontSize=9;align=center;" value="&#9315; collect()&#xa;toHtml (always)&#xa;+ printToPdf (optional)&#xa;+ screenshot (optional)" vertex="1">
+          <mxGeometry height="80" width="150" x="800" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="step5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#b85450;fontSize=9;align=center;" value="&#9316; tryFinishCollect&#xa;all collects done&#xa;&#8594; reportSucceeded&#xa;&#8594; destroyPage" vertex="1">
+          <mxGeometry height="80" width="150" x="1010" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="e_s12" edge="1" parent="1" source="step1" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#b85450;endArrow=block;endFill=1;" target="step2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_s23" edge="1" parent="1" source="step2" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#b85450;endArrow=block;endFill=1;" target="step3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_s34" edge="1" parent="1" source="step3" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#b85450;endArrow=block;endFill=1;" target="step4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_s45" edge="1" parent="1" source="step4" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#b85450;endArrow=block;endFill=1;" target="step5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="concurrency" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;" value="Concurrency model&lt;br&gt;&lt;br&gt;• N Workers, each holds its own page&lt;br&gt;  (created per task, async-destroyed after use)&lt;br&gt;• Chromium multi-process provides true parallelism" vertex="1">
+          <mxGeometry height="85" width="220" x="1220" y="575" as="geometry" />
+        </mxCell>
+        <mxCell id="e_finish_ws" edge="1" parent="1" source="step5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;dashed=1;exitX=1;exitY=0.5;entryX=1;entryY=0.5;" target="ws">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1160" y="615" />
+              <mxPoint x="1180" y="615" />
+              <mxPoint x="1180" y="158" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="lbl_finish" connectable="0" parent="e_finish_ws" style="edgeLabel;html=1;fontSize=9;fontColor=#82b366;align=left;" value="taskFinished signal&#xa;&#8594; notifyFinished pushes to subscribers" vertex="1">
+          <mxGeometry relative="1" x="0.2" as="geometry">
+            <mxPoint x="5" y="305" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="grp_aux" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999;fontSize=11;fontStyle=1;verticalAlign=top;spacingTop=2;dashed=1;" value="Auxiliary modules (each ships its own thread-safety mechanism)" vertex="1">
+          <mxGeometry height="70" width="1480" x="60" y="770" as="geometry" />
+        </mxCell>
+        <mxCell id="aux1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999;fontSize=9;align=center;" value="CookieStore&lt;br&gt;Login-state injection + encrypted persistence" vertex="1">
+          <mxGeometry height="35" width="230" x="75" y="800" as="geometry" />
+        </mxCell>
+        <mxCell id="aux2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999;fontSize=9;align=center;" value="ProxyConfig&lt;br&gt;Runtime proxy switching" vertex="1">
+          <mxGeometry height="35" width="230" x="320" y="800" as="geometry" />
+        </mxCell>
+        <mxCell id="aux3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999;fontSize=9;align=center;" value="StealthProfile&lt;br&gt;Fingerprint unification (basic feature-detection evasion)" vertex="1">
+          <mxGeometry height="35" width="230" x="565" y="800" as="geometry" />
+        </mxCell>
+        <mxCell id="aux4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999;fontSize=9;align=center;" value="Metrics&lt;br&gt;Cumulative metrics (success rate / latency dist / throughput / domain / config)" vertex="1">
+          <mxGeometry height="35" width="230" x="810" y="800" as="geometry" />
+        </mxCell>
+        <mxCell id="aux5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999;fontSize=9;align=center;" value="html2md&#xa;HTML-to-Markdown string-level converter" vertex="1">
+          <mxGeometry height="35" width="230" x="1055" y="800" as="geometry" />
+        </mxCell>
+        <mxCell id="aux6" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999;fontSize=9;align=center;" value="TokenCompare&lt;br&gt;Constant-time token compare (timing side-channel defense)" vertex="1">
+          <mxGeometry height="35" width="230" x="1300" y="800" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#ccc;" value="" vertex="1">
+          <mxGeometry height="40" width="1480" x="60" y="860" as="geometry" />
+        </mxCell>
+        <mxCell id="leg_title" parent="1" style="text;html=1;fontSize=10;fontStyle=1;" value="Legend:" vertex="1">
+          <mxGeometry height="20" width="50" x="80" y="870" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1" parent="1" style="text;html=1;fontSize=9;" value="&#9472;&#9472;&#9658; Solid = request/data flow" vertex="1">
+          <mxGeometry height="16" width="150" x="130" y="872" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2" parent="1" style="text;html=1;fontSize=9;" value="&#9476;&#9476;&#9658; Dashed = async signal / callback / push" vertex="1">
+          <mxGeometry height="16" width="180" x="300" y="872" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3" parent="1" style="text;html=1;fontSize=9;fontColor=#cc0000;" value="&#9476;&#9476; Red dashed = thread boundary (cannot cross)" vertex="1">
+          <mxGeometry height="16" width="220" x="500" y="872" as="geometry" />
+        </mxCell>
+        <mxCell id="leg4" parent="1" style="text;html=1;fontSize=9;" value="&#128309; Blue=HTTP  &#128994; Green=WS  &#128995; Purple=MCP  &#128992; Orange=Queue  &#128308; Red=RenderPool  &#128993; Yellow=Security guard" vertex="1">
+          <mxGeometry height="16" width="500" x="740" y="872" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
