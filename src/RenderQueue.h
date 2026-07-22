@@ -27,7 +27,8 @@ using RenderTaskPtr = QSharedPointer<RenderTask>;
 // HTTP 长轮询线程用 waitForCompletion() 阻塞等待终态。终态后的 WS 推送由调用方在主线程信号槽完成。
 class RenderQueue {
 public:
-    RenderQueue() = default;
+    // dataDir 为指标持久化目录（二进制同级 data/）；空则禁用指标持久化（纯内存）。
+    explicit RenderQueue(const QString& dataDir = QString()) : m_metrics(dataDir) {}
     ~RenderQueue() = default;
 
     RenderQueue(const RenderQueue&) = delete;

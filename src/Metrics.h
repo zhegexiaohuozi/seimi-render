@@ -5,6 +5,7 @@
 
 #include <QMutex>
 #include <QMutexLocker>
+#include <QString>
 
 #include <cstdint>
 #include <string>
@@ -17,9 +18,14 @@ namespace seimi {
 // 只在任务到达终态时调 record()（RenderQueue 持锁 setTerminal 内部触发），
 // 故本类用独立 QMutex，不与渲染队列锁嵌套。
 // 延迟用对数桶直方图（固定 32 桶，O(1)）；域名计数设上限（默认 1000），超限剔除最冷门域。
+//
+// 持久化：累计计数（total/succeeded/失败/延迟桶/域名分布/输出类型/反爬三态）可跨重启累加。
+// 落盘明文 JSON 到 dataDir/metrics.json（指标非敏感）。uptime/startedAt 不持久化（进程生命周期指标）。
+// dataDir 为空时禁用持久化（纯内存，行为同 v1）。与 CookieStore 同构。
 class Metrics {
 public:
-    Metrics();
+    // dataDir 为持久化目录（二进制同级 data/）；空则禁用持久化（纯内存）。
+    explicit Metrics(const QString& dataDir = QString());
 
     Metrics(const Metrics&) = delete;
     Metrics& operator=(const Metrics&) = delete;
@@ -79,11 +85,23 @@ public:
     // 取一份快照。maxDomains 限制返回的域名条数（默认 20）。
     Snapshot snapshot(int maxDomains = 20) const;
 
+    // ====== 持久化 ======
+
+    // GUI 线程：把累计指标落盘（定时器周期调 + 退出 flush 调）。
+    // dataDir 为空时 no-op。失败静默（日志 warning），不抛异常。
+    void saveToDisk();
+
 private:
     // 把一个成功任务的延迟计入直方图桶。
     void addToHistogram(std::int64_t ms);
 
+    // —— 持久化（构造期 / GUI 线程）——
+    void loadFromDisk();                                  // 构造期恢复累计基线
+    QByteArray serializeLocked() const;                   // 已持 m_mutex 下调用：序列化累计字段为 JSON
+    bool parse(const QByteArray& json, std::int64_t schemaVersion); // 反序列化填充累计字段
+
     mutable QMutex m_mutex;
+    QString m_dataDir;                       // 持久化目录（空=禁用）
     std::int64_t m_startedAtMsec = 0;       // 构造（进程启动）时初始化
 
     // 累计计数
