@@ -365,7 +365,8 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
 
     // 渲染队列：全局线程安全中枢。
-    RenderQueue queue;
+    // 传入 data/ 目录启用指标持久化（重启自动恢复累计统计，跨重启累加）。
+    RenderQueue queue(QCoreApplication::applicationDirPath() + "/data");
 
     // Cookie 同步中枢：浏览器插件通过 POST /cookies 灌入登录态，
     // 由 RenderPool 在 GUI 线程周期 apply 到共享 profile。
@@ -461,6 +462,15 @@ int main(int argc, char** argv) {
     mcp.start(mcpHost, cfg.mcpPort, "127.0.0.1", cfg.httpPort,
               HttpServer::computeToken(cfg.adminPassword));
 
+    // 指标持久化：定时把累计统计落盘（跨重启累加）。GUI 线程 QTimer。
+    // 崩溃最多丢 30s 数据；退出时 aboutToQuit 再 flush 一次。
+    QTimer metricsPersistTimer;
+    metricsPersistTimer.setInterval(30 * 1000);
+    QObject::connect(&metricsPersistTimer, &QTimer::timeout, [&queue]() {
+        queue.metrics().saveToDisk();
+    });
+    metricsPersistTimer.start();
+
     // 优雅退出：信号到来时按序关闭。
     QObject::connect(&app, &QCoreApplication::aboutToQuit, [&]() {
         queue.stop();   // 唤醒渲染消费者 + 长轮询线程
@@ -469,6 +479,7 @@ int main(int argc, char** argv) {
         if (httpThread.joinable()) httpThread.join();
         mcp.stop();
         cookies.flush();  // 退出前确保 cookie 持久化落盘
+        queue.metrics().saveToDisk();  // 退出前确保指标持久化落盘
     });
 
     std::fprintf(stdout,

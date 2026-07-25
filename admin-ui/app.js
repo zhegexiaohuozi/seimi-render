@@ -30,6 +30,7 @@ async function api(url, opts = {}) {
   bindResultCopy();
   bindApiTabs();
   bindLangToggle();
+  bindDomainSort();   // 域名分布表头排序
   // 语言切换时重渲染动态部分（统计/cookie/MCP/API 示例；docs 若已渲染则重渲）。
   window.i18n.onLanguageChange(() => {
     if (!document.getElementById('app').classList.contains('hidden')) {
@@ -173,17 +174,120 @@ function renderStats(d) {
   ).join('');
 
   // 域名分布
-  const doms = d.domains?.top || [];
-  document.querySelector('#stats-domains tbody').innerHTML = doms.length ? doms.map(dm => {
-    const rate = dm.total ? (dm.succeeded / dm.total * 100).toFixed(1) : '0.0';
-    const rc = parseFloat(rate) >= 90 ? 'rate-good' : (parseFloat(rate) < 50 ? 'rate-bad' : '');
-    return `<tr><td>${esc(dm.domain)}</td><td class="num">${dm.total}</td>
-      <td class="num">${dm.succeeded}</td><td class="num">${dm.failed}</td>
-      <td class="num ${rc}">${rate}%</td></tr>`;
-  }).join('') : `<tr><td colspan="5" class="muted">${t('common.noData')}</td></tr>`;
+  renderDomainTable(d.domains);
 
   // 运行环境卡片（来自 /status 的 environment 段）
   renderEnv(d.environment);
+}
+
+// ---------- 域名分布表格（排序 / 分级成功率 / 失败高亮 / 千分位）----------
+// 用户可点击表头切换排序字段与方向，状态记忆在内存中（切语言/刷新数据保持）。
+let domainSort = { key: 'total', dir: 'desc' };   // 默认按总请求降序，与后端一致
+let lastDomainsCache = null;                       // 缓存最新数据，切语言时复用
+
+function fmtNum(n) {                               // 千分位格式化（可读性，大数据量场景必需）
+  const v = Number(n) || 0;
+  return v.toLocaleString('en-US');
+}
+
+// 成功率分级：≥90% 优、70–90% 中、<70% 差、0% 全失败。
+// 配色统一用「文字色 + 同色系极浅背景」组合，色块撑满单元格宽度，保证视觉一致。
+// 文字色均达 WCAG AA（与浅背景对比度 ≥4.5:1）。
+function rateTierClass(rate) {
+  if (rate >= 90) return 'rate-excellent';
+  if (rate >= 70) return 'rate-fair';
+  if (rate > 0)   return 'rate-poor';
+  return 'rate-zero';
+}
+
+function renderDomainTable(domains) {
+  if (!domains) return;
+  lastDomainsCache = domains;
+
+  const top = domains.top || [];
+  const distinct = domains.distinct || top.length;
+  const shown = top.length;
+
+  // 标题：显示 Top N（共 M 个域名），让用户知道边界与是否被截断。
+  const titleEl = document.getElementById('stats-domains-count');
+  if (titleEl) {
+    titleEl.textContent = distinct > shown
+      ? t('stats.domains.topN', { n: shown, total: distinct })
+      : t('stats.domains.topNLimited', { n: shown });
+  }
+
+  // 排序：稳定排序。多列等值时按域名升序作次级排序，让顺序确定可预期。
+  const sorted = top.slice().sort((a, b) => {
+    const k = domainSort.key;
+    let va, vb;
+    if (k === 'domain') { va = a.domain || ''; vb = b.domain || ''; }
+    else if (k === 'rate') {
+      va = a.total ? a.succeeded / a.total : 0;
+      vb = b.total ? b.succeeded / b.total : 0;
+    } else { va = a[k] || 0; vb = b[k] || 0; }
+    let cmp;
+    if (k === 'domain') cmp = va.localeCompare(vb);
+    else cmp = va - vb;
+    if (domainSort.dir === 'desc') cmp = -cmp;
+    if (cmp === 0) {
+      // 次级排序：总请求降序 → 域名升序，保证同量级行序稳定。
+      const c2 = (b.total || 0) - (a.total || 0);
+      return c2 !== 0 ? c2 : (a.domain || '').localeCompare(b.domain || '');
+    }
+    return cmp;
+  });
+
+  const tbody = document.querySelector('#stats-domains tbody');
+  if (!shown) {
+    tbody.innerHTML = `<tr><td colspan="6" class="muted">${t('stats.domains.empty')}</td></tr>`;
+  } else {
+    tbody.innerHTML = sorted.map((dm, i) => {
+      const rate = dm.total ? (dm.succeeded / dm.total * 100) : 0;
+      const rateStr = rate.toFixed(1);
+      const rc = rateTierClass(rate);
+      const failCls = (dm.failed || 0) > 0 ? 'cell-failed' : '';
+      const domain = esc(dm.domain || '');
+      return `<tr>
+        <td class="col-rank">${i + 1}</td>
+        <td class="col-domain" title="${domain}">${domain}</td>
+        <td class="num">${fmtNum(dm.total)}</td>
+        <td class="num">${fmtNum(dm.succeeded)}</td>
+        <td class="num ${failCls}">${fmtNum(dm.failed)}</td>
+        <td class="num"><span class="rate-badge ${rc}">${rateStr}%</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  // 同步表头排序指示器（箭头 + aria-sort 无障碍标注）。
+  document.querySelectorAll('#stats-domains th.sortable').forEach(th => {
+    const k = th.dataset.sort;
+    th.classList.toggle('sort-active', k === domainSort.key);
+    th.classList.toggle('sort-asc',  k === domainSort.key && domainSort.dir === 'asc');
+    th.classList.toggle('sort-desc', k === domainSort.key && domainSort.dir === 'desc');
+    th.setAttribute('aria-sort',
+      k === domainSort.key
+        ? (domainSort.dir === 'asc' ? 'ascending' : 'descending')
+        : 'none');
+  });
+}
+
+// 表头点击排序：同一列重复点击切换升降序，不同列切过去默认降序（domain 默认升序更符合直觉）。
+function bindDomainSort() {
+  const table = document.getElementById('stats-domains');
+  if (!table || table.dataset.sortBound) return;
+  table.dataset.sortBound = '1';
+  table.querySelectorAll('th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.sort;
+      if (domainSort.key === k) {
+        domainSort.dir = domainSort.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        domainSort.key = k;
+        domainSort.dir = (k === 'domain') ? 'asc' : 'desc';
+      }
+      renderDomainTable(lastDomainsCache);
+    });
+  });
 }
 
 // ---------- 页签 1.6：运行环境（OS/硬件/构建信息 + 实时占用）----------

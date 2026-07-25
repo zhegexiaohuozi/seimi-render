@@ -197,12 +197,76 @@ body {
 .data-table { width: 100%; border-collapse: collapse; font-size: 14px; background: var(--bg-elev); }
 .data-table th, .data-table td { padding: 16px; text-align: left; border-bottom: 1px solid var(--border); }
 .data-table th { background: #f8fafc; color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;}
-.data-table td.num, .data-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* 数值列：表头与单元格统一右对齐 + tabular-nums（等宽数字），保证小数位上下对齐。 */
+.data-table td.num, .data-table th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .data-table tbody tr { transition: background 0.2s ease; }
-.data-table tbody tr:hover { background: #fdfeff; }
+.data-table tbody tr:hover { background: #eef4ff; }   /* 悬浮整行高亮：蓝调强调，比白底明显 */
 .data-table tbody tr:last-child td { border-bottom: none; }
 .rate-good { color: var(--success); font-weight: 700; background: #ecfdf5; padding: 4px 8px; border-radius: 6px; display: inline-block;}
 .rate-bad { color: var(--danger); font-weight: 700; background: #fff1f2; padding: 4px 8px; border-radius: 6px; display: inline-block;}
+
+/* ---------- 域名分布表（增强可读性 / 交互 / 可视化）---------- */
+.domains-table { table-layout: fixed; }   /* 固定列宽：域名列可稳定省略，数值列不被撑开 */
+.domains-table th, .domains-table td { padding: 11px 14px; }   /* 比 16px 紧凑，长表格更易扫读 */
+.domains-table th { user-select: none; vertical-align: middle; }
+
+/* 列宽分配：排名窄、域名占大头、数值列等宽。配合 table-layout:fixed 生效。 */
+.domains-table .col-rank    { width: 52px;  text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
+.domains-table .col-domain  { width: auto; }
+/* 域名列溢出省略 + 悬浮 title 提示完整域名，避免超长域名撑破表格。 */
+.domains-table td.col-domain {
+  max-width: 0;                 /* fixed 布局下让 text-overflow 生效的关键 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.domains-table th.num,
+.domains-table td.num { width: 88px; }
+
+/* 隔行斑马纹：偶数行浅底，密集行更易横向追踪不串行。 */
+.domains-table tbody tr:nth-child(even) { background: #f8fafc; }
+.domains-table tbody tr:nth-child(even):hover { background: #eef4ff; }
+
+/* 可排序表头：点击切换排序，带升降序箭头指示当前排序状态。 */
+.domains-table th.sortable {
+  cursor: pointer;
+  position: relative;
+}
+.domains-table th.sortable:hover { color: var(--primary); }
+/* 用 ::after 画三角箭头，默认（非激活列）显示淡灰双向箭头暗示可点。 */
+.domains-table th.sortable::after {
+  content: '⇅';
+  display: inline-block;
+  margin-left: 5px;
+  font-size: 11px;
+  color: #cbd5e1;
+  vertical-align: middle;
+}
+.domains-table th.sortable.sort-asc::after  { content: '▲'; color: var(--primary); font-size: 10px; }
+.domains-table th.sortable.sort-desc::after { content: '▼'; color: var(--primary); font-size: 10px; }
+
+/* 失败数 > 0 的单元格强调：红色文字让异常域名一眼可定位。 */
+.domains-table td.cell-failed {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+/* 成功率分级徽章：block 撑满单元格宽度，所有色块等宽对齐，视觉规则统一。
+   分级梯度：优(≥90%) / 中(70-90%) / 差(<70%) / 全失败(0%)。
+   文字色 vs 浅背景对比度均达 WCAG AA（≥4.5:1），色弱友好。 */
+.rate-badge {
+  display: block;
+  text-align: center;
+  padding: 3px 0;
+  border-radius: 5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 64px;
+}
+.rate-excellent { background: #dcfce7; color: #15803d; }   /* 深绿字 + 浅绿底，对比度足 */
+.rate-fair      { background: #fef9c3; color: #854d0e; }   /* 琥珀中性：介于优/差之间 */
+.rate-poor      { background: #ffedd5; color: #9a3412; }   /* 橙警示：偏低但非全失败 */
+.rate-zero      { background: #fee2e2; color: #b91c1c; }   /* 红强警示：0% 全失败 */
 
 /* ---------- 渲染测试台 ---------- */
 .render-form {

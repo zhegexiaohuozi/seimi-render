@@ -99,10 +99,20 @@
           <div id="stats-outputs" class="output-bars"></div>
         </div>
         <div class="section">
-          <h3><span data-i18n="stats.domains.title">域名分布 Top</span> <span class="muted small" style="font-weight:normal; margin-left:4px;" data-i18n="stats.domains.subtitle">(按请求数)</span></h3>
+          <h3>
+            <span data-i18n="stats.domains.title">域名分布 Top</span>
+            <span id="stats-domains-count" class="muted small" style="font-weight:normal; margin-left:4px;"></span>
+          </h3>
           <div class="table-wrap">
-            <table id="stats-domains" class="data-table">
-              <thead><tr><th data-i18n="stats.domains.colDomain">目标域名</th><th class="num" data-i18n="stats.domains.colTotal">总请求</th><th class="num" data-i18n="stats.domains.colSuccess">成功</th><th class="num" data-i18n="stats.domains.colFail">失败</th><th class="num" data-i18n="stats.domains.colRate">成功率</th></tr></thead>
+            <table id="stats-domains" class="data-table domains-table">
+              <thead><tr>
+                <th class="col-rank" data-i18n="stats.domains.colRank">排名</th>
+                <th class="col-domain sortable" data-sort="domain" data-i18n="stats.domains.colDomain">目标域名</th>
+                <th class="num sortable" data-sort="total" data-i18n="stats.domains.colTotal">总请求</th>
+                <th class="num sortable" data-sort="succeeded" data-i18n="stats.domains.colSuccess">成功</th>
+                <th class="num sortable" data-sort="failed" data-i18n="stats.domains.colFail">失败</th>
+                <th class="num sortable" data-sort="rate" data-i18n="stats.domains.colRate">成功率</th>
+              </tr></thead>
               <tbody></tbody>
             </table>
           </div>
