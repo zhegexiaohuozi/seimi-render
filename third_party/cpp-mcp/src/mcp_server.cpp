@@ -1117,6 +1117,13 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     res.status = 200;
 
     // Use chunked content provider — same pattern as legacy SSE
+    // [seimi patch] 流结束时回收 session。handle_mcp_get 此前在 provider 退出时从不调
+    // close_session（与 legacy handle_sse L721/L733 不一致），导致 session_dispatchers_ map
+    // 里堆积僵尸记录——客户端每次用新 session_id 拉一次 GET 就塞一条永不回收的项，
+    // 灌满 max_sessions_（默认 64）后新请求全部 503。maintenance 线程也救不了：只要 SSE
+    // 长连接开着，provider 循环里 update_activity() 持续刷新 last_activity，永不判过期。
+    // 这里对齐 legacy SSE 的两个退出点（wait_event 失败 / 异常）补 close_session，让流
+    // 断开后 session 立即从 map 移除。
     res.set_chunked_content_provider(
         "text/event-stream",
         [this, session_id, dispatcher](size_t, httplib::DataSink& sink) {
@@ -1127,11 +1134,13 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
                 dispatcher->update_activity();
                 bool result = dispatcher->wait_event(&sink);
                 if (!result) {
+                    close_session(session_id);
                     return false;
                 }
                 dispatcher->update_activity();
                 return true;
             } catch (...) {
+                close_session(session_id);
                 return false;
             }
         });

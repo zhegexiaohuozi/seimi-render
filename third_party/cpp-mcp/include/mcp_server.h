@@ -257,7 +257,25 @@ public:
      * @return True if the server is running
      */
     bool is_running() const;
-    
+
+    /**
+     * @brief Get the number of currently active sessions.
+     *
+     * [seimi patch] 诊断用：供 seimi-render 的 /status 暴露 MCP session 占用，
+     * 让运维能在灌满 max_sessions 之前发现 session 泄漏。
+     * 线程安全（内部对 mutex_ 加锁，mutex_ 为 mutable，const 方法可锁）。
+     */
+    unsigned int session_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<unsigned int>(session_dispatchers_.size());
+    }
+
+    /**
+     * @brief Get the configured maximum number of concurrent sessions.
+     * [seimi patch] 诊断用：构造后只读，无需加锁。
+     */
+    unsigned int max_sessions() const { return max_sessions_; }
+
     /**
      * @brief Set server information
      * @param name The name of the server

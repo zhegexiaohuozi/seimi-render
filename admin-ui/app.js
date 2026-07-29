@@ -149,6 +149,7 @@ function renderStats(d) {
 
   renderWorkload(d.queue);
   renderProxy(d.proxy);
+  renderMcp(d.mcp);
 
   // 延迟分布
   const lat = d.latency_ms || {};
@@ -428,6 +429,63 @@ function renderProxy(p) {
       '<span class="proxy-kv"><span class="pk">' + t('proxy.kv.auth') + '</span>' + authInfo + '</span>' +
     '</div>' +
     '<p class="muted small" style="margin-top:10px">' + t('proxy.desc') + '</p>';
+}
+
+// ---------- 页签 1.6：MCP 服务健康度 ----------
+// 数据来自 /status 的 mcp 字段（sessions_used / sessions_limit）。
+// MCP session 泄漏曾是 /mcp 反复 503 的根因（GET/SSE 流结束不回收 session，灌满上限后新连接全 503）。
+// 这里用 session 用量进度条做前瞻监控：逼近上限即告警，让运维在 503 发生前发现问题。
+function renderMcp(m) {
+  const section = document.getElementById('stats-mcp-section');
+  const badge = document.getElementById('stats-mcp-badge');
+  const body = document.getElementById('stats-mcp-body');
+  if (!section || !badge || !body) return;
+  // 字段缺失（旧后端 / 未启用 MCP）：隐藏整段，避免空卡片。
+  if (!m) { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  // 未启用：badge 灰、提示未监听。
+  if (!m.enabled) {
+    badge.textContent = t('mcp.off');
+    badge.className = 'proxy-badge proxy-badge-off';
+    body.innerHTML = `<p class="muted small">${t('mcp.disabledDesc')}</p>`;
+    return;
+  }
+
+  const used = m.sessions_used ?? 0;
+  const limit = m.sessions_limit ?? 0;
+  const pct = limit > 0 ? Math.min(used / limit * 100, 100) : 0;
+
+  // 染色：≥90% 危险（即将 503）、≥70% 警告、否则正常。
+  // 阈值与 admin-ui 现有「渲染负载」pending>0 染 warn 的保守风格一致。
+  let barColorStyle = '';
+  if (pct >= 90)      barColorStyle = 'background:var(--danger)';
+  else if (pct >= 70) barColorStyle = 'background:var(--warn)';
+
+  // badge：用满 = 红（proxy-badge-off 为中性灰，这里用内联色叠出醒目红），
+  // 健康 = 绿（复用 proxy-badge-on）。
+  if (pct >= 90) {
+    badge.textContent = t('mcp.nearFull');
+    badge.className = 'proxy-badge mcp-badge-danger';
+  } else {
+    badge.textContent = t('mcp.healthy');
+    badge.className = 'proxy-badge proxy-badge-on';
+  }
+
+  const bar = limit > 0
+    ? `<div class="bar-row" style="margin-top:8px"><span class="bar-label">${t('mcp.sessionsUsed')}</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${pct.toFixed(1)}%;${barColorStyle}"></div></div>
+        <span class="bar-val">${used} / ${limit}</span></div>`
+    : `<p class="muted small" style="margin-top:6px">${t('mcp.unlimited')}</p>`;
+
+  body.innerHTML =
+    '<div class="proxy-line">' +
+      '<span class="proxy-kv"><span class="pk">' + t('mcp.kv.sessionsUsed') + '</span><span class="pv">' + used + '</span></span>' +
+      '<span class="proxy-kv"><span class="pk">' + t('mcp.kv.sessionsLimit') + '</span><span class="pv mono">' + limit + '</span></span>' +
+      '<span class="proxy-kv"><span class="pk">' + t('mcp.kv.usage') + '</span><span class="pv"' + (pct >= 90 ? ' style="color:var(--danger)"' : (pct >= 70 ? ' style="color:var(--warn)"' : '')) + '>' + pct.toFixed(1) + '%</span></span>' +
+    '</div>' +
+    bar +
+    '<p class="muted small" style="margin-top:10px">' + t('mcp.desc') + '</p>';
 }
 
 // ---------- 页签 2：渲染测试台 ----------

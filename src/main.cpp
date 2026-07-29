@@ -446,6 +446,18 @@ int main(int argc, char** argv) {
     }
     // 网络代理配置：注册 GET/POST/DELETE /proxy 接口。
     http.setProxyConfig(&proxyConfig);
+
+    // MCP server（供 Claude Code 等 agent 工具接入）。工具内部经 HTTP 调本机渲染 API。
+    // 启用密码时工具调渲染 API 带同一确定性 token 鉴权。
+    // MCP 端口绑定：用户未显式 --host 时强制回环，避免误开公网。需远程 MCP 显式 --host 0.0.0.0。
+    // 在 httpThread 启动之前构造 mcp，以便 http 的 /status 能通过 setMcpServer 稳定引用到它
+    //（setMcpServer 必须在 http.start() 即路由注册前完成，否则存在 /status 抢先读不到 m_mcp 的竞态）。
+    std::string mcpHost = cfg.hostExplicit ? cfg.host : std::string("127.0.0.1");
+    McpServer mcp;
+    mcp.start(mcpHost, cfg.mcpPort, "127.0.0.1", cfg.httpPort,
+              HttpServer::computeToken(cfg.adminPassword));
+    http.setMcpServer(&mcp);
+
     std::thread httpThread([&]() {
         if (!http.start(cfg.host, cfg.httpPort, cfg.httpThreads)) {
             std::fprintf(stderr, "FATAL: HTTP server failed to listen on %s:%d\n",
@@ -453,14 +465,6 @@ int main(int argc, char** argv) {
             QMetaObject::invokeMethod(&app, &QCoreApplication::quit, Qt::QueuedConnection);
         }
     });
-
-    // MCP server（供 Claude Code 等 agent 工具接入）。工具内部经 HTTP 调本机渲染 API。
-    // 启用密码时工具调渲染 API 带同一确定性 token 鉴权。
-    // MCP 端口绑定：用户未显式 --host 时强制回环，避免误开公网。需远程 MCP 显式 --host 0.0.0.0。
-    std::string mcpHost = cfg.hostExplicit ? cfg.host : std::string("127.0.0.1");
-    McpServer mcp;
-    mcp.start(mcpHost, cfg.mcpPort, "127.0.0.1", cfg.httpPort,
-              HttpServer::computeToken(cfg.adminPassword));
 
     // 指标持久化：定时把累计统计落盘（跨重启累加）。GUI 线程 QTimer。
     // 崩溃最多丢 30s 数据；退出时 aboutToQuit 再 flush 一次。

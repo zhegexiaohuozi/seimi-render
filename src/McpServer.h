@@ -33,6 +33,13 @@ public:
 
     void stop();
 
+    // ---------- 诊断访问器（供 /status 暴露 MCP 健康度）----------
+    // session 泄漏曾是 /mcp 反复 503 的根因（handle_mcp_get 流结束不回收 session）。
+    // 这些访问器让运维能在 session 堆积到上限前发现问题。
+    bool isRunning() const;                // MCP server 是否成功启动并监听
+    unsigned int activeSessionCount() const; // 当前活跃 session 数
+    unsigned int maxSessions() const;      // session 容量上限（写死 64）
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

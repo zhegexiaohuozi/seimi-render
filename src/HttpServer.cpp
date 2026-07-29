@@ -5,6 +5,7 @@
 
 #include "CookieStore.h"
 #include "Environment.h"
+#include "McpServer.h"
 #include "ProxyConfig.h"
 #include "IpNet.h"
 #include "TokenCompare.h"
@@ -409,6 +410,17 @@ std::string HttpServer::jsonRuntimeStatus(const httplib::Request& req) {
         s += ",\"memory_percent\":" + fmtDouble(e.memoryPercent);
         s += ",\"sampled_at_ms\":" + fmtMs(e.sampledAtMs);
         s += ",\"markdown\":\"" + esc(e.markdown) + "\"";
+        s += "}";
+    }
+
+    // —— MCP 服务健康度 ——
+    // 让运维能在 session 堆积到上限前发现问题：sessions_used 持续逼近 sessions_limit
+    // 即将触发 503。可空（未启用 MCP 时 m_mcp 为 nullptr，本段不出现）。
+    if (m_mcp) {
+        s += ",\"mcp\":{";
+        s += "\"enabled\":" + std::string(m_mcp->isRunning() ? "true" : "false");
+        s += ",\"sessions_used\":" + std::to_string(m_mcp->activeSessionCount());
+        s += ",\"sessions_limit\":" + std::to_string(m_mcp->maxSessions());
         s += "}";
     }
 

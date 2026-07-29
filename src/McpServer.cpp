@@ -798,4 +798,18 @@ void McpServer::stop() {
     m_impl->running = false;
 }
 
+bool McpServer::isRunning() const {
+    // start(false) 成功后 running=true，stop()/启动失败置 false。
+    // srv 可能在 stop 后仍非空但已停止监听，故以 running 为准。
+    return m_impl->running.load();
+}
+
+unsigned int McpServer::activeSessionCount() const {
+    return m_impl->srv ? m_impl->srv->session_count() : 0u;
+}
+
+unsigned int McpServer::maxSessions() const {
+    return m_impl->srv ? m_impl->srv->max_sessions() : 0u;
+}
+
 } // namespace seimi
