@@ -178,6 +178,8 @@ body {
 }
 .proxy-badge-on  { background: #ecfdf5; color: var(--success); }
 .proxy-badge-off { background: var(--bg-elev2); color: var(--muted); }
+/* MCP session 用量危险态：极浅红底 + danger 字色，配色范式同 .proxy-auth-set。 */
+.mcp-badge-danger { background: #fef2f2; color: var(--danger); }
 .proxy-body { min-height: 24px; }
 .proxy-line { display: flex; flex-wrap: wrap; gap: 10px 24px; align-items: center; }
 .proxy-kv { display: inline-flex; align-items: baseline; gap: 8px; }

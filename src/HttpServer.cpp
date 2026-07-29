@@ -5,6 +5,7 @@
 
 #include "CookieStore.h"
 #include "Environment.h"
+#include "McpServer.h"
 #include "ProxyConfig.h"
 #include "IpNet.h"
 #include "TokenCompare.h"
@@ -412,6 +413,17 @@ std::string HttpServer::jsonRuntimeStatus(const httplib::Request& req) {
         s += "}";
     }
 
+    // —— MCP 服务健康度 ——
+    // 让运维能在 session 堆积到上限前发现问题：sessions_used 持续逼近 sessions_limit
+    // 即将触发 503。可空（未启用 MCP 时 m_mcp 为 nullptr，本段不出现）。
+    if (m_mcp) {
+        s += ",\"mcp\":{";
+        s += "\"enabled\":" + std::string(m_mcp->isRunning() ? "true" : "false");
+        s += ",\"sessions_used\":" + std::to_string(m_mcp->activeSessionCount());
+        s += ",\"sessions_limit\":" + std::to_string(m_mcp->maxSessions());
+        s += "}";
+    }
+
     s += "}";
     return s;
 }
@@ -486,7 +498,7 @@ bool HttpServer::checkAuth(const httplib::Request& req) const {
 
 void HttpServer::rejectAuth(httplib::Response& res) {
     res.status = 401;
-    res.set_content(R"({"error":"unauthorized","login":"/api/login"})", "application/json");
+    res.set_content(R"({"error":"unauthorized","login":"/api/login"})", "application/json; charset=utf-8");
 }
 
 void HttpServer::noteLoginFailure(const QString& ip) {
@@ -554,7 +566,7 @@ void HttpServer::registerRoutes() {
     // 健康/探活检查（始终免鉴权，供监控/容器探活用）。原 GET / 的 JSON 移到这里以保持 API 兼容。
     m_srv->Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"service":"seimi-render","status":"ok"})",
-                        "application/json");
+                        "application/json; charset=utf-8");
     });
 
     // 鉴权状态查询（免鉴权）。管理页据此判断密码是否启用（不依赖本地 sessionStorage token 残留）。
@@ -562,7 +574,7 @@ void HttpServer::registerRoutes() {
         std::string body = "{\"password_enabled\":";
         body += (m_password.empty() ? "false" : "true");
         body += "}";
-        res.set_content(body, "application/json");
+        res.set_content(body, "application/json; charset=utf-8");
     });
 
     // 管理 UI 登录（仅启用密码时注册）。前端 POST {password}，对则返回 token。
@@ -583,7 +595,7 @@ void HttpServer::registerRoutes() {
                 res.set_header("Retry-After", std::to_string(retrySec));
                 std::string body = R"({"error":"too many login failures","retry_after_sec":)"
                                  + std::to_string(retrySec) + R"(})";
-                res.set_content(body, "application/json");
+                res.set_content(body, "application/json; charset=utf-8");
                 return;
             }
 
@@ -602,11 +614,11 @@ void HttpServer::registerRoutes() {
                 res.set_header("Set-Cookie",
                     std::string("seimi_token=") + m_token
                     + "; Path=/; HttpOnly; SameSite=Lax");
-                res.set_content(std::string("{\"token\":\"") + m_token + "\"}", "application/json");
+                res.set_content(std::string("{\"token\":\"") + m_token + "\"}", "application/json; charset=utf-8");
             } else {
                 noteLoginFailure(ip);
                 res.status = 401;
-                res.set_content(R"({"error":"invalid password"})", "application/json");
+                res.set_content(R"({"error":"invalid password"})", "application/json; charset=utf-8");
             }
             // 顺带回收过期条目（节流，实际每 5 分钟才扫一次）。
             gcLoginRate();
@@ -624,7 +636,7 @@ void HttpServer::registerRoutes() {
             }
         }
         // 无管理页或读不到：回退健康检查
-        res.set_content(R"({"service":"seimi-render","status":"ok"})", "application/json");
+        res.set_content(R"({"service":"seimi-render","status":"ok"})", "application/json; charset=utf-8");
     });
 
     // 统计（简单队列快照，保留向后兼容）
@@ -638,7 +650,7 @@ void HttpServer::registerRoutes() {
                            ",\"workers\":" + std::to_string(s.concurrency) +
                            ",\"workers_busy\":" + std::to_string(s.busy) +
                            ",\"peak_pending\":" + std::to_string(s.peakPending) + "}";
-        res.set_content(body, "application/json");
+        res.set_content(body, "application/json; charset=utf-8");
     });
 
     // 运行时状态全景：进程信息 + 累计计数 + 成功率 + 延迟分布(p50/p90/p99) +
@@ -646,7 +658,7 @@ void HttpServer::registerRoutes() {
     // 可带 ?domains=N 控制返回的域名条数（默认 20，上限 200）。
     m_srv->Get("/status", [this](const httplib::Request& req, httplib::Response& res) {
         SEIMI_AUTH(req, res);
-        res.set_content(jsonRuntimeStatus(req), "application/json");
+        res.set_content(jsonRuntimeStatus(req), "application/json; charset=utf-8");
     });
 
     // ====== Cookie 同步（浏览器插件用）======
@@ -662,13 +674,13 @@ void HttpServer::registerRoutes() {
                 QByteArray::fromStdString(req.body), &err);
             if (err.error != QJsonParseError::NoError || !doc.isObject()) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid json body"})", "application/json");
+                res.set_content(R"({"error":"invalid json body"})", "application/json; charset=utf-8");
                 return;
             }
             QJsonArray arr = doc.object().value(QStringLiteral("cookies")).toArray();
             if (arr.isEmpty()) {
                 res.status = 400;
-                res.set_content(R"({"error":"'cookies' array is empty or missing"})", "application/json");
+                res.set_content(R"({"error":"'cookies' array is empty or missing"})", "application/json; charset=utf-8");
                 return;
             }
             // 上限保护：单次 ≤ 5000，防滥用
@@ -695,7 +707,7 @@ void HttpServer::registerRoutes() {
             }
             int stored = m_cookies->record(batch);
             res.set_content("{\"stored\":" + std::to_string(stored) +
-                            ",\"applied\":true}", "application/json");
+                            ",\"applied\":true}", "application/json; charset=utf-8");
         });
 
         // 概览
@@ -709,7 +721,7 @@ void HttpServer::registerRoutes() {
                      "\",\"count\":" + std::to_string(ov.domains[i].count) + "}";
             }
             s += "]}";
-            res.set_content(s, "application/json");
+            res.set_content(s, "application/json; charset=utf-8");
         });
 
         // 清空
@@ -718,11 +730,11 @@ void HttpServer::registerRoutes() {
             if (req.has_param("permanent")) {
                 // 永久删除：删除 data/cookies.dat 文件 + 清全部内存状态。
                 m_cookies->requestPurge();
-                res.set_content(R"({"purged":true})", "application/json");
+                res.set_content(R"({"purged":true})", "application/json; charset=utf-8");
             } else {
                 // 普通清空：清内存 + 清持久仓库 + 落空文件（重启不恢复）。
                 m_cookies->requestClear();
-                res.set_content(R"({"cleared":true})", "application/json");
+                res.set_content(R"({"cleared":true})", "application/json; charset=utf-8");
             }
         });
     }
@@ -746,7 +758,7 @@ void HttpServer::registerRoutes() {
                 s += ",\"password_set\":" + std::string(p.pass.empty() ? "false" : "true");
             }
             s += "}";
-            res.set_content(s, "application/json");
+            res.set_content(s, "application/json; charset=utf-8");
         });
 
         m_srv->Post("/proxy", [this](const httplib::Request& req, httplib::Response& res) {
@@ -756,7 +768,7 @@ void HttpServer::registerRoutes() {
                 QByteArray::fromStdString(req.body), &err);
             if (err.error != QJsonParseError::NoError || !doc.isObject()) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid json body"})", "application/json");
+                res.set_content(R"({"error":"invalid json body"})", "application/json; charset=utf-8");
                 return;
             }
             QJsonObject obj = doc.object();
@@ -770,7 +782,7 @@ void HttpServer::registerRoutes() {
                 spec.type = ProxySpec::Type::Socks5;
             } else {
                 res.status = 400;
-                res.set_content(R"({"error":"'type' must be direct|http|socks5"})", "application/json");
+                res.set_content(R"({"error":"'type' must be direct|http|socks5"})", "application/json; charset=utf-8");
                 return;
             }
             if (spec.type != ProxySpec::Type::Direct) {
@@ -790,7 +802,7 @@ void HttpServer::registerRoutes() {
                 spec.pass = obj.value(QStringLiteral("pass")).toString().toStdString();
                 if (spec.host.empty() || port < 1 || port > 65535) {
                     res.status = 400;
-                    res.set_content(R"({"error":"http/socks5 requires 'host' and 'port' [1-65535]"})", "application/json");
+                    res.set_content(R"({"error":"http/socks5 requires 'host' and 'port' [1-65535]"})", "application/json; charset=utf-8");
                     return;
                 }
             }
@@ -803,14 +815,14 @@ void HttpServer::registerRoutes() {
                 s += ",\"port\":" + std::to_string(spec.port);
             }
             s += "}";
-            res.set_content(s, "application/json");
+            res.set_content(s, "application/json; charset=utf-8");
         });
 
         m_srv->Delete("/proxy", [this](const httplib::Request& req, httplib::Response& res) {
             SEIMI_AUTH(req, res);
             ProxySpec direct;  // 默认 Direct
             m_proxy->setProxy(direct);
-            res.set_content(R"({"ok":true,"type":"direct"})", "application/json");
+            res.set_content(R"({"ok":true,"type":"direct"})", "application/json; charset=utf-8");
         });
     }
 
@@ -822,14 +834,14 @@ void HttpServer::registerRoutes() {
             QByteArray::fromStdString(req.body), &err);
         if (err.error != QJsonParseError::NoError || !doc.isObject()) {
             res.status = 400;
-            res.set_content(R"({"error":"invalid json body"})", "application/json");
+            res.set_content(R"({"error":"invalid json body"})", "application/json; charset=utf-8");
             return;
         }
         QJsonObject obj = doc.object();
         QString url = obj.value(QStringLiteral("url")).toString().trimmed();
         if (url.isEmpty()) {
             res.status = 400;
-            res.set_content(R"({"error":"missing 'url'"})", "application/json");
+            res.set_content(R"({"error":"missing 'url'"})", "application/json; charset=utf-8");
             return;
         }
         // 基础 URL 校验
@@ -837,7 +849,7 @@ void HttpServer::registerRoutes() {
         if (!qurl.isValid() || (qurl.scheme() != QStringLiteral("http")
                                 && qurl.scheme() != QStringLiteral("https"))) {
             res.status = 400;
-            res.set_content(R"({"error":"url must be http/https"})", "application/json");
+            res.set_content(R"({"error":"url must be http/https"})", "application/json; charset=utf-8");
             return;
         }
         // SSRF 防护：拒绝指向内网/回环/链路本地/元数据地址的目标。
@@ -846,7 +858,7 @@ void HttpServer::registerRoutes() {
             res.status = 400;
             std::string body = R"({"error":"url blocked by SSRF guard","detail":")"
                              + escJson(ssrfReason) + R"("})";
-            res.set_content(body, "application/json");
+            res.set_content(body, "application/json; charset=utf-8");
             return;
         }
 
@@ -866,13 +878,13 @@ void HttpServer::registerRoutes() {
             // 任务表过载（洪泛提交/积压）：背压拒绝，让客户端稍后重试。
             res.status = 503;
             res.set_header("Retry-After", "2");
-            res.set_content(R"({"error":"server overloaded, retry later"})", "application/json");
+            res.set_content(R"({"error":"server overloaded, retry later"})", "application/json; charset=utf-8");
             return;
         }
 
         if (longPollMs == 0) {
             // 非长轮询：立即返回 pending。用持锁快照读字段（避免跨线程数据竞争）。
-            res.set_content(jsonStateResp(m_queue->snapshot(id), outputs), "application/json");
+            res.set_content(jsonStateResp(m_queue->snapshot(id), outputs), "application/json; charset=utf-8");
             return;
         }
 
@@ -882,10 +894,10 @@ void HttpServer::registerRoutes() {
         RenderQueue::Snapshot s = m_queue->snapshot(id);
         if (!s.found) {
             res.status = 404;
-            res.set_content(R"({"error":"task not found"})", "application/json");
+            res.set_content(R"({"error":"task not found"})", "application/json; charset=utf-8");
             return;
         }
-        res.set_content(jsonStateResp(s, s.done ? outputs : 0), "application/json");
+        res.set_content(jsonStateResp(s, s.done ? outputs : 0), "application/json; charset=utf-8");
     });
 
     // 非阻塞状态查询（不含 html/markdown，只状态 + 计时）
@@ -896,10 +908,10 @@ void HttpServer::registerRoutes() {
         RenderQueue::Snapshot s = m_queue->snapshot(id);
         if (!s.found) {
             res.status = 404;
-            res.set_content(R"({"error":"task not found"})", "application/json");
+            res.set_content(R"({"error":"task not found"})", "application/json; charset=utf-8");
             return;
         }
-        res.set_content(jsonStateResp(s, 0), "application/json");
+        res.set_content(jsonStateResp(s, 0), "application/json; charset=utf-8");
     });
 
     // 长轮询拉取渲染结果。output=html,markdown 控制返回内容；image 走 /screenshot。
@@ -914,11 +926,11 @@ void HttpServer::registerRoutes() {
         RenderQueue::Snapshot s = m_queue->snapshot(id);
         if (!s.found) {
             res.status = 404;
-            res.set_content(R"({"error":"task not found"})", "application/json");
+            res.set_content(R"({"error":"task not found"})", "application/json; charset=utf-8");
             return;
         }
         if (s.done) {
-            res.set_content(jsonStateResp(s, outMask), "application/json");
+            res.set_content(jsonStateResp(s, outMask), "application/json; charset=utf-8");
             return;
         }
         // 默认长轮询 25s
@@ -938,10 +950,10 @@ void HttpServer::registerRoutes() {
         s = m_queue->snapshot(id);                   // 等待后再取一次安全快照
         if (!s.found) {
             res.status = 404;
-            res.set_content(R"({"error":"task not found"})", "application/json");
+            res.set_content(R"({"error":"task not found"})", "application/json; charset=utf-8");
             return;
         }
-        res.set_content(jsonStateResp(s, s.done ? outMask : 0), "application/json");
+        res.set_content(jsonStateResp(s, s.done ? outMask : 0), "application/json; charset=utf-8");
     });
 
     // 下载打印 PDF（仅当任务请求了 pdf 且渲染成功）
@@ -952,18 +964,18 @@ void HttpServer::registerRoutes() {
         RenderQueue::Snapshot s = m_queue->snapshot(id);
         if (!s.found) {
             res.status = 404;
-            res.set_content(R"({"error":"task not found"})", "application/json");
+            res.set_content(R"({"error":"task not found"})", "application/json; charset=utf-8");
             return;
         }
         if (!s.done) {
             res.status = 409;
-            res.set_content(R"({"error":"task not finished"})", "application/json");
+            res.set_content(R"({"error":"task not finished"})", "application/json; charset=utf-8");
             return;
         }
         if (s.pdfData.isEmpty()) {
             res.status = 404;
             res.set_content(R"({"error":"no pdf for this task; request output=pdf when submitting"})",
-                            "application/json");
+                            "application/json; charset=utf-8");
             return;
         }
         res.set_content(s.pdfData.toStdString(), "application/pdf");
@@ -978,18 +990,18 @@ void HttpServer::registerRoutes() {
         RenderQueue::Snapshot s = m_queue->snapshot(id);
         if (!s.found) {
             res.status = 404;
-            res.set_content(R"({"error":"task not found"})", "application/json");
+            res.set_content(R"({"error":"task not found"})", "application/json; charset=utf-8");
             return;
         }
         if (!s.done) {
             res.status = 409;
-            res.set_content(R"({"error":"task not finished"})", "application/json");
+            res.set_content(R"({"error":"task not finished"})", "application/json; charset=utf-8");
             return;
         }
         if (s.imageData.isEmpty()) {
             res.status = 404;
             res.set_content(R"({"error":"no screenshot for this task; request output=screenshot when submitting"})",
-                            "application/json");
+                            "application/json; charset=utf-8");
             return;
         }
         // Content-Type 按实际编码格式（智能选择或手动指定的结果）。

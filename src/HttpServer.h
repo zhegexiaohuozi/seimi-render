@@ -25,6 +25,7 @@ namespace seimi {
 class CookieStore;
 class ProxyConfig;
 class Environment;
+class McpServer;
 
 // HTTP 接口层（cpp-httplib，内置线程池）。
 // 路由：POST /render、GET /status/:id、GET /result/:id?timeout=、GET /stats、GET /health、
@@ -60,6 +61,9 @@ public:
     // 设置网络代理配置中枢（启用 GET/POST/DELETE /proxy）。必须在 start() 前调用。
     void setProxyConfig(ProxyConfig* cfg) { m_proxy = cfg; }
     void setEnvironment(Environment* env) { m_env = env; }
+    // 注入 MCP server 引用，使 /status 能暴露 MCP session 健康度。可空（未启动 MCP 时为 nullptr）。
+    // 必须在 start() 前调用。
+    void setMcpServer(McpServer* mcp) { m_mcp = mcp; }
 
 private:
     void registerRoutes();
@@ -69,7 +73,8 @@ private:
     static std::string jsonStateResp(const RenderQueue::Snapshot& s, OutputMask outMask);
 
     // GET /status 的运行时全景 JSON：进程信息 + 累计计数 + 成功率 + 延迟分布 +
-    // 吞吐 + 输出类型需求 + 域名分布(top-N) + 当前队列快照 + 当前网络代理生效配置。
+    // 吞吐 + 输出类型需求 + 域名分布(top-N) + 当前队列快照 + 当前网络代理生效配置 +
+    // MCP session 健康度（注入 m_mcp 时）。
     std::string jsonRuntimeStatus(const httplib::Request& req);
 
     // —— 管理 UI 与密码保护 ——
@@ -106,6 +111,7 @@ private:
     CookieStore* m_cookies = nullptr;  // 可空；非空时启用 /cookies 接口
     ProxyConfig* m_proxy = nullptr;    // 可空；非空时启用 /proxy 接口
     Environment* m_env = nullptr;      // 可空；非空时 /status 附带 environment 段
+    McpServer* m_mcp = nullptr;        // 可空；非空时 /status 附带 mcp session 健康段
     int m_settleDefaultMs;
     std::unique_ptr<httplib::Server> m_srv;
     std::atomic<bool> m_running{false};

@@ -4,9 +4,12 @@
 #include "RenderQueue.h"
 
 #include <QElapsedTimer>
+#include <QList>
 #include <QRandomGenerator>
 #include <QUrl>
 #include <QUuid>
+
+#include <QtLogging>
 
 #include <algorithm>
 #include <utility>
@@ -27,6 +30,30 @@ static std::string extractHost(const QString& url) {
     const QUrl u(url);
     QString host = u.host().toLower();
     return host.isEmpty() ? std::string() : host.toStdString();
+}
+
+// —— 渲染日志辅助 ——
+// sanitizeUrlForLog：去掉控制符（防终端错乱）+ 截断（防超长 URL 刷屏）。
+// 思路与 RenderPool.cpp 的 sanitizeForLog 一致，但 RenderQueue 不依赖它，就地实现。
+static QString sanitizeUrlForLog(const QString& s) {
+    QString out;
+    out.reserve(s.size());
+    for (const QChar c : s) {
+        if (c.category() != QChar::Other_Control && c.category() != QChar::Other_Format) {
+            out.append(c);
+        }
+    }
+    return out.left(120);
+}
+
+// outputMaskNames：把 OutputMask 位标记转成可读名（如 "html,markdown"），用于日志。
+static QByteArray outputMaskNames(OutputMask mask) {
+    QList<QByteArray> parts;
+    if (mask & static_cast<OutputMask>(Output::Html))       parts << "html";
+    if (mask & static_cast<OutputMask>(Output::Markdown))   parts << "markdown";
+    if (mask & static_cast<OutputMask>(Output::Pdf))        parts << "pdf";
+    if (mask & static_cast<OutputMask>(Output::Screenshot)) parts << "screenshot";
+    return parts.isEmpty() ? QByteArray("(none)") : parts.join(',');
 }
 
 QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs,
@@ -55,6 +82,14 @@ QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs
 
     // 借机淘汰过期/超量的终态任务，防完成任务的产物（html/pdf/image 可达数十 MB）无限堆积致 OOM。
     sweepTerminalLocked(nowMsec);
+
+    // 入口日志（仅入队成功；过载背压被拒的由调用方直接回 503，不在此打）。
+    // 对齐 MCP 入口 [MCP] render_url ... 日志，让 HTTP /render 直连也有等价的可见性。
+    qWarning("[render] submit id=%s url=%s output=%s settle=%dms",
+             id.toUtf8().constData(),
+             sanitizeUrlForLog(task->url).toUtf8().constData(),
+             outputMaskNames(outputs).constData(),
+             settleDelayMsec);
 
     return id;
 }
@@ -140,6 +175,27 @@ void RenderQueue::setTerminal(const QString& id,
         blockAttempts = task->blockAttempts;
         blockedFinal = task->blocked;
         shouldRecord = true;
+
+        // 终态日志：对齐 MCP 入口 [MCP] ... -> SUCCEEDED 日志，让 HTTP /render 直连也有等价可见性。
+        // fill() 已把产物（html/markdown/pdf/image）填入 task，此处大小读得到。
+        if (succeeded) {
+            qWarning("[render] SUCCEEDED id=%s url=%s elapsed=%lldms output=%s "
+                     "(md=%zdB html=%zdB pdf=%s screenshot=%s)",
+                     id.toUtf8().constData(),
+                     sanitizeUrlForLog(task->url).toUtf8().constData(),
+                     elapsedMs,
+                     outputMaskNames(task->outputs).constData(),
+                     static_cast<size_t>(task->markdown.size()),
+                     static_cast<size_t>(task->html.size()),
+                     task->pdfData.isEmpty() ? "no" : "yes",
+                     task->imageData.isEmpty() ? "no" : "yes");
+        } else {
+            qWarning("[render] FAILED    id=%s url=%s elapsed=%lldms error=%s",
+                     id.toUtf8().constData(),
+                     sanitizeUrlForLog(task->url).toUtf8().constData(),
+                     elapsedMs,
+                     task->error.isEmpty() ? "(unknown)" : task->error.toUtf8().constData());
+        }
 
         // 借终态变更淘汰过期/超量旧终态任务（刚完成的任务不会被淘汰，WS/长轮询回取安全）。
         sweepTerminalLocked(nowMsec);

@@ -113,6 +113,19 @@
       'proxy.authNone': '无认证',
       'proxy.desc': '代理经由 <code>QNetworkProxy::setApplicationProxy</code> 运行时下发给 Chromium 网络栈（Qt WebEngine 轮询它，数秒内切换生效）。切换瞬间已在途的请求可能走旧代理，新请求走新代理。密码不回显。',
 
+      // MCP 服务健康度
+      'mcp.title': 'MCP 服务',
+      'mcp.off': '未启用',
+      'mcp.disabledDesc': 'MCP server 未启动或监听失败（HTTP/WS 渲染不受影响）。配置参考「MCP 接入」页签。',
+      'mcp.healthy': '正常',
+      'mcp.nearFull': '会话将满',
+      'mcp.sessionsUsed': '会话占用',
+      'mcp.unlimited': '会话数无上限。',
+      'mcp.kv.sessionsUsed': '已用',
+      'mcp.kv.sessionsLimit': '上限',
+      'mcp.kv.usage': '使用率',
+      'mcp.desc': 'MCP 工具无状态，客户端可复用同一会话。会话用量持续逼近上限通常意味着客户端反复重连未复用会话 ID；接近上限时新连接会收到 503「Too many sessions」。',
+
       // 渲染测试台
       'render.url': '目标 URL',
       'render.settle': '等待延迟 (Settle MS)',
@@ -350,6 +363,19 @@
       'proxy.authSet': 'Credentials configured',
       'proxy.authNone': 'No auth',
       'proxy.desc': 'Proxy is delivered to the Chromium network stack at runtime via <code>QNetworkProxy::setApplicationProxy</code> (Qt WebEngine polls it; switches within seconds). In-flight requests at the switch moment may still use the old proxy; new requests use the new one. Password is never echoed back.',
+
+      // MCP service health
+      'mcp.title': 'MCP Service',
+      'mcp.off': 'Disabled',
+      'mcp.disabledDesc': 'MCP server is not started or failed to listen (HTTP/WS rendering is unaffected). See the "MCP" tab for configuration.',
+      'mcp.healthy': 'Healthy',
+      'mcp.nearFull': 'Sessions near full',
+      'mcp.sessionsUsed': 'Sessions used',
+      'mcp.unlimited': 'Unlimited sessions.',
+      'mcp.kv.sessionsUsed': 'Used',
+      'mcp.kv.sessionsLimit': 'Limit',
+      'mcp.kv.usage': 'Usage',
+      'mcp.desc': 'MCP tools are stateless; clients may reuse the same session. Usage staying near the limit usually means clients reconnect repeatedly without reusing the session ID. When the limit is reached, new connections get a 503 "Too many sessions".',
 
       'render.url': 'Target URL',
       'render.settle': 'Settle delay (Settle MS)',
