@@ -44,6 +44,10 @@
 | Linux   | `sh scripts\package-linux.sh` |
 | macOS   | `sh scripts\package.sh` |
 
+## 免构建直接下载地址
+
+https://github.com/zhegexiaohuozi/seimi-render/releases
+
 ## 快速开始
 
 启动服务（默认无头 offscreen）：
