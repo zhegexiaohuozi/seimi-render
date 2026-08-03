@@ -1,6 +1,6 @@
 # <img src="admin-ui/favicon.svg" width="32" align="top"> seimi-render
 
-> 📖 **文档语言：** **简体中文** | [English](docs/README.en.md)
+> 📖 **文档语言：** **简体中文** | [English](docs/README.en.md) | [项目地址一键直达](https://github.com/zhegexiaohuozi/seimi-render) | 欢迎Star
 
 这个工程的更原始的版本是[SeimiAgent](https://github.com/zhegexiaohuozi/SeimiAgent)，SeimiRender是SeimiAgent的现代化升级版。基于Chromium的网页渲染服务。提交 URL，以真实的 Chromium 浏览器行为渲染页面（执行 JS、等待异步内容），然后返回渲染后的完整 HTML、pdf、png、json结构化搜素结果。支持长轮询与 WebSocket 推送获取结果。可在后台静默无打扰运行。支持MCP协议，完美适配各类AI Agent工具，拓展你的Harness数据获取边界。也可以是Vibe Coding中AI进行RL迭代自动优化的基础设施。
 
