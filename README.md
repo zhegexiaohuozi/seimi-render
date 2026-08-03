@@ -16,6 +16,7 @@
 - **内置 Web 管理后台**：监控大盘、渲染测试台、cookie 管理、接口文档、Agent 配置一键复制
 - **搜索引擎结果结构化提取**：百度/必应/Google 搜索结果去广告结构化，直接返回 JSON
 - **运行时监控指标**：成功率、延迟分位数（p50/p90/p99）、吞吐、域名分布，适合运维大盘
+- **网络录制与 HAR 导出**：开启 `--remote-debugging-port` 后，渲染时带 `record_network=true` 即可录制页面加载全过程（请求/响应/headers/响应体/timing，类似 Chrome F12 Network），产出标准 HAR 1.2 文件，可直接导入 Chrome DevTools / Charles / haralyzer 分析。可以极大的提高自动化信息挖掘效率。
 - **多种渲染输出**：html、markdown、pdf、png/jpg、搜索结果json结构化。
 - **无头运行**：默认 offscreen 平台，无需显示器,不会干扰本地浏览器操作，本地操作也不会干扰浏览结果获取。
 - **基础防浏览器指纹识别**：基础反爬识别能力。
@@ -127,6 +128,7 @@ curl -X POST http://localhost:8088/render \
 | `--no-stealth` | 关闭（stealth 开启） | 禁用浏览器指纹统一。默认开启 stealth，将所有渲染实例伪装成同一 Chrome 桌面环境（UA/screen/WebGL/canvas），融入人群以绕过基础反爬（如 Google） |
 | `--no-warmup` | 关闭（warmup 开启） | 关闭启动 Google 会话预热。默认开启：进程启动时先以隐藏 page 加载一次 `--warmup-url`（默认 https://www.google.com/）拿到 NID/CONSENT 等会话 cookie，**再**启动 dispatch 定时器接业务请求——冷启动零 cookie 直打搜索是 Google 风控的最高危窗口，预热能显著降低首条搜索的 sorry 概率 |
 | `--warmup-url <url>` | `https://www.google.com/` | 会话预热目标 URL（必须 http/https）。仅在 warmup 开启时使用；一般无需改，特殊环境（如走代理时 google.com 不通）可换成能稳定返回 google 域 cookie 的镜像。warmup 自带失败自适应：连续 3 次预热失败（约 90min，Google 不可达）会自动暂停 30min 周期、改用 5min 低频探活；探活成功立即恢复正常周期。状态变化在服务日志里以 `[warmup] SUSPENDED` / `[warmup] RESUMED` 标记 |
+| `--remote-debugging-port <n>` | —（关闭） | 开启 Chromium 远程调试端口，启用 **HAR 网络录制**能力（详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network)）。开启后 stealth 的 `AutomationControlled` 标记会被自动跳过（调试模式与反爬互斥），并显著打印警告。**生产环境请勿对外暴露此端口**——它授予完整的浏览器控制权 |
 | `--help` | — | 显示帮助信息 |
 
 ### 并发与吞吐（`--concurrency`）
@@ -157,7 +159,7 @@ seimi-render 内置一个浏览器管理控制台(`GET /`,访问根路径即打�
 | **渲染测试台**(English) | 同一界面切到 English(右上角「中」切回中文),演示 Google 搜索结果结构化提取(`extract=google_serp`)。 | <a href="docs/images/google-search-extract-en.png" target="_blank"><img src="docs/images/google-search-extract-en.png" width="420" alt="英文界面 - Google 搜索结果提取"></a> |
 | **Cookie 状态** | 查看渲染服务持有的登录态 cookie,按域名展示「携带 cookie 数量」(不含 value,防泄露),与浏览器插件对账。「清空当前会话」/「永久删除」分别清内存会话与加密持久化存储(`data/cookies.dat`)。 | <a href="docs/images/cookies.png" target="_blank"><img src="docs/images/cookies.png" width="420" alt="Cookie 状态"></a> |
 | **配置示例** | 一键复制 Agent 接入与调用配置:Claude Code / Cursor 的 `mcpServers` JSON、curl 调 `/render` 示例、WebSocket 示例,以及当前访问 token(启用 `--password` 时显示)。 | <a href="docs/images/config-show.png" target="_blank"><img src="docs/images/config-show.png" width="420" alt="配置示例"></a> |
-| **接口文档** | 交互式 API 文档:左目录按「HTTP REST / MCP 工具 / WebSocket」分组(16 HTTP 端点 + 4 MCP 工具 + WS 的 render/subscribe/auth),右详情含参数表、curl/JSON 示例、响应示例与错误码,均可一键复制。 | <a href="docs/images/api-docs.png" target="_blank"><img src="docs/images/api-docs.png" width="420" alt="接口文档"></a> |
+| **接口文档** | 交互式 API 文档:左目录按「HTTP REST / MCP 工具 / WebSocket」分组(17 HTTP 端点 + 5 MCP 工具 + WS 的 render/subscribe/auth),右详情含参数表、curl/JSON 示例、响应示例与错误码,均可一键复制。 | <a href="docs/images/api-docs.png" target="_blank"><img src="docs/images/api-docs.png" width="420" alt="接口文档"></a> |
 
 > cookie 同步来源见上文 [浏览器插件](#浏览器插件) 章节。管理界面是纯静态资源([`admin-ui/`](admin-ui/)),随二进制打包分发,不依赖外部服务。远程访问需显式 `--host 0.0.0.0` 并强烈建议配置 `--password`(管理界面可改代理、注入 cookie,是高权限入口)。
 
@@ -214,6 +216,7 @@ seimi-render 默认Chromum内核渲染,没有你的登录态。要渲染「登�
 | GET  | `/status/:id` | 查询单个任务状态（非阻塞） |
 | GET  | `/status` | 运行时全景：累计计数、成功率、延迟分布、吞吐、域名分布、队列快照 |
 | GET  | `/result/:id?timeout=N` | 长轮询拉取 HTML（默认 25s） |
+| GET  | `/har/:id` | 下载任务的 HAR 网络录制（需 `--remote-debugging-port` + `record_network=true`，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network)） |
 | POST | `/cookies` | 同步浏览器登录态 cookies（插件用） |
 | GET  | `/cookies` | 已同步 cookie 概览（域名→数量，不含 value） |
 | DELETE | `/cookies` | 清空已同步的 cookie |
@@ -446,19 +449,122 @@ sequenceDiagram
     Note over C: JS 缺失/异常时静默降级：<br/>无 serp_json 字段，仅返回 html
 ```
 
+## 网络录制与 HAR 导出（`record_network`）
+
+seimi-render 支持在渲染时**录制页面加载的全过程网络流量**（所有 HTTP 请求与响应，含 headers、状态码、响应体、timing），产出 **标准 HAR 1.2 文件**——与 Chrome DevTools 的 Network 面板「Save all as HAR」功能等价。录制的 HAR 可直接导入 Chrome DevTools、Charles、haralyzer 等工具进行性能分析、接口逆向、故障排查。
+
+### 工作原理
+
+启用后，seimi-render 会通过 **CDP（Chrome DevTools Protocol）** 连接到渲染页面的 Chromium target，订阅 `Network` domain 事件（`requestWillBeSent` / `responseReceived` / `loadingFinished` 等），按 requestId 聚合为 HAR entry。CdpClient 内嵌在进程内（基于 Qt WebSocket），不依赖任何外部 CDP 客户端。
+
+### 启用方式
+
+两步：
+
+1. **启动服务时加 `--remote-debugging-port`**：
+
+```bash
+./build/seimi-render.app/Contents/MacOS/seimi-render \
+  --http-port 8088 --ws-port 8099 \
+  --remote-debugging-port 9222
+```
+
+2. **渲染时带 `record_network: true`**：
+
+```bash
+TASK_ID=$(curl -s -X POST http://localhost:8088/render \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://weibo.com/","output":"html","record_network":true,"long_poll_ms":45000}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['task_id'])")
+
+# 渲染完成后取 HAR（finalize 有 ~0.3s 延时，稍等片刻）
+sleep 2
+curl http://localhost:8088/har/$TASK_ID -o trace.har
+```
+
+> HAR 文件保留 10 分钟后自动淘汰（`HarStore` 的 TTL + 200 份上限 LRU）。
+
+### HTTP 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/har/:id` | 下载指定任务的 HAR。成功返回 `application/json`（HAR 1.2 正文），附 `Content-Disposition: attachment; filename="<task_id>.har"`。未开 `--remote-debugging-port` 时返回 `503`；任务未录制（没带 `record_network`）或已过期返回 `404` |
+
+### `POST /render` 新增参数
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `record_network` | bool | `false` | 设为 `true` 时，本次渲染会录制所有网络流量。未开 `--remote-debugging-port` 时静默降级（渲染正常，但不产出 HAR）。录制会增加约 50-200ms 的 CDP attach 开销 |
+
+### MCP 工具
+
+Agent 可通过两个 MCP 工具完成完整录制闭环：
+
+```bash
+# 1. render_url 带 record_network
+#    agent 调用 render_url 时传 record_network: true
+#    返回 task_id 后，HAR 在渲染结束时自动归档
+
+# 2. get_har 取结果
+#    用上一步的 task_id 调 get_har，返回 HAR JSON 字符串
+```
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `render_url` | `record_network`(bool, 默认 false) | 渲染时录制网络流量，结果用 `get_har` 取 |
+| `get_har` | `task_id`(必填) | 取指定任务的 HAR，返回 HAR 1.2 JSON。归档有 ~0.3s 延时，渲染刚结束立即取可能提示「not available」，稍等重试即可 |
+
+### HAR 内容
+
+产出的是**标准 HAR 1.2**，每个 entry 包含：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `request` | CDP `Network.requestWillBeSent` | method / url / httpVersion / headers / queryString / postData / bodySize |
+| `response` | CDP `Network.responseReceived` | status / statusText / httpVersion / headers / mimeType / redirectURL / bodySize |
+| `response.content` | CDP `Network.getResponseBody` | size / mimeType / text（响应体，二进制走 base64 encoding）/ compression |
+| `timings` | CDP `ResourceTiming` | send / wait / receive（毫秒） |
+| `_resourceType` | CDP `type` | document / xhr / script / stylesheet / image / font / media / fetch / websocket 等（Chrome 扩展字段） |
+| `_initiator` | CDP `initiator` | 请求发起方（parser / script / other，Chrome 扩展字段） |
+| `_transferSize` | CDP `encodedDataLength` | 线上传输字节数（Chrome 扩展字段） |
+| `startedDateTime` | CDP `wallTime` | ISO 8601 带毫秒（UTC） |
+| `time` | timings 之和 | 总耗时（ms） |
+
+> 响应体默认全量捕获；单条 >1MB 时降级为只留 size 不留 text（省内存，仍保留 mimeType）。
+
+### ⚠️ 重要：与 stealth（反爬）的互斥
+
+`--remote-debugging-port` 开启后，stealth 的 **`--disable-blink-features=AutomationControlled` 标记会被自动跳过**——因为该标记会抹除 CDP 痕迹，与录制所需的 CDP 连接冲突。
+
+这意味着：
+
+- **录制模式 = 调试/分析模式**：适合开发调试、性能分析、接口逆向，**不适合反爬场景**
+- 其余 stealth 层（UA 统一、stealth.js 指纹补全、高熵 Client Hints）仍生效，减少指纹漂移
+- 如需同时反爬渲染 + HAR 录制，建议跑**两个实例**：一个不带 `--remote-debugging-port`（满血 stealth），一个带（录制分析）
+
+> 启动时服务会打印显著警告：`Stealth AutomationControlled flag will be SKIPPED to avoid CDP conflict`。
+
+### 安全提示
+
+`--remote-debugging-port` 授予**完整的浏览器控制权**（可执行任意 JS、读取 cookie、导航到任意 URL）。生产环境部署时：
+
+- **务必绑定 `127.0.0.1`**（Chromium 默认行为，不要 `--host 0.0.0.0` 时开启）
+- 或放在防火墙/VPN 之后，禁止公网直接访问
+
 ## MCP（供 Claude Code / Cursor 等 agent 接入）
 
 seimi-render 内置一个 **MCP（Model Context Protocol）server**（默认端口 `8090`，基于 [hkr04/cpp-mcp](https://github.com/hkr04/cpp-mcp)，Streamable HTTP 传输，符合 2025-03-26 规范）。这让 Claude Code、Cursor 等 AI agent 工具能**直接把 seimi-render 当成渲染工具来调用**——agent 自动决定何时渲染网页、拿到渲染后的内容。
 
 ### 暴露的 tools
 
-共 4 个工具，按「语义层级」从高到低排列——agent 优先用高层工具，底层 `render_url` 兜底所有它覆盖不到的场景：
+共 5 个工具，按「语义层级」从高到低排列——agent 优先用高层工具，底层 `render_url` 兜底所有它覆盖不到的场景：
 
 | tool | 作用 | 必填参数 | 可选参数 |
 |------|------|----------|----------|
 | `browser_search` | 关键词搜索：自动构造搜索引擎 URL 并渲染，返回结果列表。**没给具体 URL、只想「搜一下/查一下」时优先用** | `query` | `engine`(google/bing/baidu/duckduckgo，默认 google)、`settle_ms`(2500)、`timeout_ms`(45000) |
 | `get_web_content` | 读单篇文章正文：用 readability 提取干净 markdown（去导航/广告/侧栏）。**给了具体 URL 要读全文时优先用** | `url` | `md_algorithm`(readability/conservative，默认 readability)、`settle_ms`(2500)、`timeout_ms`(45000) |
-| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000) |
+| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000)、`record_network`(false，开启 HAR 网络录制，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network)) |
+| `get_har` | 按 task_id 取网络录制 HAR：配合 `render_url` 的 `record_network=true` 使用，返回标准 HAR 1.2 JSON | `task_id` | — |
 | `get_render_result` | 按 task_id 补取已提交任务的结果：`render_url` 超时返回 `running` 后轮询，或重新拉取已完成产物 | `task_id` | `output`(markdown/html/screenshot/pdf，默认 markdown)、`timeout_ms`(5000) |
 
 **工具选择速查**（每个工具的 description 里也写了，agent 会自动判断）：

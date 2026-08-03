@@ -26,12 +26,24 @@
 #include <QWebEngineUrlRequestInfo>
 #include <QWebEngineUrlRequestInterceptor>
 
+#include <QHash>
 #include <QHostAddress>
 #include <QHostInfo>
 #include <QString>
 #include <QUrl>
 
+#include <functional>
+
 namespace seimi {
+
+// HAR 录制用：拦截器观测到的请求侧信息（跑在 IO 线程，跨线程投递时拷贝）。
+struct InterceptorRequestInfo {
+    QByteArray method;                          // GET/POST/...
+    QUrl url;
+    QHash<QString, QString> headers;            // 请求头全量
+    QUrl firstPartyUrl;                         // 顶层文档 URL（对应 initiator）
+    int resourceType = 0;                       // QWebEngineUrlRequestInfo::ResourceType
+};
 
 class SsrfRequestInterceptor : public QWebEngineUrlRequestInterceptor {
 public:
@@ -40,6 +52,12 @@ public:
     explicit SsrfRequestInterceptor(bool stealthHeaders = false, QObject* parent = nullptr)
         : QWebEngineUrlRequestInterceptor(parent)
         , m_stealthHeaders(stealthHeaders) {}
+
+    // HAR 录制兜底：设置后每个 http(s) 请求都会回调（跑在 IO 线程，回调内必须快且不阻塞）。
+    // 回调方自行负责跨线程投递（如 QMetaObject::invokeMethod 到 GUI 线程）。
+    // 不设置则无录制兜底（默认行为，向后兼容）。
+    using RequestObserver = std::function<void(const InterceptorRequestInfo&)>;
+    void setRequestObserver(RequestObserver ob) { m_requestObserver = std::move(ob); }
 
     void interceptRequest(QWebEngineUrlRequestInfo& info) override {
         const QUrl url = info.requestUrl();
@@ -82,6 +100,21 @@ public:
         }
         if (!isHttp) return;  // data/about/blob 无外部网络目标，放行
 
+        // HAR 录制兜底：对 http(s) 请求回调观测（CDP 漏事件时补全请求侧字段）。
+        // 跑在 IO 线程，回调内必须快（仅拷贝数据 + 跨线程投递，不阻塞）。
+        if (m_requestObserver) {
+            InterceptorRequestInfo ri;
+            ri.method = info.requestMethod();
+            ri.url = url;
+            const auto hdrs = info.httpHeaders();
+            for (auto hit = hdrs.begin(); hit != hdrs.end(); ++hit) {
+                ri.headers.insert(QString::fromUtf8(hit.key()), QString::fromUtf8(hit.value()));
+            }
+            ri.firstPartyUrl = info.firstPartyUrl();
+            ri.resourceType = static_cast<int>(info.resourceType());
+            m_requestObserver(ri);
+        }
+
         const QString host = url.host().trimmed();
         if (host.isEmpty()) return;
 
@@ -115,6 +148,7 @@ public:
 
 private:
     bool m_stealthHeaders;
+    RequestObserver m_requestObserver;   // HAR 录制兜底回调（可选，默认空）
 };
 
 } // namespace seimi

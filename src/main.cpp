@@ -15,6 +15,8 @@
 #include "McpServer.h"
 #include "CookieStore.h"
 #include "Environment.h"
+#include "HarRecorder.h"
+#include "HarStore.h"
 #include "ProxyConfig.h"
 #include "RenderPool.h"
 #include "RenderQueue.h"
@@ -104,6 +106,7 @@ struct Config {
     bool stealthEnabled = true;   // 浏览器指纹统一（默认开启，--no-stealth 关闭）
     bool warmupEnabled = true;    // Google 会话预热（默认开启，--no-warmup 关闭）
     std::string warmupUrl = "https://www.google.com/";  // --warmup-url 自定义预热目标
+    int remoteDebugPort = 0;      // Chromium --remote-debugging-port（HAR 网络录制必需；0=不开）
 };
 
 static void printUsage() {
@@ -145,6 +148,11 @@ static void printUsage() {
         "                        Warm-up renders --warmup-url once to acquire Google cookies\n"
         "                        (NID/SOCS) before dispatching render tasks; re-warms every 30min.\n"
         "  --warmup-url <url>    warm-up target (default https://www.google.com/; must be http/https)\n"
+        "  --remote-debugging-port <n>  Chromium remote debugging port. Enables CDP-based network\n"
+        "                        recording (HAR export via /har/<task_id>, render_url record_network).\n"
+        "                        When set, stealth AutomationControlled flag is SKIPPED (debug/analysis\n"
+        "                        mode): anti-bot detection may be less effective. Bind to 127.0.0.1\n"
+        "                        only in production (the port exposes full browser control).\n"
         "  --help                show this help\n");
 }
 
@@ -239,6 +247,7 @@ static Config parseArgs(int argc, char** argv) {
         else if (a == "--no-stealth") c.stealthEnabled = false;
         else if (a == "--no-warmup") c.warmupEnabled = false;
         else if (a == "--warmup-url" && i + 1 < argc) c.warmupUrl = argv[++i];
+        else if (a == "--remote-debugging-port" && i + 1 < argc) c.remoteDebugPort = std::atoi(argv[++i]);
     }
     c.concurrency   = std::max(1, c.concurrency);
     c.httpThreads   = std::max(2, c.httpThreads);
@@ -302,6 +311,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    // CDP 网络录制：开启 Chromium remote debugging port（HAR 录制必需）。
+    // Qt WebEngine 底层 = Chromium，--remote-debugging-port 开出 CDP 端点供本进程内嵌的
+    // CdpClient 连接订阅 Network domain 事件。默认绑 127.0.0.1（Chromium 默认行为）。
+    if (cfg.remoteDebugPort > 0) {
+        QByteArray existing = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
+        if (existing.indexOf("--remote-debugging-port") < 0) {
+            QByteArray flags = existing.trimmed();
+            if (!flags.isEmpty()) flags += ' ';
+            flags += "--remote-debugging-port=" + QByteArray::number(cfg.remoteDebugPort);
+            qputenv("QTWEBENGINE_CHROMIUM_FLAGS", flags);
+            std::fprintf(stderr,
+                "NOTE: Chromium remote debugging port %d enabled (debug/analysis mode).\n"
+                "      Stealth AutomationControlled flag will be SKIPPED to avoid CDP conflict —\n"
+                "      anti-bot detection may be less effective. Ensure the port is not exposed\n"
+                "      to untrusted networks (it grants full browser control).\n",
+                cfg.remoteDebugPort);
+        }
+    }
+
     // 网络代理：经 QNetworkProxy::setApplicationProxy 运行时动态配置（见 ProxyConfig）。
     // Qt WebEngine 轮询全局应用代理，运行时修改后 Chromium 在数秒内切换。具体 apply 由 RenderPool GUI 线程定时器驱动。
 
@@ -333,12 +361,18 @@ int main(int argc, char** argv) {
     // 浏览器指纹统一（stealth）：注入 Chromium flag 在原生层抹除自动化标记。
     // AutomationControlled 控制 navigator.webdriver 与 CDP 痕迹，默认开启会被反爬识别。
     // 同时禁用 Translate/OptimizationHints/MediaRouter 减少额外网络请求指纹面。
+    //
+    // 关键互斥：开启 --remote-debugging-port（CDP 网络录制）时跳过 AutomationControlled——
+    // 该 flag 会抹除 CDP 痕迹，与录制所需的 CDP 端点直接冲突。开端口 = 明确进入调试/分析模式，
+    // 接受反爬能力下降。其余 stealth 层（UA 统一、stealth.js、Client Hints）仍生效，减少指纹漂移。
     if (cfg.stealthEnabled) {
         QByteArray existing = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
         QByteArray flags = existing.trimmed();
 
         // 核心：禁用 AutomationControlled（抹除 webdriver + CDP 痕迹）。
-        if (existing.indexOf("AutomationControlled") < 0) {
+        // 仅在未开 remote debugging port 时注入（CDP 录制与该 flag 互斥）。
+        const bool cdpActive = (cfg.remoteDebugPort > 0);
+        if (!cdpActive && existing.indexOf("AutomationControlled") < 0) {
             if (!flags.isEmpty()) flags += ' ';
             flags += "--disable-blink-features=AutomationControlled";
         }
@@ -381,6 +415,15 @@ int main(int argc, char** argv) {
         proxyConfig.setProxy(cfg.initialProxy);
     }
 
+    // HAR 网络录制中枢（仅当 --remote-debugging-port 开启时启用）。
+    // HarStore 是线程安全的归档存储（HTTP 线程查询 + GUI 线程归档），
+    // HarRecorder 是 GUI 线程的录制中枢（管理 CdpClient + 聚合 CDP 事件为 HAR）。
+    HarStore harStore;
+    HarRecorder* harRecorder = nullptr;
+    if (cfg.remoteDebugPort > 0) {
+        harRecorder = new HarRecorder(cfg.remoteDebugPort, &harStore, &app);
+    }
+
     // 渲染池（GUI 线程）：N 个 WebEngine 并发。
     RenderPool pool(&queue, cfg.concurrency, cfg.loadTimeoutMs, &app);
     pool.setCookieStore(&cookies);
@@ -388,6 +431,7 @@ int main(int argc, char** argv) {
     pool.setStealthEnabled(cfg.stealthEnabled);
     pool.setWarmupEnabled(cfg.warmupEnabled);
     pool.setWarmupUrl(QString::fromStdString(cfg.warmupUrl));
+    if (harRecorder) pool.setHarRecorder(harRecorder);
 
     // WebSocket 服务（GUI 线程）：支持 render 请求与 subscribe 订阅。
     // 启用密码时传入同一确定性 token，WS 端口同样受保护（见 WsServer 鉴权）。
@@ -446,6 +490,11 @@ int main(int argc, char** argv) {
     }
     // 网络代理配置：注册 GET/POST/DELETE /proxy 接口。
     http.setProxyConfig(&proxyConfig);
+    // HAR 录制产物查询：GET /har/<task_id>。仅在 --remote-debugging-port 开启时挂载
+    //（HarStore 虽然总是实例化，但未开 CDP 时没有录制能力，/har 应返回 503 而非 404）。
+    if (harRecorder) {
+        http.setHarStore(&harStore);
+    }
 
     // MCP server（供 Claude Code 等 agent 工具接入）。工具内部经 HTTP 调本机渲染 API。
     // 启用密码时工具调渲染 API 带同一确定性 token 鉴权。

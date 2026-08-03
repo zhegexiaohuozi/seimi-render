@@ -22,6 +22,7 @@ namespace seimi {
 class CookieStore;
 class ProxyConfig;
 class SsrfRequestInterceptor;
+class HarRecorder;
 
 // 单个渲染工作单元：每任务用独立 QWebEnginePage，用完即销毁。
 // 必须且只能在 GUI 线程创建/使用（WebEngine 强制）。
@@ -35,7 +36,8 @@ class SsrfRequestInterceptor;
 class RenderWorker : public QObject {
     Q_OBJECT
 public:
-    explicit RenderWorker(QWebEngineProfile* profile, RenderQueue* queue, qint64 loadTimeoutMsec, QObject* parent = nullptr);
+    explicit RenderWorker(QWebEngineProfile* profile, RenderQueue* queue, qint64 loadTimeoutMsec,
+                          HarRecorder* harRecorder, QObject* parent = nullptr);
     ~RenderWorker() override;
 
     bool isBusy() const { return m_busy; }
@@ -131,6 +133,7 @@ private:
     QWebEngineProfile* m_profile;
     RenderQueue* m_queue;
     qint64 m_loadTimeoutMsec;
+    HarRecorder* m_harRecorder;   // HAR 录制中枢（可空，未开 --remote-debugging-port 时为 nullptr）
     QWebEngineView* m_view;     // 当前任务专属 view（持有 page）
     QWebEnginePage* m_page;     // m_view->page()，缓存便于连信号；view 销毁时随之失效
 
@@ -198,6 +201,11 @@ public:
     //（Qt WebEngine 轮询它，运行时动态生效）。可空。
     void setProxyConfig(ProxyConfig* pc) { m_proxyConfig = pc; }
 
+    // 绑定 HAR 录制中枢：start() 后会被 worker 在 page 生命周期内 attach/detach。
+    // 可空（未开 --remote-debugging-port 时为 nullptr，recordHar 任务静默降级为不录制）。
+    // 必须在 start() 前调用。
+    void setHarRecorder(HarRecorder* hr) { m_harRecorder = hr; }
+
     // 开启/关闭浏览器指纹统一（stealth）。开启后 start() 注册 stealth.js（DocumentCreation 注入）
     // + 统一 UA/窗口尺寸。默认开启（--no-stealth 关闭）。必须在 start() 前调用。
     void setStealthEnabled(bool enabled) { m_stealthEnabled = enabled; }
@@ -233,6 +241,7 @@ private:
     QWebEngineProfile* m_profile; // 所有 worker 共享一个 profile，降低内存/复用缓存
     CookieStore* m_cookies = nullptr;
     ProxyConfig* m_proxyConfig = nullptr;
+    HarRecorder* m_harRecorder = nullptr;
     bool m_stealthEnabled = true;  // 浏览器指纹统一（默认开启，--no-stealth 关闭）
     // SSRF 二次防护：装到共享 profile 上，对 Chromium 实际发起的每个请求再判一次，
     // 堵住重定向 / DNS rebinding / 内嵌子框架等提交时校验无法覆盖的旁路（见 SsrfInterceptor.h）。

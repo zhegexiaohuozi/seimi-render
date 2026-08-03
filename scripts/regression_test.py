@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 # SPDX-License-Identifier: Apache-2.0
 
-"""seimi-render 全接口自动回测脚本：构建 → 起双实例(有/无密码) → 跑 9 组接口用例 → 报告。
+"""seimi-render 全接口自动回测脚本：构建 → 起三实例(无密码/有密码/HAR录制) → 跑 10 组接口用例 → 报告。
 
 设计文档: docs/superpowers/specs/2026-06-28-regression-test-design.md
 """
@@ -39,6 +39,10 @@ IS_MACOS = sys.platform == "darwin"
 # 临时高位端口，避开默认 8088/8089/8090，防与开发中的实例冲突。
 NO_AUTH_PORTS = {"http": 18088, "ws": 18089, "mcp": 18090}
 AUTH_PORTS = {"http": 18188, "ws": 18189, "mcp": 18190}
+HAR_PORTS = {"http": 18288, "ws": 18289, "mcp": 18290}  # 带 --remote-debugging-port 的录制实例
+
+# HAR 录制实例的 Chromium remote debugging 端口（CDP 端点）。
+HAR_CDP_PORT = 19222
 
 AUTH_PASSWORD = "testpass_2024"
 # token = sha256("seimi-render:" + password) 的 hex，须与服务端 HttpServer::computeToken 一致。
@@ -374,18 +378,21 @@ def find_qt_bin():
     return None
 
 
-def start_instance(binary, ports, password=None, tag="instance"):
+def start_instance(binary, ports, password=None, tag="instance", remote_debug_port=None):
     args = [
         binary,
         "--host", HOST,
         "--http-port", str(ports["http"]),
         "--ws-port", str(ports["ws"]),
         "--mcp-port", str(ports["mcp"]),
+        "--no-warmup",  # 回测不依赖 Google 预热，跳过省时且避免风控干扰
     ]
     if _no_sandbox_needed():
         args.append("--no-sandbox")
     if password:
         args += ["--password", password]
+    if remote_debug_port:
+        args += ["--remote-debugging-port", str(remote_debug_port)]
 
     _log("boot", f"启动 {tag} http://127.0.0.1:{ports['http']} ...")
     try:
@@ -393,13 +400,24 @@ def start_instance(binary, ports, password=None, tag="instance"):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        env = os.environ.copy()
         # Windows 未部署二进制：把 Qt bin 前置到 PATH，否则 STATUS_DLL_NOT_FOUND。
         qt_bin = find_qt_bin()
         if qt_bin:
-            env = os.environ.copy()
             env["PATH"] = qt_bin + os.pathsep + env.get("PATH", "")
             kwargs["env"] = env
             _log("boot", f"{DIM}Qt bin 加入 PATH: {qt_bin}{RESET}")
+        # macOS：cmake --build 产出的 .app 未经 macdeployqt 部署时，rpath 指向 brew Qt，
+        # 但 bundle 的 Frameworks 目录里也有一份 Qt → 双重加载 → offscreen 插件初始化失败。
+        # 用 DYLD 强制走 brew Qt（与 rpath 一致），绕过 bundle 内嵌 Qt 的干扰。
+        # 正式部署后（package.sh 跑过）rpath 已修正为 @executable_path，此注入无害（路径不存在则忽略）。
+        if IS_MACOS:
+            brew_qt_lib = "/opt/homebrew/opt/qt/lib"
+            if os.path.isdir(brew_qt_lib):
+                env["DYLD_FRAMEWORK_PATH"] = brew_qt_lib
+                env["DYLD_LIBRARY_PATH"] = brew_qt_lib
+                env["QT_PLUGIN_PATH"] = brew_qt_lib + "/plugins"
+                kwargs["env"] = env
         if IS_WINDOWS:
             # 独立进程组，便于 taskkill /T 杀整棵进程树（Chromium 会拉子进程）。
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -515,31 +533,35 @@ class CaseResult:
 
 
 class Case:
-    def __init__(self, cid, name, group, assertion, func, needs_auth=False):
+    def __init__(self, cid, name, group, assertion, func, needs_auth=False, needs_har=False):
         self.id = cid
         self.name = name
         self.group = group
         self.assertion = assertion
         self.func = func
         self.needs_auth = needs_auth  # 是否需要密码实例（用于 --no-auth 跳过）
+        self.needs_har = needs_har    # 是否需要 HAR 录制实例（用于 --no-har 跳过）
 
 
 class CaseContext:
     def __init__(self, no_auth_http, no_auth_ws_port, no_auth_mcp_port,
-                 auth_http=None, auth_ws_port=None):
+                 auth_http=None, auth_ws_port=None, har_http=None):
         self.http = no_auth_http
         self.ws_port = no_auth_ws_port
         self.mcp_port = no_auth_mcp_port
         self.auth_http = auth_http                     # 有密码 HttpClient（带 token），可能 None
         self.auth_ws_port = auth_ws_port
+        self.har_http = har_http                        # HAR 录制实例 HttpClient，可能 None
 
 
 class Runner:
-    def __init__(self, ctx, only_groups=None, only_cases=None, no_auth=False, verbose=False):
+    def __init__(self, ctx, only_groups=None, only_cases=None, no_auth=False, no_har=False,
+                 verbose=False):
         self.ctx = ctx
         self.only_groups = set(only_groups) if only_groups else None
         self.only_cases = set(only_cases) if only_cases else None
         self.no_auth = no_auth
+        self.no_har = no_har
         self.verbose = verbose
         self.cases = []
         self.results = []
@@ -563,6 +585,10 @@ class Runner:
                 self.results.append(res)
                 continue
             if self.no_auth and case.needs_auth:
+                res.status = "skip"
+                self.results.append(res)
+                continue
+            if self.no_har and case.needs_har:
                 res.status = "skip"
                 self.results.append(res)
                 continue
@@ -1362,6 +1388,259 @@ def group_i(ctx):
 
 
 # ============================================================
+# §J HAR 网络录制（HAR 录制实例 C：带 --remote-debugging-port）
+# ============================================================
+
+# HAR 录制用的轻量渲染目标（内容稳定、有子资源、不依赖反爬）。
+# 注意：录制实例开了 --remote-debugging-port 会跳过 stealth（AutomationControlled），
+# 反爬敏感站点（如 HN）在无 stealth 下可能渲染失败，故选对自动化痕迹不敏感的站点。
+URL_HAR_TARGET = "https://example.com/"
+URL_HAR_MULTI = "https://www.w3.org/"  # 稳定多资源站点（font/css/js/img/xhr，≈28 entries）
+
+# HAR schema 必填字段（har-validator 1.2）。
+_HAR_ENTRY_REQUIRED = ["startedDateTime", "time", "request", "response", "cache", "timings"]
+_HAR_REQUEST_REQUIRED = ["method", "url", "httpVersion", "cookies", "headers",
+                          "queryString", "headersSize", "bodySize"]
+_HAR_RESPONSE_REQUIRED = ["status", "statusText", "httpVersion", "cookies", "headers",
+                           "content", "redirectURL", "headersSize", "bodySize"]
+_HAR_CONTENT_REQUIRED = ["size", "mimeType"]
+_HAR_TIMINGS_REQUIRED = ["send", "wait", "receive"]
+
+
+def _validate_har_schema(har_json, label="HAR"):
+    """校验 HAR 1.2 schema 必填字段，返回 (ok, errors[])。"""
+    errors = []
+    log = har_json.get("log")
+    if not isinstance(log, dict):
+        return False, [f"{label}: 缺 log 对象"]
+    for f in ("version", "creator", "entries"):
+        if f not in log:
+            errors.append(f"{label}: log 缺 {f}")
+    creator = log.get("creator", {})
+    for f in ("name", "version"):
+        if f not in creator:
+            errors.append(f"{label}: creator 缺 {f}")
+    entries = log.get("entries", [])
+    if not isinstance(entries, list):
+        errors.append(f"{label}: entries 非 list")
+        return len(errors) == 0, errors
+    for i, e in enumerate(entries):
+        for f in _HAR_ENTRY_REQUIRED:
+            if f not in e:
+                errors.append(f"{label}: entry[{i}] 缺 {f}")
+        req = e.get("request", {})
+        for f in _HAR_REQUEST_REQUIRED:
+            if f not in req:
+                errors.append(f"{label}: entry[{i}].request 缺 {f}")
+        resp = e.get("response", {})
+        for f in _HAR_RESPONSE_REQUIRED:
+            if f not in resp:
+                errors.append(f"{label}: entry[{i}].response 缺 {f}")
+        content = resp.get("content", {})
+        for f in _HAR_CONTENT_REQUIRED:
+            if f not in content:
+                errors.append(f"{label}: entry[{i}].content 缺 {f}")
+        timings = e.get("timings", {})
+        for f in _HAR_TIMINGS_REQUIRED:
+            if f not in timings:
+                errors.append(f"{label}: entry[{i}].timings 缺 {f}")
+        # 数值约束
+        if isinstance(e.get("time"), (int, float)) and e["time"] < 0:
+            errors.append(f"{label}: entry[{i}].time < 0")
+        for t in _HAR_TIMINGS_REQUIRED:
+            v = timings.get(t)
+            if isinstance(v, (int, float)) and v < -1:
+                errors.append(f"{label}: entry[{i}].timings.{t} < -1")
+    return len(errors) == 0, errors
+
+
+def _render_with_record_and_get_har(ctx, url, settle_ms=2500, timeout=50):
+    """提交带 record_network 的渲染，等完成后取 HAR JSON。返回 (task_id, har_dict_or_None, error_str)。"""
+    body = {"url": url, "output": "html", "record_network": True,
+            "long_poll_ms": RENDER_LONG_POLL_MS, "settle_ms": settle_ms}
+    r = ctx.har_http.post("/render", json_body=body, timeout=timeout)
+    if r.status != 200:
+        return None, None, f"/render 状态 {r.status}: {r.text}"
+    state = (r.json or {}).get("state")
+    tid = (r.json or {}).get("task_id")
+    if not tid:
+        return None, None, f"无 task_id: {r.text}"
+    if state != "succeeded":
+        return tid, None, f"渲染未成功 state={state}"
+    # finalize 有 ~0.3s 延时，稍等后取 HAR
+    time.sleep(1.5)
+    har_r = ctx.har_http.get(f"/har/{tid}", timeout=30)
+    if har_r.status != 200:
+        return tid, None, f"/har 状态 {har_r.status}: {har_r.text}"
+    try:
+        return tid, har_r.json, None
+    except Exception as e:
+        return tid, None, f"HAR 非 JSON: {har_r.text[:200]}"
+
+
+def group_j(ctx):
+    """J. HAR 网络录制（HAR 录制实例 C：带 --remote-debugging-port）。"""
+    cases = []
+
+    def j1(c):
+        # 录制模式未开时 /har 应 503（用无密码实例验证降级）
+        r = c.http.get("/har/anybody")
+        check(r.status == 503, f"J1: 无 CDP 实例 /har 应 503，实际 {r.status}")
+        check("disabled" in r.text.lower(), f"J1: body={r.text}")
+    cases.append(Case("J1", "降级-未开CDP", "J",
+                      "无 CDP 实例 GET /har → 503 + disabled", j1, needs_har=True))
+
+    def j2(c):
+        tid, har, err = _render_with_record_and_get_har(c, URL_HAR_TARGET, settle_ms=2000)
+        check(err is None, f"J2: {err}")
+        check(har is not None, "J2: HAR 为 None")
+        ok, errors = _validate_har_schema(har, "J2")
+        check(ok, f"J2: schema 校验失败: {errors[:5]}")
+        entries = har["log"]["entries"]
+        check(len(entries) >= 1, f"J2: entries 为空")
+        # 主文档请求应在 entries 里
+        urls = [e["request"]["url"] for e in entries]
+        check(any("example.com" in u for u in urls), f"J2: entries 无 example.com: {urls}")
+    cases.append(Case("J2", "基础录制-schema", "J",
+                      "record_network example.com → HAR schema 合规 + entries≥1 + 含主文档", j2, needs_har=True))
+
+    def j3(c):
+        tid, har, err = _render_with_record_and_get_har(c, URL_HAR_MULTI, settle_ms=3000)
+        check(err is None, f"J3: {err}")
+        check(har is not None, "J3: HAR 为 None")
+        entries = har["log"]["entries"]
+        check(len(entries) >= 3, f"J3: 多资源站点 entries<3: {len(entries)}")
+        # 验证 _resourceType 分类（Chrome 扩展字段）
+        types = set()
+        for e in entries:
+            rt = e.get("_resourceType")
+            if rt:
+                types.add(rt)
+        check(len(types) >= 2, f"J3: _resourceType 种类<2: {types}")
+        # 主文档应被标记为 document
+        has_doc = any(e.get("_resourceType") == "document" for e in entries)
+        check(has_doc, f"J3: 无 _resourceType=document 的 entry")
+    cases.append(Case("J3", "多资源录制", "J",
+                      "record_network w3.org → entries≥2 + _resourceType 多种 + 含 document", j3, needs_har=True))
+
+    def j4(c):
+        tid, har, err = _render_with_record_and_get_har(c, URL_HAR_TARGET, settle_ms=2000)
+        check(err is None and har is not None, f"J4: {err}")
+        entries = har["log"]["entries"]
+        check(len(entries) >= 1, "J4: entries 为空")
+        e = entries[0]
+        content = e["response"]["content"]
+        # 响应体应被捕获（text 字段非空）
+        check("text" in content, f"J4: content 无 text 字段")
+        check(len(content.get("text", "")) > 0, f"J4: 响应体 text 为空")
+        check(bool(content.get("mimeType")), "J4: mimeType 为空")
+        # mimeType 是 text/html（example.com 主文档）
+        check("html" in content.get("mimeType", "").lower(),
+              f"J4: mimeType={content.get('mimeType')}")
+    cases.append(Case("J4", "响应体捕获", "J",
+                      "HAR response.content 含 text + mimeType", j4, needs_har=True))
+
+    def j5(c):
+        # record_network=false（或不带）→ /har 应 404
+        body = {"url": URL_HAR_TARGET, "output": "html", "long_poll_ms": RENDER_LONG_POLL_MS}
+        r = c.har_http.post("/render", json_body=body, timeout=RENDER_HTTP_TIMEOUT)
+        check(r.status == 200, f"J5: /render 状态 {r.status}")
+        tid = (r.json or {}).get("task_id")
+        check(bool(tid), "J5: 无 task_id")
+        time.sleep(1)
+        har_r = c.har_http.get(f"/har/{tid}")
+        check(har_r.status == 404, f"J5: 不录制时 /har 应 404，实际 {har_r.status}")
+    cases.append(Case("J5", "不录制-404", "J",
+                      "record_network 未带 → /har → 404", j5, needs_har=True))
+
+    def j6(c):
+        # 并发录制隔离：两个不同 URL 同时提交，HAR 互不串
+        b1 = {"url": URL_HAR_TARGET, "output": "html", "record_network": True,
+              "long_poll_ms": RENDER_LONG_POLL_MS, "settle_ms": 2000}
+        b2 = {"url": "https://example.org/", "output": "html", "record_network": True,
+              "long_poll_ms": RENDER_LONG_POLL_MS, "settle_ms": 2000}
+        r1 = c.har_http.post("/render", json_body=b1, timeout=RENDER_HTTP_TIMEOUT)
+        r2 = c.har_http.post("/render", json_body=b2, timeout=RENDER_HTTP_TIMEOUT)
+        t1 = (r1.json or {}).get("task_id")
+        t2 = (r2.json or {}).get("task_id")
+        check(bool(t1) and bool(t2), f"J6: task_id 缺失 t1={t1} t2={t2}")
+        check(t1 != t2, f"J6: task_id 相同: {t1}")
+        time.sleep(1.5)
+        har1 = c.har_http.get(f"/har/{t1}", timeout=30)
+        har2 = c.har_http.get(f"/har/{t2}", timeout=30)
+        check(har1.status == 200 and har2.status == 200,
+              f"J6: /har 状态 har1={har1.status} har2={har2.status}")
+        urls1 = [e["request"]["url"] for e in har1.json.get("log", {}).get("entries", [])]
+        urls2 = [e["request"]["url"] for e in har2.json.get("log", {}).get("entries", [])]
+        # t1 应是 example.com，t2 应是 example.org，不串
+        check(any("example.com" in u for u in urls1), f"J6: t1 无 example.com: {urls1}")
+        check(any("example.org" in u for u in urls2), f"J6: t2 无 example.org: {urls2}")
+        check(not any("example.org" in u for u in urls1), f"J6: t1 串入 example.org: {urls1}")
+        check(not any("example.com" in u for u in urls2), f"J6: t2 串入 example.com: {urls2}")
+    cases.append(Case("J6", "并发隔离", "J",
+                      "两个 URL 并发 record_network → HAR 互不串", j6, needs_har=True))
+
+    def j7(c):
+        # /har Content-Disposition 头（下载文件名）
+        tid, har, err = _render_with_record_and_get_har(c, URL_HAR_TARGET, settle_ms=2000)
+        check(err is None, f"J7: {err}")
+        har_r = c.har_http.get(f"/har/{tid}", timeout=30)
+        cd = har_r.headers.get("Content-Disposition", "")
+        check(tid in cd and ".har" in cd, f"J7: Content-Disposition 缺 task_id/.har: {cd}")
+    cases.append(Case("J7", "下载头", "J",
+                      "GET /har/:id → Content-Disposition 含 task_id.har", j7, needs_har=True))
+
+    def j8(c):
+        # HAR creator 字段
+        tid, har, err = _render_with_record_and_get_har(c, URL_HAR_TARGET, settle_ms=2000)
+        check(err is None and har is not None, f"J8: {err}")
+        creator = har["log"]["creator"]
+        check(creator.get("name") == "seimi-render", f"J8: creator.name={creator.get('name')}")
+        check(bool(creator.get("version")), f"J8: creator.version 为空")
+        check(har["log"]["version"] == "1.2", f"J8: log.version={har['log']['version']}")
+    cases.append(Case("J8", "creator元信息", "J",
+                      "HAR log.version=1.2 + creator.name=seimi-render", j8, needs_har=True))
+
+    def j9(c):
+        # MCP get_har 工具存在
+        mcp = McpClient(HAR_PORTS["mcp"])
+        mcp.initialize()
+        result = mcp.list_tools()
+        names = [t.get("name") for t in result.get("tools", [])]
+        check("get_har" in names, f"J9: tools/list 无 get_har: {names}")
+        check("render_url" in names, f"J9: tools/list 无 render_url: {names}")
+    cases.append(Case("J9", "MCP工具注册", "J",
+                      "HAR 实例 MCP tools/list 含 get_har + render_url", j9, needs_har=True))
+
+    def j10(c):
+        # MCP render_url 带 record_network + get_har 取结果
+        mcp = McpClient(HAR_PORTS["mcp"])
+        mcp.initialize()
+        r1 = mcp.call_tool("render_url",
+                           {"url": URL_HAR_TARGET, "output": "html", "record_network": True})
+        text = r1.get("content", [{}])[0].get("text", "")
+        m = re.search(r"task_id=(\S+)", text)
+        check(m is not None, f"J10: render_url 无 task_id: {text[:200]}")
+        tid = m.group(1).rstrip(").,;")
+        time.sleep(1.5)
+        r2 = mcp.call_tool("get_har", {"task_id": tid})
+        har_text = r2.get("content", [{}])[0].get("text", "")
+        # get_har 返回 HAR JSON 字符串，应能解析且含 entries
+        try:
+            har = json.loads(har_text)
+            ok, errors = _validate_har_schema(har, "J10")
+            check(ok, f"J10: HAR schema 失败: {errors[:3]}")
+            check(len(har["log"]["entries"]) >= 1, "J10: entries 为空")
+        except Exception as e:
+            # 可能是 "HAR not available" 文本提示（finalize 未完成）
+            check(False, f"J10: get_har 返回非 HAR JSON: {har_text[:200]} (err: {e})")
+    cases.append(Case("J10", "MCP录制闭环", "J",
+                      "render_url(record_network) + get_har → HAR JSON", j10, needs_har=True))
+
+    return cases
+
+
+# ============================================================
 # §7 main：参数解析 + 编排
 # ============================================================
 def parse_args():
@@ -1370,7 +1649,8 @@ def parse_args():
     ap.add_argument("--clean", action="store_true",
                     help="从零清理后全量重建（Windows 脚本自带每次清空；Linux rm -rf build；macOS 传 clean 给 package.sh）")
     ap.add_argument("--no-auth", action="store_true", help="只测无密码实例（跳过 F 组）")
-    ap.add_argument("--group", help="只跑某组（A/B/C/D/E/F/G/H/I），逗号分隔")
+    ap.add_argument("--no-har", action="store_true", help="不测 HAR 录制实例（跳过 J 组）")
+    ap.add_argument("--group", help="只跑某组（A/B/C/D/E/F/G/H/I/J），逗号分隔")
     ap.add_argument("--case", help="只跑指定用例，逗号分隔（如 B1,B6）")
     ap.add_argument("--keep-servers", action="store_true", help="测完不杀进程（调试用）")
     ap.add_argument("--verbose", action="store_true", help="打印每请求/响应详情")
@@ -1406,6 +1686,14 @@ def main():
             cleanup_all(keep=args.keep_servers)
             return EXIT_ENV
 
+    har_proc = None
+    if not args.no_har:
+        har_proc = start_instance(binary, HAR_PORTS, remote_debug_port=HAR_CDP_PORT,
+                                  tag="实例C(HAR录制)")
+        if not har_proc or not wait_ready(HAR_PORTS["http"], tag="实例C"):
+            cleanup_all(keep=args.keep_servers)
+            return EXIT_ENV
+
     instances = {
         "no_auth": {"http_port": NO_AUTH_PORTS["http"], "ws_port": NO_AUTH_PORTS["ws"],
                     "mcp_port": NO_AUTH_PORTS["mcp"], "pid": no_auth_proc.pid, "ready": True},
@@ -1413,21 +1701,27 @@ def main():
     if auth_proc:
         instances["auth"] = {"http_port": AUTH_PORTS["http"], "ws_port": AUTH_PORTS["ws"],
                              "mcp_port": AUTH_PORTS["mcp"], "pid": auth_proc.pid, "ready": True}
+    if har_proc:
+        instances["har"] = {"http_port": HAR_PORTS["http"], "ws_port": HAR_PORTS["ws"],
+                            "mcp_port": HAR_PORTS["mcp"], "cdp_port": HAR_CDP_PORT,
+                            "pid": har_proc.pid, "ready": True}
 
     no_auth_http = HttpClient(NO_AUTH_PORTS["http"], verbose=args.verbose)
     auth_http = HttpClient(AUTH_PORTS["http"], token=EXPECTED_TOKEN, verbose=args.verbose) if auth_proc else None
+    har_http = HttpClient(HAR_PORTS["http"], verbose=args.verbose) if har_proc else None
     ctx = CaseContext(
         no_auth_http=no_auth_http,
         no_auth_ws_port=NO_AUTH_PORTS["ws"],
         no_auth_mcp_port=NO_AUTH_PORTS["mcp"],
         auth_http=auth_http,
         auth_ws_port=AUTH_PORTS["ws"] if auth_proc else None,
+        har_http=har_http,
     )
 
     only_groups = args.group.split(",") if args.group else None
     only_cases = args.case.split(",") if args.case else None
     runner = Runner(ctx, only_groups=only_groups, only_cases=only_cases,
-                    no_auth=args.no_auth, verbose=args.verbose)
+                    no_auth=args.no_auth, no_har=args.no_har, verbose=args.verbose)
 
     print()
     all_cases_by_group = []
@@ -1441,6 +1735,7 @@ def main():
         ("G. MCP", group_g),
         ("H. Cookie", group_h),
         ("I. Proxy", group_i),
+        ("J. HAR网络录制", group_j),
     ]:
         cases = group_fn(ctx)
         all_cases_by_group.append((group_name, cases))
@@ -1451,7 +1746,8 @@ def main():
     def _group_will_run(group_letter):
         for case in runner.cases:
             if case.group == group_letter and runner._should_run(case) \
-                    and not (runner.no_auth and case.needs_auth):
+                    and not (runner.no_auth and case.needs_auth) \
+                    and not (runner.no_har and case.needs_har):
                 return True
         return False
 

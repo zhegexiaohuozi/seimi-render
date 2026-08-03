@@ -222,6 +222,12 @@ bool McpServer::start(const std::string& host, int port,
             false)
         .with_number_param("timeout_ms",
             "Max milliseconds to wait for render (default 45000; raise to 60000 for slow/blocked sites)", false)
+        .with_boolean_param("record_network",
+            "If true, record all network traffic (requests + responses, like Chrome F12) "
+            "during the render and produce a standard HAR 1.2 file. Requires the server to "
+            "be started with --remote-debugging-port. Retrieve the HAR afterwards via the "
+            "get_har tool with the returned task_id. Default false.",
+            false)
         .build();
 
     m_impl->srv->register_tool(renderTool,
@@ -266,8 +272,12 @@ bool McpServer::start(const std::string& host, int port,
                 {"md_algorithm", mdAlg},
                 {"format", fmt},
             };
-            mcpLog("render_url url=%s output=%s settle_ms=%d timeout_ms=%d",
-                   url.c_str(), outSpec.c_str(), settle, timeout);
+            bool recordNetwork = params.value("record_network", false);
+            if (recordNetwork) {
+                body["record_network"] = true;
+            }
+            mcpLog("render_url url=%s output=%s settle_ms=%d timeout_ms=%d record_network=%d",
+                   url.c_str(), outSpec.c_str(), settle, timeout, recordNetwork ? 1 : 0);
             std::string resp = impl->httpPost("/render", body.dump());
             if (resp.empty()) {
                 mcpLog("render_url url=%s -> render service unreachable", url.c_str());
@@ -772,6 +782,62 @@ bool McpServer::start(const std::string& host, int port,
             } catch (...) {
                 return toTextContent(resp);
             }
+        });
+
+    // ---------- tool: get_har ----------
+    // 取一个渲染任务（record_network=true）的网络录制 HAR。
+    // 产物是标准 HAR 1.2 JSON（含 Chrome 扩展字段），可被 har-validator 校验、
+    // Chrome DevTools / Charles / haralyzer 导入分析。
+    // HAR 录制是异步的（任务结束时才归档），render_url 带 record_network 返回后，
+    // 通常需等 ~0.3s（finalize 延时）再调本工具。task 不存在或未录制返回明确提示。
+    mcp::tool harTool = mcp::tool_builder("get_har")
+        .with_description(
+            "Retrieve the network recording (HAR 1.2 JSON) for a render task that was "
+            "submitted with record_network=true. The HAR captures all HTTP requests and "
+            "responses during the render (like Chrome F12 Network tab), including headers, "
+            "status codes, response bodies, and timings. The output is a standard HAR 1.2 "
+            "file that can be imported into Chrome DevTools, Charles, haralyzer, or any "
+            "HAR-compliant analysis tool.\n"
+            "Requires: the server must be started with --remote-debugging-port, and the "
+            "render task must have had record_network=true.\n"
+            "Timing: HAR is archived ~0.3s after the render task finishes; if you get "
+            "'not found' immediately after render_url returns, retry after a moment.")
+        .with_string_param("task_id",
+            "The task_id returned by render_url (when called with record_network=true)")
+        .build();
+
+    m_impl->srv->register_tool(harTool,
+        [impl](const mcp::json& params, const std::string&) -> mcp::json {
+            std::string taskId = params.value("task_id", "");
+            if (taskId.empty()) {
+                throw mcp::mcp_exception(mcp::error_code::invalid_params,
+                                         "'task_id' is required");
+            }
+            mcpLog("get_har task_id=%s", taskId.c_str());
+            std::string resp = impl->httpGet("/har/" + taskId);
+            if (resp.empty()) {
+                mcpLog("get_har task_id=%s -> render service unreachable", taskId.c_str());
+                return toTextContent("error: render service unreachable");
+            }
+            // HTTP 4xx/5xx：httpGet 返回 body 含错误 JSON（如 HAR 未找到/录制未开启）。
+            // 直接把 body 透出，agent 可据此判断是重试还是放弃。
+            // 注意：httpGet 当前只返回 body（status code 丢失），但 body 里的 error 字段足够诊断。
+            try {
+                auto j = mcp::json::parse(resp);
+                if (j.contains("error")) {
+                    std::string err = j.value("error", "");
+                    mcpLog("get_har task_id=%s -> NOT FOUND (%s)", taskId.c_str(), err.c_str());
+                    return toTextContent("HAR not available for task " + taskId +
+                                         ": " + err +
+                                         ". If the render just finished, wait ~1s and retry "
+                                         "(HAR archives shortly after page teardown).");
+                }
+            } catch (...) {
+                // 非 JSON（即 HAR 正文）：直接返回。
+            }
+            mcpLog("get_har task_id=%s -> SUCCEEDED (%zu bytes)",
+                   taskId.c_str(), resp.size());
+            return toTextContent(resp);
         });
 
     // 非阻塞模式启动。关键：会话清理线程（每 10s 回收过期 session）只在非阻塞模式下启动。

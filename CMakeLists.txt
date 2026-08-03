@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(seimi-render
-    VERSION 1.1.0
+    VERSION 1.2.0
     LANGUAGES CXX
 )
 
@@ -287,6 +287,12 @@ add_executable(seimi-render
     src/HttpServer.cpp
     src/WsServer.h
     src/WsServer.cpp
+    src/CdpClient.h
+    src/CdpClient.cpp
+    src/HarStore.h
+    src/HarStore.cpp
+    src/HarRecorder.h
+    src/HarRecorder.cpp
     third_party/html2md.cpp
     third_party/table.cpp
     third_party/qaes/qaesencryption.cpp
