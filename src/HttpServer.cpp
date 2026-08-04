@@ -443,8 +443,8 @@ std::string HttpServer::loadAdminIndex() {
         static const std::string ver = std::to_string(
             QDateTime::currentSecsSinceEpoch());
         std::string& s = m_adminIndexCache;
-        // 替换 /ui/app.css" -> /ui/app.css?v=<ver>"，/ui/app.js" / i18n.js 同理
-        for (const std::string& asset : {"app.css", "app.js", "i18n.js"}) {
+        // 替换 /ui/app.css" -> /ui/app.css?v=<ver>"，/ui/app.js" / i18n.js / docs.js 同理
+        for (const std::string& asset : {"app.css", "app.js", "i18n.js", "docs.js"}) {
             std::string needle = "/ui/" + asset + "\"";
             std::string repl = "/ui/" + asset + "?v=" + ver + "\"";
             size_t pos = s.find(needle);
