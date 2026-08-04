@@ -326,6 +326,9 @@ if(APPLE)
         MACOSX_BUNDLE_BUNDLE_NAME "seimi-render"
         # LSBackgroundOnly=2：.app 不显示 Dock 但仍是 GUI 应用（Chromium 无窗口渲染需要 NSApp）。
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/cmake/MacOSXBundleInfo.plist.in"
+        # 开发期 rpath：只用 brew Qt 路径（cmake --build 产物直接可跑）。
+        # package.sh 部署时会把 brew 绝对路径改写为 @rpath/@executable_path（含 Frameworks）。
+        BUILD_WITH_INSTALL_RPATH FALSE
     )
 endif()
 
@@ -350,3 +353,18 @@ install(FILES third_party/serp/baidu_serp.js
               third_party/serp/bing_serp.js
               third_party/serp/google_serp.js
         DESTINATION third_party/serp)
+
+# macOS 开发期防冲突：package.sh 的 macdeployqt 会在 bundle 内塞 Frameworks/ + PlugIns/ +
+# Resources/，之后增量编译只替换主二进制（rpath 指向 brew Qt），与残留的内嵌 Qt 同时
+# 加载 → 崩溃。每次构建后清理这些部署产物，确保 cmake --build 产物始终是干净的非部署态。
+# package.sh 每次会重新跑 macdeployqt，所以清理不影响打包。
+# 注意：cmake -E remove_directory 不解析路径中的 ..，必须用 Contents/ 下的直接路径。
+if(APPLE)
+    set(_bundle_contents_dir "$<TARGET_BUNDLE_DIR:seimi-render>/Contents")
+    add_custom_command(TARGET seimi-render POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "${_bundle_contents_dir}/Frameworks"
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "${_bundle_contents_dir}/PlugIns"
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "${_bundle_contents_dir}/Resources"
+        COMMENT "Cleaning macdeployqt residual frameworks (dev mode)"
+    )
+endif()
