@@ -35,6 +35,7 @@ struct EnvironmentSnapshot {
     QString qtVersion;         // qVersion()
     QString buildTime;         // SEIMI_BUILD_TIME 宏
     QString gitCommit;         // SEIMI_GIT_COMMIT + dirty 标注
+    QString launchArgs;        // 启动命令行参数（敏感值已脱敏），空=未设置
     qint64  startedAtMs = 0;   // 构造时刻
 
     // —— 实时字段（GUI 定时器采样，首次采样前为 0/null）——
@@ -58,6 +59,10 @@ public:
 
     // 启动 GUI 线程 3s 采样定时器。必须在 qApp 存在后调用。
     void start(QObject* mainThreadParent);
+
+    // 注入启动命令行参数（main 在构造后调一次）。内部对 --password / --password-file /
+    // --proxy 等敏感值的下一个 token 做 *** 掩码，避免明文泄露到 /status 和管理后台。
+    void setLaunchArgs(const QStringList& args);
 
     // 加锁返回当前快照拷贝（HTTP 线程安全调用）。
     EnvironmentSnapshot snapshot() const;

@@ -406,6 +406,7 @@ std::string HttpServer::jsonRuntimeStatus(const httplib::Request& req) {
         s += ",\"qt_version\":\"" + esc(e.qtVersion) + "\"";
         s += ",\"build_time\":\"" + esc(e.buildTime) + "\"";
         s += ",\"git_commit\":\"" + esc(e.gitCommit) + "\"";
+        s += ",\"launch_args\":\"" + esc(e.launchArgs) + "\"";
         s += ",\"cpu_percent\":" + fmtDouble(e.cpuPercent);
         s += ",\"memory_rss_mb\":" + std::to_string(e.memoryRssMb);
         s += ",\"memory_percent\":" + fmtDouble(e.memoryPercent);
@@ -443,8 +444,8 @@ std::string HttpServer::loadAdminIndex() {
         static const std::string ver = std::to_string(
             QDateTime::currentSecsSinceEpoch());
         std::string& s = m_adminIndexCache;
-        // 替换 /ui/app.css" -> /ui/app.css?v=<ver>"，/ui/app.js" / i18n.js 同理
-        for (const std::string& asset : {"app.css", "app.js", "i18n.js"}) {
+        // 替换 /ui/app.css" -> /ui/app.css?v=<ver>"，/ui/app.js" / i18n.js / docs.js 同理
+        for (const std::string& asset : {"app.css", "app.js", "i18n.js", "docs.js"}) {
             std::string needle = "/ui/" + asset + "\"";
             std::string repl = "/ui/" + asset + "?v=" + ver + "\"";
             size_t pos = s.find(needle);

@@ -498,6 +498,8 @@ int main(int argc, char** argv) {
     // GUI 线程 3s 定时器采样实时 CPU/RSS，供 /status 的 environment 段。
     Environment env(&app);
     env.start(&app);
+    // 注入启动命令行参数（含脱敏），供管理后台运行环境展示完整启动配置。
+    env.setLaunchArgs(QCoreApplication::arguments());
 
     // HTTP server 跑在独立线程（httplib::listen 阻塞）。
     HttpServer http(&queue, &cookies, cfg.settleDefaultMs,

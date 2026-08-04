@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QLocale>
 #include <QMutexLocker>
+#include <QSet>
 #include <QSysInfo>
 #include <QThread>
 #include <QTimer>
@@ -56,6 +57,27 @@ void Environment::start(QObject* mainThreadParent) {
     // 立即触发一次首采样（建立差分基线），后续按 3s 间隔。
     QTimer::singleShot(0, this, &Environment::sample);
     m_timer->start();
+}
+
+void Environment::setLaunchArgs(const QStringList& args) {
+    // 脱敏：--password / --password-file / --proxy 紧跟的值含明文密码，
+    // 展示到 /status 和管理后台会泄露。把这几个 key 的下一个 token 替换为 ***。
+    // --proxy 的值格式 user:pass@host:port 整体替换（即使只含 host 也统一掩码，保守）。
+    static const QSet<QString> sensitiveKeys = {
+        QStringLiteral("--password"), QStringLiteral("--password-file"), QStringLiteral("--proxy"),
+    };
+    QStringList redacted;
+    for (int i = 0; i < args.size(); ++i) {
+        const QString& a = args[i];
+        if (sensitiveKeys.contains(a) && i + 1 < args.size()) {
+            redacted << a << QStringLiteral("***");
+            ++i;  // 跳过敏感值
+        } else {
+            redacted << a;
+        }
+    }
+    QMutexLocker lock(&m_mutex);
+    m_snap.launchArgs = redacted.join(QLatin1Char(' '));
 }
 
 void Environment::collectStatic() {
@@ -121,6 +143,9 @@ QString Environment::buildMarkdown(const EnvironmentSnapshot& s) const {
     md += QStringLiteral("- **GPU**: %1\n").arg(s.hasGpu ? QStringLiteral("有") : QStringLiteral("无（headless 服务器）"));
     md += QStringLiteral("- **Qt 版本**: %1\n").arg(s.qtVersion);
     md += QStringLiteral("- **构建信息**: %1 · %2\n").arg(s.buildTime, s.gitCommit);
+    if (!s.launchArgs.isEmpty()) {
+        md += QStringLiteral("- **启动参数**: %1\n").arg(s.launchArgs);
+    }
     if (s.sampledAtMs > 0) {
         md += QStringLiteral("- **CPU 占用**: %1%\n").arg(s.cpuPercent, 0, 'f', 1);
         md += QStringLiteral("- **内存占用**: %1 MB (%2%)\n").arg(s.memoryRssMb).arg(s.memoryPercent, 0, 'f', 1);
