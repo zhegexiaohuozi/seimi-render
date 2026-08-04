@@ -406,6 +406,7 @@ std::string HttpServer::jsonRuntimeStatus(const httplib::Request& req) {
         s += ",\"qt_version\":\"" + esc(e.qtVersion) + "\"";
         s += ",\"build_time\":\"" + esc(e.buildTime) + "\"";
         s += ",\"git_commit\":\"" + esc(e.gitCommit) + "\"";
+        s += ",\"launch_args\":\"" + esc(e.launchArgs) + "\"";
         s += ",\"cpu_percent\":" + fmtDouble(e.cpuPercent);
         s += ",\"memory_rss_mb\":" + std::to_string(e.memoryRssMb);
         s += ",\"memory_percent\":" + fmtDouble(e.memoryPercent);

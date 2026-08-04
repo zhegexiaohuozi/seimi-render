@@ -310,6 +310,7 @@ function renderEnv(env) {
     [t('stats.env.gpu'),      env.has_gpu ? t('stats.env.gpuYes') : t('stats.env.gpuNo')],
     [t('stats.env.qt'),       esc(env.qt_version || '')],
     [t('stats.env.build'),    `${esc(env.build_time || '')} · ${esc(env.git_commit || '')}`],
+    [t('stats.env.args'),     esc(env.launch_args || '--')],
     [t('stats.env.cpuUsage'), sampled ? `${(env.cpu_percent || 0).toFixed(1)}%` : '--'],
     [t('stats.env.rss'),      sampled ? `${env.memory_rss_mb} MB (${(env.memory_percent || 0).toFixed(1)}%)` : '--'],
   ];
