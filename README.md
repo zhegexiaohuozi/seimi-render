@@ -133,6 +133,7 @@ curl -X POST http://localhost:8088/render \
 | `--no-warmup` | 关闭（warmup 开启） | 关闭启动 Google 会话预热。默认开启：进程启动时先以隐藏 page 加载一次 `--warmup-url`（默认 https://www.google.com/）拿到 NID/CONSENT 等会话 cookie，**再**启动 dispatch 定时器接业务请求——冷启动零 cookie 直打搜索是 Google 风控的最高危窗口，预热能显著降低首条搜索的 sorry 概率 |
 | `--warmup-url <url>` | `https://www.google.com/` | 会话预热目标 URL（必须 http/https）。仅在 warmup 开启时使用；一般无需改，特殊环境（如走代理时 google.com 不通）可换成能稳定返回 google 域 cookie 的镜像。warmup 自带失败自适应：连续 3 次预热失败（约 90min，Google 不可达）会自动暂停 30min 周期、改用 5min 低频探活；探活成功立即恢复正常周期。状态变化在服务日志里以 `[warmup] SUSPENDED` / `[warmup] RESUMED` 标记 |
 | `--remote-debugging-port <n>` | —（关闭） | 开启 Chromium 远程调试端口，启用 **HAR 网络录制**能力（详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network)）。开启后 stealth 的 `AutomationControlled` 标记会被自动跳过（调试模式与反爬互斥），并显著打印警告。**生产环境请勿对外暴露此端口**——它授予完整的浏览器控制权 |
+| `--data-dir <path>` | `<binary_dir>/data` | 持久化目录（`cookies.dat` 加密 cookie / `seimi.key` 机器绑定盐 / `metrics.json` 累计指标）。容器化或只读部署（二进制目录不可写）时需显式指定到可写卷 |
 | `--help` | — | 显示帮助信息 |
 
 ### 并发与吞吐（`--concurrency`）
