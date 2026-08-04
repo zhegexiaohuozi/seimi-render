@@ -18,6 +18,7 @@ This project is the modern successor to [SeimiAgent](https://github.com/zhegexia
 - **Built-in web admin console** — Monitoring dashboard, render test bench, cookie management, API docs, one-click Agent-config copy.
 - **Structured search-engine result extraction** — Baidu / Bing / Google results are de-ads'd and structured into JSON.
 - **Runtime metrics** — Success rate, latency percentiles (p50/p90/p99), throughput, per-domain distribution — fit for an ops dashboard.
+- **Network recording & HAR export** — Start with `--remote-debugging-port`, then pass `record_network=true` on a render to capture the full page-load traffic (requests/responses/headers/response bodies/timing — equivalent to Chrome DevTools' Network tab), producing a standard HAR 1.2 file you can import into Chrome DevTools / Charles / haralyzer for analysis.
 - **Multiple render outputs** — html, markdown, pdf, png/jpg, and structured search-result JSON.
 - **Headless** — Defaults to the offscreen platform; no display needed, won't disturb your local browser, and your local activity won't disturb result capture.
 - **Basic anti-fingerprinting** — Baseline anti-bot-evasion capability.
@@ -128,6 +129,7 @@ Measured: rendering the Sohu homepage (`https://www.sohu.com/`) took **~8.5s**, 
 | `--no-stealth` | off (stealth on) | Disable browser fingerprint unification. Stealth is on by default, disguising every render instance as the same Chrome desktop environment (UA/screen/WebGL/canvas) to blend into the crowd and evade basic anti-bot detection (e.g. Google) |
 | `--no-warmup` | off (warmup on) | Disable startup Google session warm-up. On by default: at startup the service loads `--warmup-url` once in a hidden page (default https://www.google.com/) to acquire NID/CONSENT session cookies, **then** starts the dispatch timer to serve business requests — a cold start with zero cookies hitting /search directly is Google's highest-risk window for triggering a sorry page, and warm-up significantly lowers the sorry probability on the first search |
 | `--warmup-url <url>` | `https://www.google.com/` | Warm-up target URL (must be http/https). Only used when warm-up is on; usually no need to change it. In special environments (e.g. google.com unreachable through your proxy) you can swap in a mirror that reliably returns google-domain cookies. Warm-up has built-in failure adaptation: 3 consecutive warm-up failures (about 90min, Google unreachable) auto-suspend the 30min cycle and switch to a 5min low-frequency probe; on probe success it immediately resumes the normal cycle. State changes are logged as `[warmup] SUSPENDED` / `[warmup] RESUMED` |
+| `--remote-debugging-port <n>` | — (off) | Enables the Chromium remote-debugging port, turning on **HAR network recording** (see [Network recording & HAR export](#network-recording--har-export-record_network)). When set, stealth's `AutomationControlled` flag is automatically skipped (debug mode and anti-bot are mutually exclusive), and a prominent warning is printed. **Do not expose this port in production** — it grants full browser control |
 | `--help` | — | Show help |
 
 ### Concurrency & throughput (`--concurrency`)
@@ -158,7 +160,7 @@ See the table below for each console tab:
 | **Render test bench** (English) | The same UI switched to English (top-right "中" toggles back to Chinese), demonstrating Google structured extraction (`extract=google_serp`). A direct way to verify stealth fingerprint unification end-to-end. | <a href="images/google-search-extract-en.png" target="_blank"><img src="images/google-search-extract-en.png" width="420" alt="English UI - Google result extraction"></a> |
 | **Cookie status** | View the login-state cookies the render service holds, shown per-domain as "cookie count carried" (no values, to prevent leakage), to reconcile with the browser extension. "Clear current session" / "Permanently delete" clear in-memory session cookies and the encrypted persistent store (`data/cookies.dat`) respectively. | <a href="images/cookies.png" target="_blank"><img src="images/cookies.png" width="420" alt="Cookie status"></a> |
 | **Config example** | One-click copy of Agent integration & invocation config: the `mcpServers` JSON for Claude Code / Cursor, a curl-to-`/render` example, a WebSocket example, and the current access token (shown when `--password` is enabled). | <a href="images/config-show.png" target="_blank"><img src="images/config-show.png" width="420" alt="Config example"></a> |
-| **API docs** | Interactive API docs: the left tree groups by "HTTP REST / MCP tools / WebSocket" (16 HTTP endpoints + 4 MCP tools + WS render/subscribe/auth); the right pane has parameter tables, curl/JSON examples, response examples and error codes, all one-click copyable. | <a href="images/api-docs.png" target="_blank"><img src="images/api-docs.png" width="420" alt="API docs"></a> |
+| **API docs** | Interactive API docs: the left tree groups by "HTTP REST / MCP tools / WebSocket" (17 HTTP endpoints + 5 MCP tools + WS render/subscribe/auth); the right pane has parameter tables, curl/JSON examples, response examples and error codes, all one-click copyable. | <a href="images/api-docs.png" target="_blank"><img src="images/api-docs.png" width="420" alt="API docs"></a> |
 
 > Cookie sync source: see [Browser extension](#browser-extension) below. The admin UI is pure static assets ([`admin-ui/`](../admin-ui/)), bundled with the binary, no external service needed. Remote access requires an explicit `--host 0.0.0.0` and strongly recommends configuring `--password` (the admin UI can change the proxy and inject cookies — it's a high-privilege entry point).
 
@@ -215,6 +217,7 @@ After syncing, you can view the cookies the render service currently holds on th
 | GET  | `/status/:id` | Query a single task's status (non-blocking) |
 | GET  | `/status` | Runtime panorama: cumulative counts, success rate, latency distribution, throughput, per-domain distribution, queue snapshot |
 | GET  | `/result/:id?timeout=N` | Long-poll to fetch HTML (default 25s) |
+| GET  | `/har/:id` | Download a task's HAR network recording (requires `--remote-debugging-port` + `record_network=true`; see [Network recording & HAR export](#network-recording--har-export-record_network)) |
 | POST | `/cookies` | Sync browser login-state cookies (used by the extension) |
 | GET  | `/cookies` | Overview of synced cookies (domain → count, no values) |
 | DELETE | `/cookies` | Clear all synced cookies |
@@ -445,19 +448,122 @@ sequenceDiagram
     Note over C: JS missing/exception → silent degradation:<br/>no serp_json field, html only
 ```
 
+## Network recording & HAR export (`record_network`)
+
+seimi-render can **record the full network traffic of a page load** (all HTTP requests and responses, including headers, status codes, response bodies, and timing) during rendering, producing a **standard HAR 1.2 file** — equivalent to Chrome DevTools' Network tab "Save all as HAR". The recorded HAR can be imported directly into Chrome DevTools, Charles, haralyzer, and other tools for performance analysis, API reverse-engineering, or debugging.
+
+### How it works
+
+When enabled, seimi-render connects to the rendering page's Chromium target via **CDP (Chrome DevTools Protocol)**, subscribes to `Network` domain events (`requestWillBeSent` / `responseReceived` / `loadingFinished`, etc.), and aggregates them by requestId into HAR entries. The CdpClient is embedded in-process (built on Qt WebSocket) and does not depend on any external CDP client.
+
+### Enabling
+
+Two steps:
+
+1. **Start the service with `--remote-debugging-port`**:
+
+```bash
+./build/seimi-render.app/Contents/MacOS/seimi-render \
+  --http-port 8088 --ws-port 8099 \
+  --remote-debugging-port 9222
+```
+
+2. **Pass `record_network: true` when rendering**:
+
+```bash
+TASK_ID=$(curl -s -X POST http://localhost:8088/render \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://weibo.com/","output":"html","record_network":true,"long_poll_ms":45000}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['task_id'])")
+
+# Fetch the HAR after rendering completes (finalize has a ~0.3s delay, wait a moment)
+sleep 2
+curl http://localhost:8088/har/$TASK_ID -o trace.har
+```
+
+> HAR files are retained for 10 minutes before automatic eviction (HarStore's TTL + 200-entry LRU cap).
+
+### HTTP endpoint
+
+| Method | Path | Description |
+|------|------|------|
+| `GET` | `/har/:id` | Download a task's HAR. On success returns `application/json` (the HAR 1.2 body) with `Content-Disposition: attachment; filename="<task_id>.har"`. Returns `503` if `--remote-debugging-port` wasn't set; `404` if the task wasn't recorded (no `record_network`) or has expired |
+
+### New `POST /render` parameter
+
+| Parameter | Type | Default | Description |
+|------|------|------|------|
+| `record_network` | bool | `false` | When `true`, this render records all network traffic. Silently degrades (render succeeds, but no HAR produced) if `--remote-debugging-port` isn't set. Recording adds ~50-200ms of CDP attach overhead |
+
+### MCP tools
+
+Agents can complete the full recording loop via two MCP tools:
+
+```bash
+# 1. render_url with record_network
+#    the agent calls render_url with record_network: true
+#    after getting the task_id back, the HAR is auto-archived when rendering finishes
+
+# 2. get_har to fetch the result
+#    call get_har with the task_id from the previous step; returns the HAR JSON string
+```
+
+| Tool | Params | Description |
+|------|------|------|
+| `render_url` | `record_network` (bool, default false) | Records network traffic during the render; fetch the result with `get_har` |
+| `get_har` | `task_id` (required) | Fetches the HAR for a task, returning HAR 1.2 JSON. Archiving has a ~0.3s delay; fetching immediately after a render finishes may return "not available" — retry shortly |
+
+### HAR contents
+
+The output is **standard HAR 1.2**; each entry contains:
+
+| Field | Source | Description |
+|------|------|------|
+| `request` | CDP `Network.requestWillBeSent` | method / url / httpVersion / headers / queryString / postData / bodySize |
+| `response` | CDP `Network.responseReceived` | status / statusText / httpVersion / headers / mimeType / redirectURL / bodySize |
+| `response.content` | CDP `Network.getResponseBody` | size / mimeType / text (response body; binary goes through base64 encoding) / compression |
+| `timings` | CDP `ResourceTiming` | send / wait / receive (ms) |
+| `_resourceType` | CDP `type` | document / xhr / script / stylesheet / image / font / media / fetch / websocket, etc. (Chrome extension field) |
+| `_initiator` | CDP `initiator` | Request initiator (parser / script / other; Chrome extension field) |
+| `_transferSize` | CDP `encodedDataLength` | On-the-wire transferred bytes (Chrome extension field) |
+| `startedDateTime` | CDP `wallTime` | ISO 8601 with milliseconds (UTC) |
+| `time` | sum of timings | Total duration (ms) |
+
+> Response bodies are captured in full by default; entries >1MB degrade to keeping only size (no text) to save memory (mimeType is still retained).
+
+### ⚠️ Important: mutual exclusion with stealth (anti-bot)
+
+When `--remote-debugging-port` is on, stealth's **`--disable-blink-features=AutomationControlled` flag is automatically skipped** — because that flag erases CDP traces, which conflicts with the CDP connection needed for recording.
+
+What this means:
+
+- **Recording mode = debug/analysis mode**: suited for development debugging, performance analysis, API reverse-engineering — **not for anti-bot scenarios**
+- The remaining stealth layers (UA unification, stealth.js fingerprint patching, high-entropy Client Hints) still take effect, reducing fingerprint drift
+- If you need both anti-bot rendering and HAR recording, run **two instances**: one without `--remote-debugging-port` (full stealth), one with it (recording/analysis)
+
+> On startup the service prints a prominent warning: `Stealth AutomationControlled flag will be SKIPPED to avoid CDP conflict`.
+
+### Security note
+
+`--remote-debugging-port` grants **full browser control** (can execute arbitrary JS, read cookies, navigate anywhere). In production:
+
+- **Always bind to `127.0.0.1`** (Chromium's default; don't enable it alongside `--host 0.0.0.0`)
+- Or place it behind a firewall / VPN, blocking direct public access
+
 ## MCP (for Claude Code / Cursor and other agents)
 
 seimi-render ships with an **MCP (Model Context Protocol) server** (default port `8090`, based on [hkr04/cpp-mcp](https://github.com/hkr04/cpp-mcp), Streamable HTTP transport, compliant with the 2025-03-26 spec). This lets AI agent tools like Claude Code and Cursor **treat seimi-render directly as a rendering tool** — the agent autonomously decides when to render a page and grab the rendered content.
 
 ### Exposed tools
 
-4 tools total, ordered by "semantic level" from high to low — the agent prefers high-level tools, with the low-level `render_url` catching everything they don't cover:
+5 tools total, ordered by "semantic level" from high to low — the agent prefers high-level tools, with the low-level `render_url` catching everything they don't cover:
 
 | tool | Purpose | Required params | Optional params |
 |------|------|----------|----------|
 | `browser_search` | Keyword search: builds a search-engine URL and renders it, returning a result list. **Preferred when no URL is given and the user just wants to "search / look up".** | `query` | `engine` (google/bing/baidu/duckduckgo, default google), `settle_ms` (2500), `timeout_ms` (45000) |
 | `get_web_content` | Read a single article body: uses readability to extract clean markdown (stripping nav/ads/sidebar). **Preferred when a specific URL is given to read in full.** | `url` | `md_algorithm` (readability/conservative, default readability), `settle_ms` (2500), `timeout_ms` (45000) |
-| `render_url` | Full-featured renderer: any URL, any output combo. **Use when you need PDF/screenshot/raw HTML / a hand-specified search-engine URL / a custom settle.** | `url` | `output` (markdown/html/pdf/screenshot comma combo, default markdown), `md_algorithm` (conservative/readability, default conservative), `format` (auto/png/jpg, screenshot only), `settle_ms` (2500), `timeout_ms` (45000) |
+| `render_url` | Full-featured renderer: any URL, any output combo. **Use when you need PDF/screenshot/raw HTML / a hand-specified search-engine URL / a custom settle.** | `url` | `output` (markdown/html/pdf/screenshot comma combo, default markdown), `md_algorithm` (conservative/readability, default conservative), `format` (auto/png/jpg, screenshot only), `settle_ms` (2500), `timeout_ms` (45000), `record_network` (false, enables HAR network recording; see [Network recording & HAR export](#network-recording--har-export-record_network)) |
+| `get_har` | Fetch a task's network-recording HAR by task_id: pairs with `render_url`'s `record_network=true`, returning standard HAR 1.2 JSON | `task_id` | — |
 | `get_render_result` | Fetch the result of an already-submitted task by task_id: poll after `render_url` times out returning `running`, or re-fetch a finished artifact. | `task_id` | `output` (markdown/html/screenshot/pdf, default markdown), `timeout_ms` (5000) |
 
 **Tool-selection cheat sheet** (also written into each tool's description; the agent decides automatically):

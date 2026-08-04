@@ -108,7 +108,17 @@ def make_ico(sizes, outpath):
         f.write(data)
     print(f"wrote {outpath} ({len(data)} bytes, sizes={sizes})")
 
+def make_png_icon(size, outpath):
+    """生成单尺寸 PNG 图标（矢量直接绘制，非下采样）。"""
+    px = render_icon(size)
+    png = make_png(px, size, size)
+    with open(outpath, 'wb') as f:
+        f.write(png)
+    print(f"wrote {outpath} ({len(png)} bytes, {size}x{size})")
+
 if __name__ == '__main__':
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, 'favicon.ico')
     make_ico([16, 32, 48], out)
+    # 256×256 PNG（高清图标 / PWA / Apple Touch Icon 等）
+    make_png_icon(256, os.path.join(here, 'favicon-256.png'))

@@ -5,6 +5,7 @@
 
 #include "CookieStore.h"
 #include "Environment.h"
+#include "HarStore.h"
 #include "McpServer.h"
 #include "ProxyConfig.h"
 #include "IpNet.h"
@@ -872,8 +873,11 @@ void HttpServer::registerRoutes() {
         MdAlgorithm mdAlg = parseMdAlgorithm(obj.value(QStringLiteral("md_algorithm")));
         // 站点特定提取算法：baidu_serp（百度搜索结果页结构化提取）。默认 none。
         ExtractAlgorithm extractAlg = parseExtractAlgorithm(obj.value(QStringLiteral("extract")));
+        // HAR 网络录制：record_network=true 开启该任务的 CDP 网络录制，结果走 GET /har/<id>。
+        const bool recordHar = obj.value(QStringLiteral("record_network")).toBool(false);
 
-        QString id = m_queue->submit(url, settleMs, outputs, imgFmt, mdAlg, nowMsec(), extractAlg);
+        QString id = m_queue->submit(url, settleMs, outputs, imgFmt, mdAlg, nowMsec(),
+                                     extractAlg, recordHar);
         if (id.isEmpty()) {
             // 任务表过载（洪泛提交/积压）：背压拒绝，让客户端稍后重试。
             res.status = 503;
@@ -954,6 +958,31 @@ void HttpServer::registerRoutes() {
             return;
         }
         res.set_content(jsonStateResp(s, s.done ? outMask : 0), "application/json; charset=utf-8");
+    });
+
+    // 下载 HAR 网络录制（仅当任务请求了 record_network=true 且渲染时录制了网络）。
+    // 产物是标准 HAR 1.2 JSON（含 Chrome 扩展字段 _resourceType/_initiator/_transferSize），
+    // 可被 har-validator 校验、Chrome DevTools / Charles / haralyzer 导入分析。
+    m_srv->Get(R"(/har/([A-Za-z0-9]+))",
+               [this](const httplib::Request& req, httplib::Response& res) {
+        SEIMI_AUTH(req, res);
+        if (!m_harStore) {
+            res.status = 503;
+            res.set_content(R"({"error":"HAR recording disabled"})",
+                            "application/json; charset=utf-8");
+            return;
+        }
+        QString id = QString::fromStdString(req.matches[1]);
+        HarStore::Result r = m_harStore->get(id);
+        if (!r.found) {
+            res.status = 404;
+            res.set_content(R"({"error":"HAR not found"})",
+                            "application/json; charset=utf-8");
+            return;
+        }
+        res.set_content(r.harJson.toStdString(), "application/json; charset=utf-8");
+        res.set_header("Content-Disposition",
+                       "attachment; filename=\"" + id.toStdString() + ".har\"");
     });
 
     // 下载打印 PDF（仅当任务请求了 pdf 且渲染成功）

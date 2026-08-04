@@ -38,7 +38,8 @@ public:
     // 任务表达 kMaxLiveTasks（过载）时返回空串——调用方据此回 503 做背压。
     QString submit(QString url, int settleDelayMsec, OutputMask outputs,
                    ImageFormat imageFormat, MdAlgorithm mdAlgorithm, qint64 nowMsec,
-                   ExtractAlgorithm extractAlgorithm = ExtractAlgorithm::None);
+                   ExtractAlgorithm extractAlgorithm = ExtractAlgorithm::None,
+                   bool recordHar = false);
 
     // 消费者：GUI 渲染线程【非阻塞】取一个 Pending 任务并置 Running。
     // 队列空时立即返回 nullptr——供事件循环回调轮询，绝不阻塞。

@@ -26,6 +26,7 @@ class CookieStore;
 class ProxyConfig;
 class Environment;
 class McpServer;
+class HarStore;
 
 // HTTP 接口层（cpp-httplib，内置线程池）。
 // 路由：POST /render、GET /status/:id、GET /result/:id?timeout=、GET /stats、GET /health、
@@ -64,6 +65,9 @@ public:
     // 注入 MCP server 引用，使 /status 能暴露 MCP session 健康度。可空（未启动 MCP 时为 nullptr）。
     // 必须在 start() 前调用。
     void setMcpServer(McpServer* mcp) { m_mcp = mcp; }
+    // 注入 HAR 归档存储（启用 GET /har/<task_id>）。可空（未开 --remote-debugging-port 时为 nullptr）。
+    // 必须在 start() 前调用。
+    void setHarStore(HarStore* store) { m_harStore = store; }
 
 private:
     void registerRoutes();
@@ -112,6 +116,7 @@ private:
     ProxyConfig* m_proxy = nullptr;    // 可空；非空时启用 /proxy 接口
     Environment* m_env = nullptr;      // 可空；非空时 /status 附带 environment 段
     McpServer* m_mcp = nullptr;        // 可空；非空时 /status 附带 mcp session 健康段
+    HarStore* m_harStore = nullptr;    // 可空；非空时启用 GET /har/<task_id>（网络录制产物）
     int m_settleDefaultMs;
     std::unique_ptr<httplib::Server> m_srv;
     std::atomic<bool> m_running{false};

@@ -5,6 +5,7 @@
 
 #include "BlockDetect.h"
 #include "CookieStore.h"
+#include "HarRecorder.h"
 #include "ProxyConfig.h"
 #include "SsrfInterceptor.h"
 #include "StealthProfile.h"
@@ -59,11 +60,12 @@ bool RenderWorker::s_stealthViewport = false;
 // ============================================================
 
 RenderWorker::RenderWorker(QWebEngineProfile* profile, RenderQueue* queue,
-                           qint64 loadTimeoutMsec, QObject* parent)
+                           qint64 loadTimeoutMsec, HarRecorder* harRecorder, QObject* parent)
     : QObject(parent)
     , m_profile(profile)
     , m_queue(queue)
     , m_loadTimeoutMsec(loadTimeoutMsec)
+    , m_harRecorder(harRecorder)
     , m_view(nullptr)
     , m_page(nullptr)
     , m_busy(false)
@@ -123,6 +125,15 @@ void RenderWorker::startAttempt() {
     });
 
     m_loadTimer.start(int(m_loadTimeoutMsec));
+
+    // HAR 网络录制：在 load() 之前 attach CDP client，确保能捕获初始文档请求。
+    // attachForTask 同步发现 targetId + 立即 open WebSocket（connected/Network.enable 异步到）。
+    // 必须在 load() 之前，否则首次请求（主文档）会在 Network.enable 之前发出、被漏掉。
+    // 未开 --remote-debugging-port 时 m_harRecorder 为 nullptr，静默跳过。
+    if (m_task->recordHar && m_harRecorder) {
+        m_harRecorder->attachForTask(m_task->id, m_task->url);
+    }
+
     m_page->load(QUrl(m_task->url));
 }
 
@@ -615,6 +626,13 @@ void RenderWorker::abort() {
 }
 
 void RenderWorker::destroyPage() {
+    // HAR 网络录制：在 page 销毁前 detach CDP client，触发 HAR 聚合归档。
+    // 必须在 m_task.reset() 之前（detach 需要 taskId）。异步 finalize（300ms 后归档，
+    // 给在途 getResponseBody 回调时间）。
+    if (m_task && m_task->recordHar && m_harRecorder) {
+        m_harRecorder->detachForTask(m_task->id);
+    }
+
     m_loadTimer.stop();
     m_settleTimer.stop();
     m_collectStarted = false;
@@ -846,7 +864,8 @@ RenderPool::RenderPool(RenderQueue* queue, int concurrency, qint64 loadTimeoutMs
     : QObject(parent)
     , m_queue(queue)
     , m_concurrency(concurrency)
-    , m_loadTimeoutMsec(loadTimeoutMsec) {}
+    , m_loadTimeoutMsec(loadTimeoutMsec)
+    , m_harRecorder(nullptr) {}
 
 void RenderPool::start() {
     // 共享 profile：节省内存、复用 HTTP 缓存与 cookie；OffTheRecord 关闭持久化，纯渲染场景更干净。
@@ -858,6 +877,12 @@ void RenderPool::start() {
     // stealth 开启时，interceptor 同时统一指纹相关 HTTP 头（Sec-CH-UA 等）。
     m_ssrfInterceptor = new SsrfRequestInterceptor(m_stealthEnabled, m_profile);
     m_profile->setUrlRequestInterceptor(m_ssrfInterceptor);
+
+    // HAR 录制：把拦截器的请求观测回调接到录制中枢（作为 CDP 漏事件时的请求侧兜底）。
+    // 拦截器跑在 IO 线程，HarRecorder 内部用 QMetaObject::invokeMethod 跨线程投递到 GUI。
+    if (m_harRecorder) {
+        m_harRecorder->bindInterceptor(m_ssrfInterceptor);
+    }
 
     // 浏览器指纹统一（stealth）：所有渲染实例伪装成同一 Chrome on Windows 10 桌面环境，
     // 绕过反爬的 webdriver/UA/特征检测。三层联动（详见 StealthProfile.h）：
@@ -887,7 +912,8 @@ void RenderPool::start() {
     }
 
     for (int i = 0; i < m_concurrency; ++i) {
-        auto w = std::make_unique<RenderWorker>(m_profile, m_queue, m_loadTimeoutMsec, this);
+        auto w = std::make_unique<RenderWorker>(m_profile, m_queue, m_loadTimeoutMsec,
+                                                m_harRecorder, this);
         connect(w.get(), &RenderWorker::taskFinished, this, &RenderPool::taskFinished);
         m_workers.push_back(std::move(w));
     }

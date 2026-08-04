@@ -58,7 +58,7 @@ static QByteArray outputMaskNames(OutputMask mask) {
 
 QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs,
                             ImageFormat imageFormat, MdAlgorithm mdAlgorithm, qint64 nowMsec,
-                            ExtractAlgorithm extractAlgorithm) {
+                            ExtractAlgorithm extractAlgorithm, bool recordHar) {
     QMutexLocker locker(&m_mutex);
 
     // 过载背压：任务表已满（洪泛提交/积压未消化），拒绝新提交。调用方据此回 503。
@@ -71,7 +71,7 @@ QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs
     while (m_tasks.contains(id)) id = makeTaskId();
 
     auto task = RenderTaskPtr::create(id, std::move(url), nowMsec, settleDelayMsec,
-                                      outputs, imageFormat, mdAlgorithm, extractAlgorithm);
+                                      outputs, imageFormat, mdAlgorithm, extractAlgorithm, recordHar);
     m_tasks.insert(id, task);
     m_pendingIds.push_back(id);
 

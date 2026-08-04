@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- seimi-render LOGO（512×512 方形）：渐变圆角方块铺满整张画布，
+       闪电图标（上）+ SeimiRender 字标（下）全部内嵌于背景中。 -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 方形渐变底（rx 同 favicon 28/128 比例 ≈ 112） -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <!-- 闪电图标：128 坐标系原样缩放 2.34375×（=300px），水平居中、偏上 -->
+  <g transform="translate(106 70) scale(2.34375)">
+    <path d="M72 18 L34 74 H60 L54 110 L94 50 H68 Z"
+          fill="#fff" stroke="#1e3a8a" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+
+  <!-- 字标 SeimiRender：白色融入背景，居中置于下方 -->
+  <text x="256" y="445" text-anchor="middle"
+        font-family="'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="68" font-weight="700" letter-spacing="1"
+        fill="#ffffff" text-rendering="geometricPrecision">SeimiRender</text>
+</svg>

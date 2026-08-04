@@ -101,6 +101,7 @@ struct RenderTask {
     const ImageFormat imageFormat;    // 截图编码格式（仅 wants(Screenshot) 时有意义）
     const MdAlgorithm mdAlgorithm;    // markdown 正文提取算法（仅 wants(Markdown) 时有意义）
     const ExtractAlgorithm extractAlgorithm;  // 站点特定提取算法（默认 None，不影响现有行为）
+    const bool recordHar;             // 是否录制网络并产出 HAR（需启动 --remote-debugging-port）
 
     // 受 RenderQueue 锁保护的可变字段
     TaskState state{TaskState::Pending};
@@ -124,7 +125,7 @@ struct RenderTask {
 
     RenderTask(QString id_, QString url_, qint64 createdAt, int settleDelay, OutputMask outs,
                ImageFormat imgFmt = ImageFormat::Auto, MdAlgorithm mdAlg = MdAlgorithm::Conservative,
-               ExtractAlgorithm extractAlg = ExtractAlgorithm::None)
+               ExtractAlgorithm extractAlg = ExtractAlgorithm::None, bool recordHarFlag = false)
         : id(std::move(id_))
         , url(std::move(url_))
         , createdAtMsec(createdAt)
@@ -132,7 +133,8 @@ struct RenderTask {
         , outputs(outs)
         , imageFormat(imgFmt)
         , mdAlgorithm(mdAlg)
-        , extractAlgorithm(extractAlg) {}
+        , extractAlgorithm(extractAlg)
+        , recordHar(recordHarFlag) {}
 
     bool wants(Output o) const { return (outputs & static_cast<OutputMask>(o)) != 0; }
 };
