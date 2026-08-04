@@ -968,7 +968,17 @@ void HttpServer::registerRoutes() {
         SEIMI_AUTH(req, res);
         if (!m_harStore) {
             res.status = 503;
-            res.set_content(R"({"error":"HAR recording disabled"})",
+            // 给出可操作的开启指引（供 agent / 运维自助修复），而非仅说 disabled。
+            QJsonObject ej;
+            ej["error"] = QStringLiteral("HAR recording disabled");
+            ej["reason"] = QStringLiteral("server not started with --remote-debugging-port");
+            ej["hint"] = QStringLiteral("Restart seimi-render with --remote-debugging-port <port> "
+                                        "to enable CDP-based network recording. "
+                                        "Note: this skips stealth's AutomationControlled flag "
+                                        "(debug mode and anti-bot are mutually exclusive).");
+            ej["example"] = QStringLiteral("seimi-render --remote-debugging-port 9222 "
+                                           "--http-port 8088 --ws-port 8089");
+            res.set_content(QString::fromUtf8(QJsonDocument(ej).toJson(QJsonDocument::Compact)).toStdString(),
                             "application/json; charset=utf-8");
             return;
         }

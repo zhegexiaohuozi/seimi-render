@@ -35,6 +35,7 @@ const API_SPEC = {
         { name: 'format', type: 'string', required: false, def: 'auto', desc: { zh: '截图编码：png/jpg/jpeg/auto（按图片占比智能选择）', en: 'Screenshot encoding: png/jpg/jpeg/auto (smart pick by image ratio)' } },
         { name: 'md_algorithm', type: 'string', required: false, def: 'conservative', desc: { zh: 'Markdown 正文算法：conservative(零误伤) / readability(正文定位)', en: 'Markdown body algorithm: conservative (zero false-drop) / readability (body extraction)' } },
         { name: 'extract', type: 'string', required: false, def: 'none', desc: { zh: '站点特定结构化提取：baidu_serp(百度去广告) / bing_serp(必应) / google_serp(Google)。与 md_algorithm 互斥，设为非 none 时不转 markdown', en: 'Site-specific structured extraction: baidu_serp (Baidu, ad-removed) / bing_serp (Bing) / google_serp (Google). Mutually exclusive with md_algorithm; when set to non-none, markdown is not produced' } },
+        { name: 'record_network', type: 'bool', required: false, def: 'false', desc: { zh: '是否录制网络并产出 HAR。需启动时带 --remote-debugging-port，否则静默降级（渲染正常但不产出 HAR）。录制会增加约 50-200ms 的 CDP attach 开销。结果用 GET /har/:id 取', en: 'Whether to record network traffic and produce a HAR. Requires --remote-debugging-port at startup; otherwise silently degrades (render succeeds but no HAR produced). Recording adds ~50-200ms of CDP attach overhead. Fetch the result via GET /har/:id' } },
       ],
       curl: `curl -X POST http://127.0.0.1:8088/render \\
   -H "Authorization: Bearer <token>" \\
@@ -115,6 +116,19 @@ const API_SPEC = {
   http://127.0.0.1:8088/image/abc123 -o shot.png`,
       example: '(binary: image/png or image/jpeg)',
       errors: [{ code: 404, msg: 'task not found / no image' }, { code: 401, msg: 'unauthorized' }],
+    },
+    {
+      method: 'GET', path: '/har/:id', auth: true, tryable: false,
+      title: { zh: '下载 HAR 网络录制', en: 'Download HAR Network Recording' },
+      desc: {
+        zh: '下载任务的标准 HAR 1.2 网络录制文件（含所有请求/响应/headers/响应体/timing，类似 Chrome F12 Network）。前置条件：① 启动时带 --remote-debugging-port 开启 CDP 录制；② 渲染时带 record_network=true。产出可导入 Chrome DevTools / Charles / haralyzer 分析。HAR 保留 10 分钟后自动淘汰。注意：开启 --remote-debugging-port 会跳过 stealth 的 AutomationControlled 标记（调试模式与反爬互斥）。',
+        en: 'Download a task\'s standard HAR 1.2 network recording (all requests/responses/headers/response bodies/timing — like Chrome DevTools\' Network tab). Prerequisites: ① the server was started with --remote-debugging-port to enable CDP recording; ② the render carried record_network=true. The output can be imported into Chrome DevTools / Charles / haralyzer. HARs are auto-evicted after 10 minutes. Note: enabling --remote-debugging-port skips stealth\'s AutomationControlled flag (debug mode and anti-bot are mutually exclusive).',
+      },
+      params: [{ name: ':id', type: 'path', required: true, desc: { zh: '任务 ID（POST /render 带 record_network=true 返回的 task_id）', en: 'Task ID (the task_id from POST /render with record_network=true)' } }],
+      curl: `curl -H "Authorization: Bearer <token>" \\
+  http://127.0.0.1:8088/har/abc123 -o trace.har`,
+      example: '{ "log": { "version": "1.2", "creator": { "name": "seimi-render", "version": "1.1.0" }, "entries": [ { "startedDateTime": "2026-08-03T08:29:16.969Z", "time": 515, "request": { "method": "GET", "url": "https://example.com/", ... }, "response": { "status": 200, "content": { "size": 1256, "mimeType": "text/html", "text": "<!DOCTYPE html>..." } }, "timings": { "send": 0, "wait": 515, "receive": -1 }, "_resourceType": "document" } ] } }',
+      errors: [{ code: 503, msg: 'HAR recording disabled (server not started with --remote-debugging-port)' }, { code: 404, msg: 'HAR not found (task did not record network or has expired)' }, { code: 401, msg: 'unauthorized' }],
     },
     {
       method: 'GET', path: '/stats', auth: true, tryable: true,
@@ -271,6 +285,7 @@ const API_SPEC = {
         { name: 'format', type: 'string', required: false, def: 'auto', desc: { zh: '截图编码：auto(默认,智能选择) / png(无损) / jpg(照片体积小)。仅 screenshot 生效', en: 'Screenshot encoding: auto (default, smart) / png (lossless) / jpg (smaller for photos). Only affects screenshot' } },
         { name: 'settle_ms', type: 'int', required: false, def: '2500', desc: { zh: 'loadFinished 后等待 JS 的毫秒', en: 'Milliseconds to wait for JS after loadFinished' } },
         { name: 'timeout_ms', type: 'int', required: false, def: '30000', desc: { zh: '长轮询超时毫秒', en: 'Long-poll timeout in milliseconds' } },
+        { name: 'record_network', type: 'bool', required: false, def: 'false', desc: { zh: '设为 true 时录制本次渲染的全量网络流量（请求/响应/headers/响应体/timing），产出标准 HAR 1.2。前置条件：服务须以 --remote-debugging-port 启动；未开时静默降级（渲染正常但不产出 HAR，get_har 会提示 disabled）。录制后用 get_har 工具取结果。注意：开启录制模式会跳过 stealth 反爬标记，不适合反爬场景', en: 'When true, records all network traffic of this render (requests/responses/headers/bodies/timing), producing a standard HAR 1.2. Prerequisite: the server must be started with --remote-debugging-port; if not set, it silently degrades (render succeeds but no HAR is produced; get_har will report disabled). Fetch the result with the get_har tool. Note: recording mode skips the stealth anti-bot flag — not suitable for anti-bot scenarios' } },
       ],
       curl: `# Claude Code 配置（~/.claude.json）
 {
@@ -299,6 +314,20 @@ const API_SPEC = {
       curl: '(通过 MCP 协议调用，非 HTTP)',
       example: { content: [{ type: 'text', text: '...' }] },
       errors: [{ code: 401, msg: 'unauthorized' }],
+    },
+    {
+      method: 'TOOL', path: 'get_har', endpoint: 'http://<host>:8090/mcp', auth: true,
+      title: { zh: '取网络录制 HAR', en: 'Get Network Recording HAR' },
+      desc: {
+        zh: 'MCP 工具：按 task_id 取网络录制 HAR（标准 HAR 1.2 JSON）。配合 render_url 的 record_network=true 使用——渲染时录制全量网络流量（类似 Chrome F12 Network），录完用本工具取结果。返回的 HAR JSON 可被 har-validator 校验、Chrome DevTools / Charles 导入分析。\n\n⚠️ 生效条件（两个都必须满足）：\n① 服务以 --remote-debugging-port 启动（开启 CDP 录制能力）；\n② render_url 调用时 record_network=true。\n任一条件不满足时本工具返回提示：未开 CDP → "HAR recording disabled"；任务未录制或已过期 → "HAR not found"。\n\n时序：HAR 在渲染结束（page 销毁）后归档，有约 0.3s 延时。render_url 返回 succeeded 后立即调本工具可能提示 "not available"，稍等重试即可。',
+        en: 'MCP tool: fetch a task\'s network-recording HAR (standard HAR 1.2 JSON) by task_id. Pairs with render_url\'s record_network=true — the render records all network traffic (like Chrome DevTools\' Network tab), and you fetch the result with this tool. The returned HAR JSON can be validated by har-validator and imported into Chrome DevTools / Charles.\n\n⚠️ Prerequisites (BOTH must be met):\n① The server is started with --remote-debugging-port (enables CDP recording);\n② render_url was called with record_network=true.\nIf either is missing, this tool returns a hint: no CDP → "HAR recording disabled"; task not recorded or expired → "HAR not found".\n\nTiming: the HAR is archived after the render finishes (page teardown), with a ~0.3s delay. Calling this tool immediately after render_url returns succeeded may yield "not available" — retry shortly.',
+      },
+      params: [
+        { name: 'task_id', type: 'string', required: true, desc: { zh: '任务 ID（render_url 带 record_network=true 时返回的 task_id）', en: 'Task ID (the task_id returned by render_url with record_network=true)' } },
+      ],
+      curl: '(通过 MCP 协议调用，非 HTTP)',
+      example: { content: [{ type: 'text', text: '{ "log": { "version": "1.2", "creator": { "name": "seimi-render", "version": "1.1.0" }, "entries": [ { "request": { "method": "GET", "url": "https://example.com/" }, "response": { "status": 200, "content": { "mimeType": "text/html", "size": 1256 } }, "_resourceType": "document" } ] } }' }] },
+      errors: [{ code: 401, msg: 'unauthorized' }, { msg: 'HAR recording disabled (server not started with --remote-debugging-port)' }, { msg: 'HAR not found (task did not record network or has expired)' }],
     },
     {
       method: 'TOOL', path: 'browser_search', endpoint: 'http://<host>:8090/mcp', auth: true,

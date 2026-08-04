@@ -819,18 +819,38 @@ bool McpServer::start(const std::string& host, int port,
                 mcpLog("get_har task_id=%s -> render service unreachable", taskId.c_str());
                 return toTextContent("error: render service unreachable");
             }
-            // HTTP 4xx/5xx：httpGet 返回 body 含错误 JSON（如 HAR 未找到/录制未开启）。
-            // 直接把 body 透出，agent 可据此判断是重试还是放弃。
-            // 注意：httpGet 当前只返回 body（status code 丢失），但 body 里的 error 字段足够诊断。
+            // HTTP 4xx/5xx：httpGet 返回 body 含错误 JSON（HAR 未找到 / 录制未开启）。
+            // 按 error 类型给出可操作指引，帮助 agent 或使用者自主修复：
+            //   - "disabled" → 服务未开 CDP，需重启加 --remote-debugging-port
+            //   - "not found" → 任务未录制或 HAR 已过期，需重新渲染带 record_network=true
             try {
                 auto j = mcp::json::parse(resp);
                 if (j.contains("error")) {
                     std::string err = j.value("error", "");
-                    mcpLog("get_har task_id=%s -> NOT FOUND (%s)", taskId.c_str(), err.c_str());
-                    return toTextContent("HAR not available for task " + taskId +
-                                         ": " + err +
-                                         ". If the render just finished, wait ~1s and retry "
-                                         "(HAR archives shortly after page teardown).");
+                    mcpLog("get_har task_id=%s -> NOT AVAILABLE (%s)", taskId.c_str(), err.c_str());
+                    if (err.find("disabled") != std::string::npos) {
+                        // 未开 CDP：给出完整的重启指引
+                        return toTextContent(
+                            "HAR recording is disabled on this server. To enable network recording, "
+                            "restart seimi-render with the --remote-debugging-port flag:\n\n"
+                            "  seimi-render --remote-debugging-port 9222 --http-port 8088 --ws-port 8089\n\n"
+                            "Then re-render with record_network=true and call get_har again. "
+                            "Note: enabling --remote-debugging-port skips stealth's AutomationControlled "
+                            "flag (debug mode and anti-bot are mutually exclusive).");
+                    }
+                    if (err.find("not found") != std::string::npos) {
+                        // 未录制或过期：指引重新渲染
+                        return toTextContent(
+                            "HAR not found for task " + taskId + ". This means either:\n"
+                            "  1. The render was submitted without record_network=true — re-render with "
+                            "render_url(url, record_network=true), then call get_har again.\n"
+                            "  2. The HAR has expired (retained 10 minutes) — re-render with "
+                            "record_network=true.\n"
+                            "  3. The render just finished — wait ~1s and retry (HAR archives shortly "
+                            "after page teardown).");
+                    }
+                    // 其它未知错误：透出原文
+                    return toTextContent("HAR not available for task " + taskId + ": " + err);
                 }
             } catch (...) {
                 // 非 JSON（即 HAR 正文）：直接返回。
