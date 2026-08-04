@@ -107,6 +107,7 @@ struct Config {
     bool warmupEnabled = true;    // Google 会话预热（默认开启，--no-warmup 关闭）
     std::string warmupUrl = "https://www.google.com/";  // --warmup-url 自定义预热目标
     int remoteDebugPort = 0;      // Chromium --remote-debugging-port（HAR 网络录制必需；0=不开）
+    std::string dataDir;          // --data-dir：持久化目录（cookies.dat / seimi.key / metrics.json）。空=默认(bin 同级 data/)
 };
 
 static void printUsage() {
@@ -153,6 +154,9 @@ static void printUsage() {
         "                        When set, stealth AutomationControlled flag is SKIPPED (debug/analysis\n"
         "                        mode): anti-bot detection may be less effective. Bind to 127.0.0.1\n"
         "                        only in production (the port exposes full browser control).\n"
+        "  --data-dir <path>     data directory for persistence (cookies.dat / seimi.key / metrics.json).\n"
+        "                        Default: <binary_dir>/data. Set to a writable path for containerized\n"
+        "                        or read-only deployments where the binary directory isn't writable.\n"
         "  --help                show this help\n");
 }
 
@@ -248,6 +252,7 @@ static Config parseArgs(int argc, char** argv) {
         else if (a == "--no-warmup") c.warmupEnabled = false;
         else if (a == "--warmup-url" && i + 1 < argc) c.warmupUrl = argv[++i];
         else if (a == "--remote-debugging-port" && i + 1 < argc) c.remoteDebugPort = std::atoi(argv[++i]);
+        else if (a == "--data-dir" && i + 1 < argc) c.dataDir = argv[++i];
     }
     c.concurrency   = std::max(1, c.concurrency);
     c.httpThreads   = std::max(2, c.httpThreads);
@@ -398,14 +403,21 @@ int main(int argc, char** argv) {
     QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
     QApplication app(argc, argv);
 
+    // 持久化目录：--data-dir 显式给定；缺省 = 二进制同级 data/。
+    // 存放 cookies.dat（加密 cookie）/ seimi.key（机器绑定盐）/ metrics.json（累计指标）。
+    // 容器/只读环境（二进制目录不可写）需显式指定到可写卷。
+    QString dataDir = cfg.dataDir.empty()
+        ? (QCoreApplication::applicationDirPath() + QStringLiteral("/data"))
+        : QString::fromStdString(cfg.dataDir);
+
     // 渲染队列：全局线程安全中枢。
-    // 传入 data/ 目录启用指标持久化（重启自动恢复累计统计，跨重启累加）。
-    RenderQueue queue(QCoreApplication::applicationDirPath() + "/data");
+    // 传入 data 目录启用指标持久化（重启自动恢复累计统计，跨重启累加）。
+    RenderQueue queue(dataDir);
 
     // Cookie 同步中枢：浏览器插件通过 POST /cookies 灌入登录态，
     // 由 RenderPool 在 GUI 线程周期 apply 到共享 profile。
-    // 传入 data/ 目录启用加密持久化（重启自动恢复登录态）。
-    CookieStore cookies(QCoreApplication::applicationDirPath() + "/data");
+    // 传入 data 目录启用加密持久化（重启自动恢复登录态）。
+    CookieStore cookies(dataDir);
 
     // 网络代理配置中枢（GUI 线程 apply）：HTTP 线程经 POST /proxy 写入，
     // 由 RenderPool 的 GUI 线程定时器周期调 apply() 把新代理写入
