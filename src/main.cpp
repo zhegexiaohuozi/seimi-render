@@ -42,6 +42,16 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+// SetConsoleOutputCP / SetConsoleCP：把控制台代码页切到 UTF-8，避免 UTF-8 日志被
+// 当 GBK 解码导致中文乱码（Windows 控制台默认代码页 936）。
+// WIN32_LEAN_AND_MEAN + NOMINMAX：精简 windows.h，并禁止 min/max 宏——否则后面的
+// std::max（parseArgs 里多处）会被宏展开成语法错误（main.cpp:252 编译失败即此因）。
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace seimi {
 
 // Qt 消息处理器：降噪。被渲染的重 SPA（gemini/doubao 等）会刷大量噪声——
@@ -275,6 +285,15 @@ static Config parseArgs(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     using namespace seimi;
+
+#ifdef _WIN32
+    // Windows 控制台默认代码页 936(GBK)，把 qWarning/mcpLog/fprintf 输出的 UTF-8 字节
+    // 当 GBK 解释 → 含中文的日志（如未 URL-encode 的 url）乱码。
+    // 切到 UTF-8 代码页。只影响当前进程的控制台，进程退出后不改变系统默认。
+    // 必须在任何输出（banner/日志）之前完成。
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
 
     Config cfg = parseArgs(argc, argv);
     g_verboseChromium = cfg.verboseChromium;

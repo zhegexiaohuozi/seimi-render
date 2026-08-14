@@ -430,6 +430,7 @@ body {
 .m-delete { background: #ffe4e6; color: #be123c; }
 .m-tool { background: #f3e8ff; color: #7e22ce; }
 .m-action { background: #fef3c7; color: #b45309; }
+.m-info { background: #ecfeff; color: #155e75; }
 
 .docs-detail {
   flex: 1; background: var(--bg-elev); border: 1px solid var(--border);

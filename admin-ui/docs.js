@@ -272,6 +272,20 @@ const API_SPEC = {
   ],
   mcp: [
     {
+      // 协议概览（非工具）：体现 MCP 协议版本 / transport / 鉴权 / 版本协商；method=INFO 在详情页精简渲染、不计入工具计数
+      method: 'INFO', path: '2025-03-26', endpoint: 'http://<host>:8090/mcp', auth: true,
+      title: { zh: 'MCP 协议概览', en: 'MCP Protocol Overview' },
+      desc: {
+        zh: '基于 MCP（Model Context Protocol）2025-03-26 规范。传输：Streamable HTTP（POST /mcp，默认），兼容 legacy HTTP+SSE（2024-11-05）。会话流程：initialize → notifications/initialized → tools/list → tools/call。鉴权：启用密码时每个请求需带 Authorization: Bearer <token>（与 HTTP/WS 共用同一确定性 token）。版本协商：客户端 initialize 时带 protocolVersion，服务端不支持则回落到 2025-03-26 由客户端决定。',
+        en: 'Based on the MCP (Model Context Protocol) 2025-03-26 specification. Transport: Streamable HTTP (POST /mcp, default), with legacy HTTP+SSE (2024-11-05) fallback. Session flow: initialize → notifications/initialized → tools/list → tools/call. Auth: when a password is enabled, every request must carry Authorization: Bearer <token> (shared with HTTP/WS as one deterministic token). Version negotiation: the client sends protocolVersion in initialize; if the server does not support it, it falls back to 2025-03-26 and the client decides.',
+      },
+      params: [],
+      curl: `# 推荐用 MCP Inspector 可视化调试（自动处理 initialize 握手与 session）
+npx @modelcontextprotocol/inspector
+# 打开后 URL 填 http://127.0.0.1:8090/mcp`,
+      example: { jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'seimi-render', version: '1.1.0' } } },
+    },
+    {
       method: 'TOOL', path: 'render_url', endpoint: 'http://<host>:8090/mcp', auth: true,
       title: { zh: '渲染 URL 并取结果', en: 'Render URL and Get Result' },
       desc: {
@@ -433,8 +447,9 @@ function renderDocs() {
   let navHtml = '';
   groups.forEach(g => {
     const items = API_SPEC[g.key];
+    const toolCount = items.filter(it => it.method !== 'INFO').length;
     navHtml += `<div class="docs-group">
-      <div class="docs-group-title">${g.icon} ${g.label} <span class="docs-count">${items.length}</span></div>`;
+      <div class="docs-group-title">${g.icon} ${g.label} <span class="docs-count">${toolCount}</span></div>`;
     items.forEach((it, idx) => {
       navHtml += `<div class="docs-item" data-group="${g.key}" data-idx="${idx}">
         <span class="m-badge m-${it.method.toLowerCase()}">${it.method}</span>
@@ -508,13 +523,14 @@ function renderDocDetail(item, group) {
       <p class="docs-desc">${tr(item.desc)}</p>
       ${tryBtn}
     </div>
+    ${item.method !== 'INFO' ? `
     <div class="docs-section">
       <h4>${t('docs.section.params')}</h4>
       <table class="docs-table">
         <thead><tr><th>${t('docs.colName')}</th><th>${t('docs.colType')}</th><th>${t('docs.colRequired')}</th><th>${t('docs.colDesc')}</th></tr></thead>
         <tbody>${paramsRows}</tbody>
       </table>
-    </div>
+    </div>` : ''}
     ${group !== 'ws' ? `
     <div class="docs-section">
       <h4>${exampleTitle}</h4>
@@ -530,13 +546,14 @@ function renderDocDetail(item, group) {
         <button class="btn-copy" data-copy-text="${encodeURIComponent(exampleStr)}">${t('common.copy')}</button>
       </div>
     </div>
+    ${item.method !== 'INFO' ? `
     <div class="docs-section">
       <h4>${t('docs.section.errors')}</h4>
       <table class="docs-table">
         <thead><tr><th>${t('docs.colStatus')}</th><th>${t('docs.colMeaning')}</th></tr></thead>
         <tbody>${errorsRows}</tbody>
       </table>
-    </div>
+    </div>` : ''}
     <div id="docs-try-panel"></div>
   `;
 
