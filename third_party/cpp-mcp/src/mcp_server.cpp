@@ -1132,10 +1132,27 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
                     return false;
                 }
                 dispatcher->update_activity();
-                bool result = dispatcher->wait_event(&sink);
+                // [seimi patch] streamable HTTP GET 流保活：wait_event 超时返回 false 时，
+                // 区分「纯超时」与「真断开」。仅 dispatcher.is_closed() 才算真断开
+                // （write 失败 / 对端关闭会先 close()）；纯超时（无服务端→客户端通知，常
+                // 态）改发 SSE keepalive 注释（: ping）后继续循环。根因：原实现把超时当致
+                // 命错误 close_session，空闲 GET 流每 ~10s 被主动掐断，客户端（Roo Code /
+                // TS SDK）反复重连并报 "TypeError: terminated"。legacy handle_sse 靠独立
+                // heartbeat 线程规避此问题，streamable HTTP 路径漏了等价机制。
+                bool result = dispatcher->wait_event(&sink, std::chrono::seconds(15));
                 if (!result) {
-                    close_session(session_id);
-                    return false;
+                    if (dispatcher->is_closed()) {
+                        close_session(session_id);
+                        return false;
+                    }
+                    // 纯超时：发 SSE comment 保活 + 探活（write 失败说明对端已断）
+                    static const std::string keepalive = ": ping\n\n";
+                    if (!sink.write(keepalive.data(), keepalive.size())) {
+                        close_session(session_id);
+                        return false;
+                    }
+                    dispatcher->update_activity();
+                    return true;
                 }
                 dispatcher->update_activity();
                 return true;
