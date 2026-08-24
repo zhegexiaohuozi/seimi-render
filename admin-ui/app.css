@@ -137,6 +137,22 @@ body {
 .lang-toggle:hover { color: var(--fg); background: var(--bg-elev2); border-color: var(--primary); }
 .lang-toggle:active { transform: scale(0.96); }
 
+/* 顶栏外链按钮（GitHub / 官网），风格同语言切换按钮 */
+.topbar-link {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--muted); padding: 6px 12px; border-radius: 8px;
+  cursor: pointer; font-size: 12px; font-weight: 600;
+  transition: all 0.2s ease; line-height: 1; text-decoration: none;
+}
+.topbar-link svg { opacity: 0.8; }
+.topbar-link:hover { color: var(--fg); background: var(--bg-elev2); border-color: var(--primary); }
+.topbar-link:active { transform: scale(0.96); }
+@media (max-width: 1080px) {
+  .topbar-link span { display: none; }
+  .topbar-link { padding: 6px 9px; }
+}
+
 .content { flex: 1; padding: 32px; max-width: 1200px; width: 100%; margin: 0 auto; animation: fadeIn 0.4s ease; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 .tab-panel { display: none; }

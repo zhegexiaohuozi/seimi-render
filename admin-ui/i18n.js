@@ -27,6 +27,10 @@
       'brand.title': 'seimi-render 控制台',
       'brand.sub': '控制台',
       'conn.title': '连接状态',
+      'nav.github': 'GitHub',
+      'nav.github.title': 'GitHub 仓库',
+      'nav.site': '官网',
+      'nav.site.title': '官方网站',
 
       // 登录
       'login.hint': '控制台安全访问验证',
@@ -284,6 +288,10 @@
       'brand.title': 'seimi-render Console',
       'brand.sub': 'Console',
       'conn.title': 'Connection status',
+      'nav.github': 'GitHub',
+      'nav.github.title': 'GitHub repository',
+      'nav.site': 'Website',
+      'nav.site.title': 'Official website',
 
       'login.hint': 'Secure access verification',
       'login.placeholder': 'Enter admin password',
