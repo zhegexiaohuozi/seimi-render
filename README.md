@@ -16,6 +16,7 @@
 - **内置 Web 管理后台**：监控大盘、渲染测试台、cookie 管理、接口文档、Agent 配置一键复制
 - **搜索引擎结果结构化提取**：百度/必应/Google 搜索结果去广告结构化，直接返回 JSON
 - **运行时监控指标**：成功率、延迟分位数（p50/p90/p99）、吞吐、域名分布，适合运维大盘
+- **请求异常明细日志**：所有失败 / 反爬拦截（含重试后成功）/ 入口拒绝（SSRF、过载）逐条落盘为 JSONL（`data/anomalies/`，按天轮转），携带失败阶段、分段耗时、队列负载、代理状态等根因上下文，配合 `metrics.json` 聚合可做站点成功率归因与优化决策（详见 [请求异常日志](#请求异常日志anomalies)）
 - **网络录制与 HAR 导出**：开启 `--remote-debugging-port` 后，渲染时带 `record_network=true` 即可录制页面加载全过程（请求/响应/headers/响应体/timing，类似 Chrome F12 Network），产出标准 HAR 1.2 文件，可直接导入 Chrome DevTools / Charles / haralyzer 分析。可以极大的提高自动化信息挖掘效率。
 - **多种渲染输出**：html、markdown、pdf、png/jpg、搜索结果json结构化。
 - **无头运行**：默认 offscreen 平台，无需显示器,不会干扰本地浏览器操作，本地操作也不会干扰浏览结果获取。
@@ -133,7 +134,7 @@ curl -X POST http://localhost:8088/render \
 | `--no-warmup` | 关闭（warmup 开启） | 关闭启动 Google 会话预热。默认开启：进程启动时先以隐藏 page 加载一次 `--warmup-url`（默认 https://www.google.com/）拿到 NID/CONSENT 等会话 cookie，**再**启动 dispatch 定时器接业务请求——冷启动零 cookie 直打搜索是 Google 风控的最高危窗口，预热能显著降低首条搜索的 sorry 概率 |
 | `--warmup-url <url>` | `https://www.google.com/` | 会话预热目标 URL（必须 http/https）。仅在 warmup 开启时使用；一般无需改，特殊环境（如走代理时 google.com 不通）可换成能稳定返回 google 域 cookie 的镜像。warmup 自带失败自适应：连续 3 次预热失败（约 90min，Google 不可达）会自动暂停 30min 周期、改用 5min 低频探活；探活成功立即恢复正常周期。状态变化在服务日志里以 `[warmup] SUSPENDED` / `[warmup] RESUMED` 标记 |
 | `--remote-debugging-port <n>` | —（关闭） | 开启 Chromium 远程调试端口，启用 **HAR 网络录制**能力（详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network)）。开启后 stealth 的 `AutomationControlled` 标记会被自动跳过（调试模式与反爬互斥），并显著打印警告。**生产环境请勿对外暴露此端口**——它授予完整的浏览器控制权 |
-| `--data-dir <path>` | `<binary_dir>/data` | 持久化目录（`cookies.dat` 加密 cookie / `seimi.key` 机器绑定盐 / `metrics.json` 累计指标）。容器化或只读部署（二进制目录不可写）时需显式指定到可写卷 |
+| `--data-dir <path>` | `<binary_dir>/data` | 持久化目录（`cookies.dat` 加密 cookie / `seimi.key` 机器绑定盐 / `metrics.json` 累计指标 / `anomalies/anomaly-YYYYMMDD.jsonl` 请求异常明细日志）。容器化或只读部署（二进制目录不可写）时需显式指定到可写卷 |
 | `--help` | — | 显示帮助信息 |
 
 ### 并发与吞吐（`--concurrency`）
@@ -452,6 +453,39 @@ sequenceDiagram
     H->>Q: snapshot(id)（拷出结果）
     H-->>C: 200 {state:succeeded, html:"...",<br/>serp_json:{results:[...], meta:{ads_filtered:N}}}
     Note over C: JS 缺失/异常时静默降级：<br/>无 serp_json 字段，仅返回 html
+```
+
+## 请求异常日志（anomalies）
+
+每次「请求级异常」都会逐条追加到 `<data-dir>/anomalies/anomaly-YYYYMMDD.jsonl`（按本地日期轮转，自动清理 30 天前的旧文件，文件权限 0600——URL query 可能含凭据）。每行一个紧凑 JSON 对象，供离线统一分析异常根因、站点成功率归因与优化决策：
+
+| `kind` | 含义 |
+|---|---|
+| `failed` | 渲染终态失败：超时 / 网络不可达（Chromium 错误页）/ HTTP 4xx-5xx 小 body / 反爬拦截重试耗尽 / 截图失败等全部失败路径 |
+| `blocked_recovered` | 渲染期间命中反爬拦截页但退避重试后成功——风控压力信号（再严一步就该失败了），是「成功率下降前兆」 |
+| `rejected` | 入口直接拒绝、任务未建立：SSRF 拦截（`stage=ssrf_blocked`）/ 队列过载背压 503（`stage=overloaded`） |
+
+每条记录的关键字段：
+
+- 定位：`ts` / `ts_ms`（终态时刻）、`task_id`、`url`、`host`
+- 根因：`stage`（稳定分类标签，见下）、`error`（失败原因原文）、`blocked`、`block_attempts`（拦截页命中次数）
+- 归因上下文：`queue_wait_ms`（提交→开始渲染）/ `render_ms` / `total_ms` 分段耗时；`queue_pending` / `queue_running`（终态时队列负载，判断超时是否伴随堆积）；`proxy`（当时生效的代理摘要，不含凭据——区分「代理故障」vs「站点拦截」）；`settle_ms` / `outputs`（请求参数）；`version` / `commit`（构建版本，跨版本对比）
+- 超时失败的 `error` 自带阶段标注（如 `render timed out after 30000 ms (phase: load)`），加载期超时与采集期超时根因不同
+
+`stage` 取值：`antibot_blocked`（反爬拦截）、`net_unreachable`（DNS/连接/SSL 失败）、`load_error`（HTTP 4xx/5xx 或空 body）、`timeout`（超时）、`screenshot_failed`（截图管线失败）、`other`（未归类，看 `error` 原文）。
+
+与 `metrics.json`（全量成功/失败聚合，含域名分布）配合：按 `host` join 异常明细与聚合比率，即可回答「哪些站点成功率低、低在哪个阶段、是代理问题还是风控问题」，为下一阶段优化（调超时 / 加代理池 / 增并发 / 改进 stealth）提供数据依据。分析示例：
+
+```bash
+# 各站点失败原因分布（近 7 天）
+ls data/anomalies/anomaly-*.jsonl | tail -7 | xargs cat \
+  | python3 -c "
+import sys, json, collections
+c = collections.Counter()
+for line in sys.stdin:
+    r = json.loads(line)
+    if r['kind'] == 'failed': c[(r['host'], r['stage'])] += 1
+for (h, s), n in c.most_common(20): print(f'{n:6d}  {h:40s} {s}')"
 ```
 
 ## 网络录制与 HAR 导出（`record_network`）

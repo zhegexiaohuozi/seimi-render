@@ -79,6 +79,9 @@ private:
 
     int m_retryCount{0};             // 当前任务已重试次数
     int m_sorryHits{0};              // 当前任务累计 sorry 检测次数（写回 task->blockAttempts）
+    // 当前任务所处渲染阶段（load/settle/collect/screenshot）：超时失败时附进错误信息，
+    // 供异常日志按阶段归因（超时在加载期 vs 采集期，根因与解法完全不同）。
+    const char* m_phase{"load"};
     void destroyPage();         // 销毁当前 page 并复位状态
 
     // —— markdown Readability 正文提取（可选算法）——

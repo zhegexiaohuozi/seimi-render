@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "AnomalyLog.h"
 #include "Metrics.h"
 #include "RenderTask.h"
 
@@ -28,7 +29,9 @@ using RenderTaskPtr = QSharedPointer<RenderTask>;
 class RenderQueue {
 public:
     // dataDir 为指标持久化目录（二进制同级 data/）；空则禁用指标持久化（纯内存）。
-    explicit RenderQueue(const QString& dataDir = QString()) : m_metrics(dataDir) {}
+    // AnomalyLog 与 Metrics 同目录（dataDir/anomalies/）。
+    explicit RenderQueue(const QString& dataDir = QString())
+        : m_metrics(dataDir), m_anomaly(dataDir) {}
     ~RenderQueue() = default;
 
     RenderQueue(const RenderQueue&) = delete;
@@ -122,6 +125,11 @@ public:
     Metrics& metrics() { return m_metrics; }
     const Metrics& metrics() const { return m_metrics; }
 
+    // 请求异常记录日志（失败/拦截恢复/入口拒绝逐条 JSONL 落盘，data 目录）。
+    // 线程安全；HTTP/WS 入口用它记录 SSRF 拦截，RenderPool 用它刷新代理摘要。
+    AnomalyLog& anomalyLog() { return m_anomaly; }
+    const AnomalyLog& anomalyLog() const { return m_anomaly; }
+
 private:
     // 设置终态的通用实现（成功/失败共用）。
     void setTerminal(const QString& id,
@@ -152,6 +160,7 @@ private:
     std::atomic<bool> m_stopped{false};
 
     Metrics m_metrics;                                // 累计运行时指标
+    AnomalyLog m_anomaly;                             // 请求异常记录日志（同 dataDir）
 };
 
 } // namespace seimi

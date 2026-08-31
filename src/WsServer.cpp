@@ -154,6 +154,9 @@ void WsServer::handleRender(QWebSocket* sock, const QJsonObject& obj) {
     // SSRF 防护，与 HTTP /render 保持一致：拒绝内网/回环/链路本地/元数据地址。
     std::string ssrfReason = urlSsrfCheck(qurl);
     if (!ssrfReason.empty()) {
+        // 入口拒绝也是请求异常：记入异常日志（与 HTTP /render 路径同构）。
+        m_queue->anomalyLog().recordRejected(
+            url, QStringLiteral("ssrf_blocked"), QString::fromStdString(ssrfReason));
         sendJson(sock, {{QStringLiteral("event"), QStringLiteral("error")},
                         {QStringLiteral("message"),
                          QStringLiteral("url blocked by SSRF guard: ")

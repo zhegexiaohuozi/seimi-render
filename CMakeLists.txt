@@ -275,6 +275,8 @@ add_executable(seimi-render
     src/RenderQueue.cpp
     src/Metrics.h
     src/Metrics.cpp
+    src/AnomalyLog.h
+    src/AnomalyLog.cpp
     src/Environment.h
     src/Environment.cpp
     src/CookieStore.h

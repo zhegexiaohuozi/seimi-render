@@ -63,6 +63,12 @@ QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs
 
     // 过载背压：任务表已满（洪泛提交/积压未消化），拒绝新提交。调用方据此回 503。
     if (static_cast<int>(m_tasks.size()) >= kMaxLiveTasks) {
+        locker.unlock();
+        // 过载拒绝是请求级异常（容量不足信号）：记入异常日志供成功率/容量分析。
+        // 释锁后写，不与队列锁嵌套（AnomalyLog 自带锁，与 Metrics 同构）。
+        m_anomaly.recordRejected(url, QStringLiteral("overloaded"),
+                                 QStringLiteral("task table full (kMaxLiveTasks=%1)")
+                                     .arg(kMaxLiveTasks));
         return {};
     }
 
@@ -145,7 +151,8 @@ void RenderQueue::setTerminal(const QString& id,
                               TaskState state,
                               const std::function<void(RenderTask&)>& fill,
                               qint64 nowMsec) {
-    // 锁内做终态变更 + 取记录所需字段，释锁后记 Metrics（Metrics 自带锁，避免与渲染队列锁嵌套）。
+    // 锁内做终态变更 + 取记录所需字段，释锁后记 Metrics / AnomalyLog
+    //（两者自带锁，避免与渲染队列锁嵌套）。
     std::string host;
     bool succeeded = false;
     qint64 elapsedMs = 0;
@@ -153,6 +160,11 @@ void RenderQueue::setTerminal(const QString& id,
     bool shouldRecord = false;
     int blockAttempts = 0;
     bool blockedFinal = false;
+    // 异常日志（AnomalyLog）补充字段：失败、或成功但期间命中过反爬拦截页（风控压力信号）。
+    bool anomalyWorthy = false;
+    QString anomalyTaskId, anomalyUrl, anomalyError;
+    qint64 anomalyCreated = 0, anomalyStarted = 0;
+    int anomalySettleMs = 0, queuePending = 0, queueRunning = 0;
     {
         QMutexLocker locker(&m_mutex);
         auto it = m_tasks.find(id);
@@ -197,6 +209,22 @@ void RenderQueue::setTerminal(const QString& id,
                      task->error.isEmpty() ? "(unknown)" : task->error.toUtf8().constData());
         }
 
+        // 异常日志采集：此时本任务 state 已是终态，循环统计的是「其余任务」的负载快照
+        //（诊断超时是否伴随队列堆积 / 打满并发）。
+        if (!succeeded || blockAttempts > 0) {
+            anomalyWorthy = true;
+            anomalyTaskId = task->id;
+            anomalyUrl = task->url;
+            anomalyError = task->error;
+            anomalySettleMs = task->settleDelayMsec;
+            anomalyCreated = task->createdAtMsec;
+            anomalyStarted = task->startedAtMsec;
+            for (const auto& t : m_tasks) {
+                if (t->state == TaskState::Pending) ++queuePending;
+                else if (t->state == TaskState::Running) ++queueRunning;
+            }
+        }
+
         // 借终态变更淘汰过期/超量旧终态任务（刚完成的任务不会被淘汰，WS/长轮询回取安全）。
         sweepTerminalLocked(nowMsec);
 
@@ -206,6 +234,23 @@ void RenderQueue::setTerminal(const QString& id,
 
     if (shouldRecord) {
         m_metrics.record(std::move(host), succeeded, elapsedMs, outputs, blockAttempts, blockedFinal);
+    }
+    if (shouldRecord && anomalyWorthy) {
+        AnomalyLog::RenderRecord ar;
+        ar.succeeded = succeeded;
+        ar.taskId = anomalyTaskId;
+        ar.url = anomalyUrl;
+        ar.error = anomalyError;
+        ar.blocked = blockedFinal;
+        ar.blockAttempts = blockAttempts;
+        ar.settleMs = anomalySettleMs;
+        ar.outputs = outputs;
+        ar.createdAtMsec = anomalyCreated;
+        ar.startedAtMsec = anomalyStarted;
+        ar.finishedAtMsec = nowMsec;
+        ar.queuePending = queuePending;
+        ar.queueRunning = queueRunning;
+        m_anomaly.recordRender(ar);
     }
 }
 

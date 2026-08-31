@@ -35,6 +35,21 @@ namespace seimi {
 
 static qint64 nowMsec() { return QDateTime::currentMSecsSinceEpoch(); }
 
+// 代理摘要（"direct" / "http://host:port" / "socks5://host:port"，不含凭据）：
+// 注入 AnomalyLog 作异常记录上下文——失败根因常需区分「代理故障」vs「站点拦截/不可达」。
+static QString proxySummaryOf(const ProxySpec& s) {
+    switch (s.type) {
+        case ProxySpec::Type::Http:
+            return QStringLiteral("http://%1:%2").arg(
+                QString::fromStdString(s.host)).arg(s.port);
+        case ProxySpec::Type::Socks5:
+            return QStringLiteral("socks5://%1:%2").arg(
+                QString::fromStdString(s.host)).arg(s.port);
+        default:
+            return QStringLiteral("direct");
+    }
+}
+
 // 把不可信字符串净化为单行日志安全形式：C0 控制符（含 CR/LF）替换为空格，防日志伪造
 //（攻击者在 URL 里塞 \r\n 制造假日志行，规避 SIEM / 误导运维排查）。仅用于日志输出，
 // 不影响回传给客户端的内容（客户端内容走 JSON esc）。
@@ -100,6 +115,7 @@ void RenderWorker::assign(RenderTaskPtr task) {
 // 每任务/每尝试一个全新 view（持有 page）。用 view 而非裸 page 是为了 QWidget::grab() 截图
 //（QWebEnginePage 在 Qt6 无 grabToImage）。
 void RenderWorker::startAttempt() {
+    m_phase = "load";
     m_view = new QWebEngineView(m_profile, nullptr);
     // 视口尺寸：stealth 开启时统一 1920×1080（与 screen 指纹一致），否则 1280×2000。
     if (s_stealthViewport) {
@@ -172,6 +188,7 @@ void RenderWorker::onLoadFinished(bool ok) {
                 int bodyLen = v.toInt();
                 static constexpr int kMinViableBodyLen = 512;
                 if (bodyLen >= kMinViableBodyLen) {
+                    m_phase = "settle";
                     m_settleTimer.start(m_task->settleDelayMsec);
                 } else {
                     finishFailure(QStringLiteral(
@@ -181,17 +198,23 @@ void RenderWorker::onLoadFinished(bool ok) {
             });
         return;
     }
+    m_phase = "settle";
     m_settleTimer.start(m_task->settleDelayMsec);
 }
 
 void RenderWorker::onLoadTimeout() {
     if (!m_busy || !m_task) return;
-    finishFailure(QStringLiteral("render timed out after %1 ms").arg(m_loadTimeoutMsec));
+    // 附带超时时刻所处阶段：加载期超时（网络/代理/站点挂起）与采集期超时
+    //（巨型页 toHtml/截图）根因不同，异常日志据此归因。
+    finishFailure(QStringLiteral("render timed out after %1 ms (phase: %2)")
+                      .arg(m_loadTimeoutMsec)
+                      .arg(QLatin1String(m_phase)));
 }
 
 void RenderWorker::onSettleElapsed() {
     if (!m_busy || !m_task || !m_page) return;
     if (m_collectStarted) return;
+    m_phase = "collect";
     // 激活懒加载图片：很多新闻/SPA 站用 lazy-loading，图片只在滚动进视口时加载。
     // 注入 JS 把常见 lazy 属性拷回 src 并滚动触发，回调里再 collect。
     activateLazyImagesAndScroll();
@@ -666,6 +689,7 @@ void RenderWorker::destroyPage() {
 // 触发截图流程：先用 JS 取页面真实尺寸（宽 + 全文档高），再按高度分流。
 void RenderWorker::captureScreenshot() {
     if (!m_busy || !m_task || !m_view || !m_page) { decCollect(); return; }
+    m_phase = "screenshot";
     // 取视口宽（clientWidth）、完整文档高度（scrollHeight），并统计 img 像素占比。
     // 后者用于 ImageFormat::Auto 的智能选择：图片密集页用 JPEG（体积小），
     // 文字页用 PNG（无损）。用 documentElement 兼容标准/怪异模式。
@@ -941,8 +965,11 @@ void RenderPool::start() {
         m_proxyApplyTimer.setInterval(500);
         connect(&m_proxyApplyTimer, &QTimer::timeout, this, [this]() {
             m_proxyConfig->apply();
+            // 同步代理摘要到异常日志（500ms 周期，与实际生效代理秒级对齐）。
+            m_queue->anomalyLog().setProxySummary(proxySummaryOf(m_proxyConfig->snapshot()));
         });
         m_proxyConfig->apply();  // 启动时立即 apply（让 --proxy 初始代理生效）
+        m_queue->anomalyLog().setProxySummary(proxySummaryOf(m_proxyConfig->snapshot()));
         m_proxyApplyTimer.start();
     }
 
