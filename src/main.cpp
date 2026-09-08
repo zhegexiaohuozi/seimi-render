@@ -108,6 +108,7 @@ struct Config {
     std::string adminPassword;    // --password / --password-file / SEIMI_PASSWORD（空=不启用密码保护）
     std::string passwordFile;     // --password-file <path>：从文件读首行作密码（避免进 ps 命令行）
     bool adminEnabled = true;     // --no-admin：关闭内置管理界面
+    bool ssrfGuardEnabled = true; // --no-ssrf：关闭 SSRF 防护（本机自用 Agent 场景，允许访问内网/回环目标）
     std::string trustedProxies;   // --trusted-proxy <list>：可信反代网段（精确 IP 或 CIDR，逗号分隔），
                                    // 非空时 /api/login 按 X-Forwarded-For 还原真实客户端 IP 限流。
     // 网络代理：经 QNetworkProxy::setApplicationProxy 运行时动态配置（见 ProxyConfig）。
@@ -141,6 +142,10 @@ static void printUsage() {
         "                        Password precedence: --password > --password-file > SEIMI_PASSWORD.\n"
         "                        Empty (none given) = no password, open access.\n"
         "  --no-admin            disable built-in admin UI (default: enabled at GET /)\n"
+        "  --no-ssrf             disable SSRF guard: allow rendering internal/loopback/\n"
+        "                        link-local/metadata URLs. For LOCAL personal-agent use only\n"
+        "                        (you trust the caller with your entire network). Default:\n"
+        "                        guard ON. Never combine with a public --host.\n"
         "  --trusted-proxy <list> comma-separated trusted reverse-proxy IPs/CIDRs\n"
         "                        (e.g. 10.8.0.0/16,127.0.0.1). When set, /api/login rate-\n"
         "                        limits by the real client IP extracted from X-Forwarded-For;\n"
@@ -256,6 +261,7 @@ static Config parseArgs(int argc, char** argv) {
         else if (a == "--password" && i + 1 < argc) c.adminPassword = argv[++i];
         else if (a == "--password-file" && i + 1 < argc) c.passwordFile = argv[++i];
         else if (a == "--no-admin")   c.adminEnabled = false;
+        else if (a == "--no-ssrf")    c.ssrfGuardEnabled = false;
         else if (a == "--trusted-proxy" && i + 1 < argc) c.trustedProxies = argv[++i];
         else if (a == "--proxy" && i + 1 < argc) c.initialProxy = parseProxyUrl(argv[++i]);
         else if (a == "--no-stealth") c.stealthEnabled = false;
@@ -460,6 +466,7 @@ int main(int argc, char** argv) {
     pool.setCookieStore(&cookies);
     pool.setProxyConfig(&proxyConfig);
     pool.setStealthEnabled(cfg.stealthEnabled);
+    pool.setSsrfGuardEnabled(cfg.ssrfGuardEnabled);
     pool.setWarmupEnabled(cfg.warmupEnabled);
     pool.setWarmupUrl(QString::fromStdString(cfg.warmupUrl));
     if (harRecorder) pool.setHarRecorder(harRecorder);
@@ -467,6 +474,7 @@ int main(int argc, char** argv) {
     // WebSocket 服务（GUI 线程）：支持 render 请求与 subscribe 订阅。
     // 启用密码时传入同一确定性 token，WS 端口同样受保护（见 WsServer 鉴权）。
     WsServer ws(&queue, cfg.settleDefaultMs, HttpServer::computeToken(cfg.adminPassword), &app);
+    ws.setSsrfGuardEnabled(cfg.ssrfGuardEnabled);
     // WS 必须与 HTTP 绑同一 --host：默认 127.0.0.1 时只听本机，避免在所有网卡上
     // 暴露无密码的渲染/SSRF 入口。"localhost" 不是合法地址字面量，单独映射到回环。
     QHostAddress wsAddr;
@@ -517,6 +525,7 @@ int main(int argc, char** argv) {
     HttpServer http(&queue, &cookies, cfg.settleDefaultMs,
                     adminUi, cfg.adminPassword, &app);
     http.setEnvironment(&env);
+    http.setSsrfGuardEnabled(cfg.ssrfGuardEnabled);
     // 可信反代网段：非空时 /api/login 按 X-Forwarded-For 还原真实 IP 限流（反代部署用）。
     if (!cfg.trustedProxies.empty()) {
         http.setTrustedProxies(cfg.trustedProxies);
@@ -595,6 +604,10 @@ int main(int argc, char** argv) {
             "  Proxy     : %s%s\n", typeName,
             cur.type == ProxySpec::Type::Direct ? " (direct connection)" : "");
     }
+    // SSRF 防护状态提示（默认启用，--no-ssrf 关闭时显眼标注）。
+    if (!cfg.ssrfGuardEnabled) {
+        std::fprintf(stdout, "  SSRF guard : DISABLED (--no-ssrf)\n");
+    }
     // 构建版本信息（编译期由 CMake 注入；缺省值兼容项目 CMake 之外的手动编译）。
     //   Version    : 统一版本号（唯一可信源 = CMakeLists.txt 顶部 project(VERSION)，迭代时改那一处）
     //   Build time : 构建时刻（configure-time，UTC+8 东八区）
@@ -616,6 +629,20 @@ int main(int argc, char** argv) {
         "  Build time: %s\n"
         "  Git commit: %s (%s)\n",
         SEIMI_VERSION, SEIMI_BUILD_TIME, SEIMI_GIT_COMMIT, SEIMI_GIT_DIRTY);
+    // --no-ssrf：关闭 SSRF 防护是高危配置，给显著警告（尤其叠加对外暴露时）。
+    if (!cfg.ssrfGuardEnabled) {
+        std::fprintf(stderr,
+            "WARNING: SSRF guard disabled (--no-ssrf) — renders can reach internal,\n"
+            "         loopback, and cloud-metadata endpoints. Intended ONLY for trusted\n"
+            "         local agents; combine with a password even on localhost.\n");
+        if (cfg.host != "127.0.0.1" && cfg.host != "localhost") {
+            std::fprintf(stderr,
+                "DANGER : --no-ssrf combined with --host %s (non-loopback) exposes your\n"
+                "         entire internal network to anyone who can reach this port.\n"
+                "         Add --password / --password-file / SEIMI_PASSWORD immediately.\n",
+                cfg.host.c_str());
+        }
+    }
     // 对外暴露且无密码时给显著警告（防误开放匿名 SSRF/cookie 入口）。
     if ((cfg.host != "127.0.0.1" && cfg.host != "localhost") && cfg.adminPassword.empty()) {
         std::fprintf(stderr,

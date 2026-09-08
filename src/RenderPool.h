@@ -220,6 +220,11 @@ public:
     void setWarmupEnabled(bool enabled) { m_warmupEnabled = enabled; }
     void setWarmupUrl(const QString& url) { m_warmupUrl = url; }
 
+    // SSRF 请求层拦截开关（--no-ssrf）：关闭后拦截器不再 block 私网/回环目标，
+    // 但 stealth 头注入 / HAR 观测 / 方案白名单照常。默认开启。必须在 start() 前调用
+    //（拦截器在 start() 里创建）。入口层（UrlGuard）由 HttpServer/WsServer 各自同步关闭。
+    void setSsrfGuardEnabled(bool enabled) { m_ssrfGuardEnabled = enabled; }
+
 signals:
     // 透传每个 worker 的任务完成事件。
     void taskFinished(const QString& id);
@@ -246,6 +251,7 @@ private:
     ProxyConfig* m_proxyConfig = nullptr;
     HarRecorder* m_harRecorder = nullptr;
     bool m_stealthEnabled = true;  // 浏览器指纹统一（默认开启，--no-stealth 关闭）
+    bool m_ssrfGuardEnabled = true;  // SSRF 请求层拦截（默认开启，--no-ssrf 关闭）
     // SSRF 二次防护：装到共享 profile 上，对 Chromium 实际发起的每个请求再判一次，
     // 堵住重定向 / DNS rebinding / 内嵌子框架等提交时校验无法覆盖的旁路（见 SsrfInterceptor.h）。
     SsrfRequestInterceptor* m_ssrfInterceptor = nullptr;

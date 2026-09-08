@@ -49,6 +49,10 @@ public:
 
     quint16 serverPort() const;
 
+    // SSRF 入口防护开关（--no-ssrf）：关闭后 render 不再做 UrlGuard 校验，允许渲染
+    // 内网/回环/元数据目标（本机自用 Agent 场景）。默认开启。与 HttpServer 同步设置。
+    void setSsrfGuardEnabled(bool enabled) { m_ssrfGuardEnabled = enabled; }
+
 public slots:
     // 主线程收到 RenderPool::taskFinished 时调用，向所有订阅者推送 finished。
     void notifyFinished(const QString& taskId, const QString& state, bool blocked = false);
@@ -72,6 +76,7 @@ private:
     RenderQueue* m_queue;
     int m_settleDefaultMs;
     std::string m_authToken;        // 空=不启用鉴权
+    bool m_ssrfGuardEnabled = true; // SSRF 入口防护（默认开启，--no-ssrf 关闭）
     // 已通过鉴权的 socket 集合（启用密码时用）。未启用密码时不查此集合。
     QSet<QWebSocket*> m_authorized;
 

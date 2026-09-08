@@ -855,16 +855,19 @@ void HttpServer::registerRoutes() {
             return;
         }
         // SSRF 防护：拒绝指向内网/回环/链路本地/元数据地址的目标。
-        std::string ssrfReason = urlSsrfCheck(qurl);
-        if (!ssrfReason.empty()) {
-            // 入口拒绝也是请求异常（客户端视角即失败）：记入异常日志，供统一分析。
-            m_queue->anomalyLog().recordRejected(
-                url, QStringLiteral("ssrf_blocked"), QString::fromStdString(ssrfReason));
-            res.status = 400;
-            std::string body = R"({"error":"url blocked by SSRF guard","detail":")"
-                             + escJson(ssrfReason) + R"("})";
-            res.set_content(body, "application/json; charset=utf-8");
-            return;
+        // --no-ssrf 关闭（本机自用 Agent 场景，允许访问一切目标）。
+        if (m_ssrfGuardEnabled) {
+            std::string ssrfReason = urlSsrfCheck(qurl);
+            if (!ssrfReason.empty()) {
+                // 入口拒绝也是请求异常（客户端视角即失败）：记入异常日志，供统一分析。
+                m_queue->anomalyLog().recordRejected(
+                    url, QStringLiteral("ssrf_blocked"), QString::fromStdString(ssrfReason));
+                res.status = 400;
+                std::string body = R"({"error":"url blocked by SSRF guard","detail":")"
+                                 + escJson(ssrfReason) + R"("})";
+                res.set_content(body, "application/json; charset=utf-8");
+                return;
+            }
         }
 
         int settleMs = int(obj.value(QStringLiteral("settle_ms")).toInt(m_settleDefaultMs));

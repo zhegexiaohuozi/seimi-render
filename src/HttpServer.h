@@ -69,6 +69,10 @@ public:
     // 必须在 start() 前调用。
     void setHarStore(HarStore* store) { m_harStore = store; }
 
+    // SSRF 入口防护开关（--no-ssrf）：关闭后 /render 不再做 UrlGuard 校验，
+    // 允许渲染内网/回环/元数据目标（本机自用 Agent 场景）。默认开启。必须在 start() 前调用。
+    void setSsrfGuardEnabled(bool enabled) { m_ssrfGuardEnabled = enabled; }
+
 private:
     void registerRoutes();
 
@@ -117,6 +121,7 @@ private:
     Environment* m_env = nullptr;      // 可空；非空时 /status 附带 environment 段
     McpServer* m_mcp = nullptr;        // 可空；非空时 /status 附带 mcp session 健康段
     HarStore* m_harStore = nullptr;    // 可空；非空时启用 GET /har/<task_id>（网络录制产物）
+    bool m_ssrfGuardEnabled = true;    // SSRF 入口防护（默认开启，--no-ssrf 关闭）
     int m_settleDefaultMs;
     std::unique_ptr<httplib::Server> m_srv;
     std::atomic<bool> m_running{false};

@@ -49,9 +49,13 @@ class SsrfRequestInterceptor : public QWebEngineUrlRequestInterceptor {
 public:
     // stealthHeaders: 开启时对所有 http(s) 请求注入统一的指纹相关头
     //（Sec-CH-UA / Accept-Language 等），与 stealth.js 的 JS 指纹保持一致。
-    explicit SsrfRequestInterceptor(bool stealthHeaders = false, QObject* parent = nullptr)
+    // ssrfBlocking: 关闭（--no-ssrf，本机自用场景）时跳过私网/回环拦截判定，
+    // 但 stealth 头注入、HAR 观测兜底与方案白名单（拦 file/ftp 等）仍照常工作。
+    explicit SsrfRequestInterceptor(bool stealthHeaders = false, bool ssrfBlocking = true,
+                                    QObject* parent = nullptr)
         : QWebEngineUrlRequestInterceptor(parent)
-        , m_stealthHeaders(stealthHeaders) {}
+        , m_stealthHeaders(stealthHeaders)
+        , m_ssrfBlocking(ssrfBlocking) {}
 
     // HAR 录制兜底：设置后每个 http(s) 请求都会回调（跑在 IO 线程，回调内必须快且不阻塞）。
     // 回调方自行负责跨线程投递（如 QMetaObject::invokeMethod 到 GUI 线程）。
@@ -115,6 +119,10 @@ public:
             m_requestObserver(ri);
         }
 
+        // --no-ssrf：私网/回环拦截关闭（入口 URL 校验同层关闭），本机自用场景放行一切目标。
+        // 置于 HAR 观测之后——录制兜底不受开关影响。
+        if (!m_ssrfBlocking) return;
+
         const QString host = url.host().trimmed();
         if (host.isEmpty()) return;
 
@@ -148,6 +156,7 @@ public:
 
 private:
     bool m_stealthHeaders;
+    bool m_ssrfBlocking;                 // 私网/回环拦截开关（--no-ssrf 关闭）
     RequestObserver m_requestObserver;   // HAR 录制兜底回调（可选，默认空）
 };
 

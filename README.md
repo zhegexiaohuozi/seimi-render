@@ -128,6 +128,7 @@ curl -X POST http://localhost:8088/render \
 | `--password-file <f>` | — | 从文件第一行读取密码（推荐） |
 | `SEIMI_PASSWORD` 环境变量 | — | 从环境变量读取密码（推荐）。优先级：`--password` > `--password-file` > `SEIMI_PASSWORD`。不设 = 无密码、开放访问 |
 | `--no-admin` | 关闭（admin 开启） | 禁用内置管理界面；默认 `GET /` 提供管理控制台 |
+| `--no-ssrf` | 关闭（SSRF 防护开启） | 关闭 SSRF 防护：允许渲染内网/回环/链路本地/云元数据地址。**仅供本机自用 Agent 场景**（你完全信任调用方可触达整个内网）；入口校验与 Chromium 请求层拦截同步关闭。默认开启防护。切勿与对外 `--host` 组合使用（启动时会打 DANGER 警告） |
 | `--trusted-proxy <list>` | — | 逗号分隔的受信反向代理 IP/CIDR（如 `10.8.0.0/16,127.0.0.1`）。设置后 `/api/login` 限流基于从 `X-Forwarded-For` 提取的真实客户端 IP；未设置时使用 TCP 对端地址（忽略 XFF，防伪造） |
 | `--proxy <url>` | — | 所有 Chromium 流量的上游代理。格式 `http://[user:pass@]host:port` 或 `socks5://[user:pass@]host:port`。经 `QNetworkProxy::setApplicationProxy` 设置，支持运行时 `POST /proxy` 热切换无需重启。`type=direct` 清除 |
 | `--no-stealth` | 关闭（stealth 开启） | 禁用浏览器指纹统一。默认开启 stealth，将所有渲染实例伪装成同一 Chrome 桌面环境（UA/screen/WebGL/canvas），融入人群以绕过基础反爬（如 Google） |

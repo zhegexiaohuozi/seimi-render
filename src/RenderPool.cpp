@@ -899,7 +899,8 @@ void RenderPool::start() {
     // SSRF 二次防护：对 Chromium 实际发起的每个请求再判定一次，堵住重定向 /
     // DNS rebinding / 内嵌子框架等提交时校验（UrlGuard）无法覆盖的旁路。
     // stealth 开启时，interceptor 同时统一指纹相关 HTTP 头（Sec-CH-UA 等）。
-    m_ssrfInterceptor = new SsrfRequestInterceptor(m_stealthEnabled, m_profile);
+    // --no-ssrf 关闭的只是私网拦截段：stealth 头注入 / HAR 观测 / 方案白名单仍生效。
+    m_ssrfInterceptor = new SsrfRequestInterceptor(m_stealthEnabled, m_ssrfGuardEnabled, m_profile);
     m_profile->setUrlRequestInterceptor(m_ssrfInterceptor);
 
     // HAR 录制：把拦截器的请求观测回调接到录制中枢（作为 CDP 漏事件时的请求侧兜底）。
