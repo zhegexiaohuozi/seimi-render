@@ -836,8 +836,10 @@ bool McpServer::start(const std::string& host, int port,
             "server's proxy/bypass settings, so authenticated internal APIs (e.g. "
             "Jira /rest/api/2/search) work out of the box. PREFER THIS over render_url "
             "when the target is an API/JSON endpoint; use render_url when you need "
-            "JS execution or rendered page content. A JSON body of \"{}\" or an HTML "
-            "login page usually means the session expired (see render_url auth_wall).")
+            "JS execution or rendered page content. HTTP 401/403 statuses are passed "
+            "through verbatim (NOT transport errors) — the clearest signal that the "
+            "saved session expired: ask the user to re-sync cookies and retry. A JSON "
+            "body of \"{}\" or an HTML login page usually means the same.")
         .with_string_param("url", "The http(s) URL to fetch")
         .with_string_param("method",
             "HTTP method: GET (default), POST, PUT, PATCH, DELETE or HEAD", false)
@@ -915,10 +917,28 @@ bool McpServer::start(const std::string& host, int port,
                 std::string text = "[fetch status=" + std::to_string(statusCode);
                 if (!finalUrl.empty() && finalUrl != url) text += " final_url=" + finalUrl;
                 text += " cookies=" + std::to_string(cookiesApplied);
+                // 会话自愈可见性：服务端轮换的新 cookie 已回流 store（>0 表示登录态被续租）。
+                if (j.value("cookies_updated", 0) > 0) {
+                    text += " cookies_updated=" + std::to_string(j.value("cookies_updated", 0));
+                }
+                // 登录墙标记（backlog #10）：登录重定向伪装 200 时服务端已标 auth_wall，
+                // MCP 侧给 agent 醒目提示与修复动作（与 render_url 同款文案）。
+                if (j.value("auth_wall", false)) {
+                    text += " AUTH_WALL=true";
+                }
+                if (j.contains("warning")) {
+                    text += " warning=\"" + j.value("warning", std::string()) + "\"";
+                }
                 if (!savedPath.empty()) {
                     // file 模式：内容已落盘，只回元信息。
                     text += " saved=" + savedPath + " bytes="
                             + std::to_string(j.value("bytes", 0)) + "]\n";
+                    if (j.value("auth_wall", false)) {
+                        text += "\n[AUTH WALL DETECTED: the \"file\" is actually a login/"
+                                "permission page — the saved session has likely expired. "
+                                "Ask the user to re-sync cookies (browser extension or "
+                                "POST /cookies) and retry.]\n";
+                    }
                     return toTextContent(text);
                 }
                 if (!bodyB64.empty()) {
@@ -926,10 +946,31 @@ bool McpServer::start(const std::string& host, int port,
                     text += " encoding=base64 bytes="
                             + std::to_string(j.value("body_bytes", bodyB64.size()))
                             + "]\n\n" + bodyB64;
+                    if (j.value("auth_wall", false)) {
+                        text += "\n\n[AUTH WALL DETECTED: this base64 payload is a login/"
+                                "permission page, not the requested file — the saved session "
+                                "has likely expired. Ask the user to re-sync cookies and retry.]";
+                    }
                     return toTextContent(text);
                 }
                 text += "]\n\n";
                 text += respBody.empty() ? "(empty body)" : respBody;
+                if (j.value("auth_wall", false)) {
+                    text += "\n\n[AUTH WALL DETECTED: the response is a login/permission "
+                            "page (auth_wall_reason: "
+                            + j.value("auth_wall_reason", std::string())
+                            + ") — the saved session has likely expired. "
+                              "Ask the user to re-sync cookies (browser extension or "
+                              "POST /cookies) and retry.]";
+                } else if (statusCode == 401 || statusCode == 403) {
+                    // 登录态失效的可判读信号：目标 API 拒绝了携带的会话（Jira session
+                    // 过期即 401）。指明修复动作，agent 提示用户重新同步 cookie 即可。
+                    text += "\n\n[AUTH REJECTED: the target returned HTTP "
+                            + std::to_string(statusCode)
+                            + " — the saved session has likely expired. "
+                              "Ask the user to re-sync cookies (browser extension or "
+                              "POST /cookies) and retry.]";
+                }
                 if (truncated) text += "\n\n[body truncated at 10MB]";
                 return toTextContent(text);
             } catch (...) {

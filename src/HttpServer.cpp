@@ -4,6 +4,7 @@
 #include "HttpServer.h"
 
 #include "CookieStore.h"
+#include "AuthWall.h"
 #include "Environment.h"
 #include "FetchService.h"
 #include "HarStore.h"
@@ -24,6 +25,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QNetworkCookie>
+#include <QSet>
 #include <QUrl>
 
 #include <cerrno>
@@ -1120,12 +1122,23 @@ void HttpServer::registerRoutes() {
                  url.left(160).toUtf8().constData(), method.toUtf8().constData(), fr.statusCode,
                  static_cast<size_t>(fr.body.size()), elapsedMs, responseFormat.toUtf8().constData());
 
+        // —— Set-Cookie 回写（backlog #11）：服务端轮换的新会话标识回流 CookieStore，
+        // 快照变活会话（用进废退保活）；渲染管线经 applyTo 同步受益（消双会话分叉）。
+        // 仅在拿到 HTTP 响应时执行；同源规则由 recordFromSetCookie 强制。
+        int cookiesUpdated = 0;
+        if (m_cookies && fr.ok && fr.statusCode > 0) {
+            cookiesUpdated = m_cookies->recordFromSetCookie(
+                QUrl(fr.finalUrl).host(), fr.responseHeaders);
+        }
+
         std::string out = "{\"url\":\"" + esc(url) +
                           "\",\"final_url\":\"" + esc(fr.finalUrl) +
                           "\",\"status_code\":" + std::to_string(fr.statusCode) +
                           ",\"elapsed_ms\":" + std::to_string(elapsedMs) +
-                          ",\"cookies_applied\":" + std::to_string(cookiesApplied);
+                          ",\"cookies_applied\":" + std::to_string(cookiesApplied) +
+                          ",\"cookies_updated\":" + std::to_string(cookiesUpdated);
         // 响应头：同名多值（如 Set-Cookie）逗号拼接。回显服务端会话 cookie 有泄漏面，跳过。
+        QString contentType;
         {
             std::string headersJson;
             QString lastKey;
@@ -1134,6 +1147,7 @@ void HttpServer::registerRoutes() {
                 if (key == QLatin1String("set-cookie")) continue;
                 const QString value = QString::fromUtf8(h.second);
                 if (value.isEmpty()) continue;
+                if (key == QLatin1String("content-type")) contentType = value.toLower();
                 if (key == lastKey && !headersJson.empty()) {
                     // 同名头追加（QNAM 按收到顺序平铺，同名相邻；极端乱序时退化为独立键，
                     // 后写覆盖——与旧行为一致，可接受）。
@@ -1145,6 +1159,47 @@ void HttpServer::registerRoutes() {
                 lastKey = key;
             }
             out += ",\"headers\":{" + headersJson + "}";
+        }
+
+        // —— 登录墙检测（backlog #10）：与渲染管线共用同一启发式（AuthWall.h）——
+        // 场景：会话/权限失效后目标 302 到 login.jsp?permissionViolation=true，最终
+        // HTTP 200 + 登录页 HTML——按旧约定这是"成功"，agent 只能靠猜。服务端显式
+        // 标记 auth_wall，把判读责任收回。
+        {
+            bool authWall = false;
+            QString authWallReason;
+            detectAuthWall(fr.finalUrl, &authWall, &authWallReason);
+            if (authWall) {
+                out += ",\"auth_wall\":true";
+                if (!authWallReason.isEmpty()) {
+                    out += ",\"auth_wall_reason\":\"" + esc(authWallReason) + "\"";
+                }
+            }
+            // content-type 交叉校验：URL 明明是二进制文件（带附件扩展名）却收到 text/html
+            // ——"伪装 200"的服务端指纹（登录页/错误页）。只提示不强制失败（404 页等合法
+            // html 响应也常见），但让下游嗅探多一个可靠依据。
+            QString warning;
+            if (contentType.startsWith(QLatin1String("text/html"))) {
+                const QString suffix = QUrl(qurl).path().section(QLatin1Char('.'), -1).toLower();
+                static const QSet<QString> kBinaryExt = {
+                    QStringLiteral("gz"), QStringLiteral("zip"), QStringLiteral("rar"),
+                    QStringLiteral("7z"), QStringLiteral("tar"), QStringLiteral("tgz"),
+                    QStringLiteral("bz2"), QStringLiteral("xz"), QStringLiteral("pdf"),
+                    QStringLiteral("exe"), QStringLiteral("dmg"), QStringLiteral("pkg"),
+                    QStringLiteral("bin"), QStringLiteral("iso"), QStringLiteral("apk"),
+                    QStringLiteral("xlsx"), QStringLiteral("docx"), QStringLiteral("pptx"),
+                    QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"),
+                    QStringLiteral("gif"), QStringLiteral("webp"),
+                };
+                if (kBinaryExt.contains(suffix)) {
+                    warning = QStringLiteral(
+                        "requested '.*%1' but got text/html — likely a login/permission "
+                        "page rather than the file").arg(suffix);
+                }
+            }
+            if (!warning.isEmpty()) {
+                out += ",\"warning\":\"" + esc(warning) + "\"";
+            }
         }
 
         if (responseFormat == QStringLiteral("base64")) {

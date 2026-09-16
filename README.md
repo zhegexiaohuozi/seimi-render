@@ -337,7 +337,7 @@ curl -X POST http://localhost:8088/fetch \
 | `response_format` | `text` | 响应体输出模式：`text`（JSON 字符串内嵌，适合 JSON/HTML API；**二进制会经 UTF-8 有损转换，勿用于附件**，>10MB 截断标 `body_truncated`）/ `base64`（二进制安全，字段 `body_base64`+`body_bytes`，**超过 50MB 返回 413 明确拒绝**——base64 再撑大 1/3 对传输不友好，超大文件用 file）/ `file`（落盘到 `data-dir/fetch/`，返回 `saved_path`+`bytes`，适合大附件） |
 | `filename` | URL 末段 | 仅 `response_format=file` 时的落盘文件名；净化为 basename（仅字母数字 `._-`，防路径穿越），同名冲突自动加序号 |
 
-响应：`status_code` / `final_url`（重定向后）/ `headers`（对象，`set-cookie` 不回显）/ `body`（text 模式）或 `body_base64`+`body_bytes`（base64 模式）或 `saved_path`+`bytes`（file 模式）/ `cookies_applied`（自动携带的 cookie 数，session 是否健康的直观信号——为 0 通常意味着还没同步该域登录态）。默认 UA 与 stealth 统一指纹一致。失败（超时 504 / 网络错 502 / SSRF 400 / base64 超限 413）返回 `{"error":...,...}`。MCP 通道对应工具为 `fetch_url`（支持 `response_format` 透传）。
+响应：`status_code` / `final_url`（重定向后）/ `headers`（对象，`set-cookie` 不回显）/ `body`（text 模式）或 `body_base64`+`body_bytes`（base64 模式）或 `saved_path`+`bytes`（file 模式）/ `cookies_applied`（自动携带的 cookie 数，session 是否健康的直观信号——为 0 通常意味着还没同步该域登录态）/ `cookies_updated`（**Set-Cookie 回写条数**——服务端轮换的新会话标识自动回流 CookieStore，用得越多会话越新鲜，登录态快照变「活会话」；渲染管线经 applyTo 同步受益；>0 表示本次登录态被续租）/ `auth_wall`+`auth_wall_reason`（登录重定向伪装 200 的服务端标记）/ `warning`（请求带二进制扩展名却收到 text/html 时的交叉校验提示）。**HTTP 401/403 按状态码如实透出**（不是错误）——这是 session 过期最明确的信号（MCP `fetch_url` 会对 401/403 附 `AUTH REJECTED` 提示，指引用户重新同步 cookie），别把 401 当网络故障排查。默认 UA 与 stealth 统一指纹一致。失败（超时 504 / 网络错 502 / SSRF 400 / base64 超限 413）返回 `{"error":...,...}`。MCP 通道对应工具为 `fetch_url`（支持 `response_format` 透传）。
 
 > 判断拿到的是不是有效数据：REST API session 过期常返回 `200 + {}` 或登录页 HTML——结合 `cookies_applied` 与 `render_url` 的 `auth_wall` 字段判断，必要时先用插件重同步 cookie。
 

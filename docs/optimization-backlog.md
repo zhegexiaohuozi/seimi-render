@@ -7,6 +7,9 @@
 2026-09-14 补充：第二次真实会话（渲染单个内网 Jira 工单 CUXV5VR-11656，全程走 MCP 通道），
 新增条目 6-9。
 
+2026-09-16 补充：第三次真实会话（Jira 工单 CUXV5VR-10208 端到端分析，附件下载场景），
+新增条目 10（/fetch 登录重定向伪装 200，导致 agent 弃用 /fetch 改走浏览器 blob 下载）。
+
 > **2026-09-15 批量处置**：条目 1/2/3/5/6/7/9 已实现（v1.3.0，见文末「已完成」）；
 > 条目 4 此前已修复；条目 8 经决策**不做**（维持人工机制），原需求描述移入「已决策不做」。
 
@@ -60,7 +63,36 @@
 
 见文末「已完成」#9。
 
-## 2026-09-14 会话验证记录（能力侧，无需改代码）
+## 10. `/fetch` 登录重定向伪装 200：final_url 换域名不告警、无 auth_wall 检测（2026-09-16 实撞）—— ✅ 已完成
+
+见文末「已完成」#10/#11。
+
+- **场景**：Jira 单 CUXV5VR-10208 附件下载（`jira-fetch-attachment.sh` → `POST /fetch`
+  `response_format=base64`）。会话 cookie 过期后，`/secure/attachment/...` 的请求被 Jira
+  302 到 `login.jsp?permissionViolation=true`，**最终响应是登录页 HTML，HTTP 200**。
+- **后果链**：
+  1. `/fetch` 返回 `status_code: 200, cookies_applied: 5, body_base64: <登录页 HTML>`——
+     按当前约定这是"成功"，agent 无法从 status 区分附件与登录页；
+  2. wrapper 侧的登录页嗅探（`raw[:15].lstrip().startswith(b'<!DOCTYPE html>')`）被登录页
+     前部 8 个换行符绕过，登录页被当附件落盘（`file` 才发现全是 HTML）；
+  3. agent 判定"SeimiRender 登录态失效"，改走用户 Chrome blob 下载通道完成任务
+     ——/fetch 的既有能力（base64 二进制、大文件）本可胜任，本次被迫绕行。
+- **已排查的非因**：不是 401 误报（#1 增补已修，本次真是 200）；不是代理/网络；REST API
+  同一会话其余端点 200 正常，是附件路径的会话校验先失效（同域不同路径的登录态判定差异，
+  Jira `permissionViolation=true` 路径即指纹）。
+- **改进方向**（fetch 侧对齐条目 2 已有的渲染侧能力）：
+  1. **final_url 域名/路径漂移检测**：请求 URL 与 final_url 去参数比较，出现
+     `login/signin/sso/permissionViolation` 段（复用 auth_wall 启发式）时在响应中显式标记
+     `auth_wall: true` + 醒目 detail，MCP 侧附"请重新同步 cookie"指引——把判读责任从
+     agent/wrapper 收回到服务端；
+  2. **content-type 交叉校验提示**：请求二进制附件却收到 `text/html` 时打 WARN 字段
+     （不强制失败，但让"伪装 200"有服务端指纹）；
+  3. 顺带留档：**下游二进制嗅探不能只看前 15 字节**——登录页可携带前导空白，嗅探窗口
+     至少 512 字节 + content-type 双保险（已在 wrapper 侧修复验证）。
+- **验证素材**：`jira-analyzer/CUXV5VR-10208/downloads/` 会话（登录页样本 + Chrome 通道
+  对照 200 完整 gzip）；wrapper 修复 `jira-analyzer/skill/gwm-jira-analyzer/scripts/jira-fetch-attachment.sh`。
+
+
 
 - `exec_js` + 页面同源 `fetch()` 调 Jira REST API：结构化工单数据直出（key/status/assignee/
   labels/issuelinks/description），带登录态 cookie，零 HTML 反解——条目 1（fetch 模式）的临时
@@ -104,6 +136,11 @@
   专职 QThread + 长命 QNAM + 全异步回复状态机，httplib 线程仅经条件变量等待（等待上限
   = timeout + 15s 兜底）。回归验证：12 轮混合模式拉 5.6MB 二进制 + 6 路并发 base64
   字节级完整，进程存活。
+- **HTTP 401 误报修复**（2026-09-16 Jira 真实会话实撞）：session 过期时目标回 401，QNAM 将其置为
+  AuthenticationRequiredError，被误当传输失败抛 502 "Host requires authentication"——agent 把
+  「掉登录」误判成「服务/网络故障」。修复：401/407 归为「拿到 HTTP 响应」，`status_code` 如实
+  透出 + 响应体可读；MCP fetch_url 对 401/403 附 `AUTH REJECTED` 提示（指引用户重同步 cookie）。
+  回测 L10 覆盖（无效 github token 造稳定 401）。
 - **二进制输出**（用户提的改进建议，直接实现）：`response_format` 参数——`text`（默认，
   JSON 内嵌，二进制有损）、`base64`（二进制安全，`body_base64`+`body_bytes`，**>50MB 返回
   413 拒绝**并提示用 file）、`file`（落盘 `data-dir/fetch/`，返回 `saved_path`+`bytes`；
@@ -148,6 +185,26 @@ small）的 error 追加 `[proxy=... | resolved=... | hint: ...]`：fake-ip 段�
 **#9 MCP serverInfo.version**：根因是 `SEIMI_VERSION` 宏只注入 `seimi-render` 可执行目标、
 未注入 `seimi-mcp` 静态库（McpServer.cpp 编译进库时宏未定义走 "unknown" 兜底）。CMakeLists
 给 seimi-mcp 的 `target_compile_definitions` 补注入，一行修复。
+
+**#10 /fetch 登录墙检测 + 状态码透出**（2026-09-16）：登录重定向伪装 200 的判读责任收回服务端——
+- 抽共享 `AuthWall.h`（渲染与 fetch 同一份启发式，新增 Jira `permissionViolation` query 指纹），
+  /fetch 响应显式标 `auth_wall`/`auth_wall_reason`；请求带二进制扩展名（gz/zip/pdf…）却收到
+  text/html 时附 `warning` 字段（伪装 200 的服务端指纹）；MCP fetch_url 命中时附
+  `[AUTH WALL DETECTED ... re-sync cookies]` 指引（与 render_url 同款）。
+- 顺带修 **404 误报**：QNAM 对 4xx 置 error（ContentNotFoundError 等），曾被误抛 502——
+  统一为「有 HTTP 状态码即透出」（401 修复的推广），传输失败（DNS/连接/TLS/超时）才走 502/504。
+- 回测 L11（登录墙标记正反例）/L12（扩展名×content-type 交叉校验）覆盖。
+
+**#11 Set-Cookie 回写：登录态快照变活会话**（2026-09-16，"为啥 SeimiRender 的会过期而 Chrome 不会"的治本项）：
+/fetch 响应的 Set-Cookie 解析回流 CookieStore（`recordFromSetCookie`，含 Domain/Path/Expires/
+Max-Age/Secure/HttpOnly 属性解析；浏览器同款同源规则拒跨域投毒；过期删除语义经读取侧过滤自然
+生效），下次请求自动携带轮换新值——用进废退保活，渲染管线经 applyTo 同步受益（消双会话分叉）。
+响应新增 `cookies_updated` 观测字段。**三个实测坑留档**：
+1. QNAM 内置 cookieJar 会消费 Set-Cookie 头——必须 `setCookieJar(nullptr)`（CookieStore 唯一事实源）；
+2. Qt 把同名多值头合并为 `\n` 连接的单值——多条 Set-Cookie 必须按 `\n` 拆开独立解析，
+   否则后一条的 Domain 污染前一条（被同源规则整批误拒）；
+3. 公网站点按流量画像/UA 分流决定是否下发 cookie（bing 对回测多实例并发触发软风控回精简页、
+   gitee/baidu 对 Chrome UA 不发探针）——回写断言必须用本地受控服务（回测实例 E + L13）。
 
 **#4 cookie padding bug**：2026-09-11 已修复（removePadding + parseStore 返 bool + 原子写 +
 三条失败路径 qWarning），详见上方留档。

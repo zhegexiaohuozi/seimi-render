@@ -59,6 +59,11 @@ void FetchWorker::run(seimi::FetchRequest req, quint64 jobId) {
     // QNAM 必须在本线程创建且长命（跨线程 not allowed；每请求新建是崩溃根源之一）。
     if (!m_nam) {
         m_nam = new QNetworkAccessManager(this);
+        // 禁用内置 cookieJar：① 内置 jar 会消费响应的 Set-Cookie 头（rawHeaderPairs 里
+        // 拿不到原始值），/fetch 的回写（CookieStore::recordFromSetCookie）需要它原样保留；
+        // ② jar 会自动携带自己存的 cookie，与 CookieStore 手动注入的 Cookie 头打架。
+        // CookieStore 是唯一 cookie 事实源（2026-09-16 回写机制实测踩坑）。
+        m_nam->setCookieJar(nullptr);
         // bypass 模式：/fetch 专属 per-host 分流 factory（实例级，不动全局——全局注册会让
         // QtWebEngine 轮询推送覆盖 Chromium flag，见 ProxyConfig 类注释）。
         if (m_proxy && m_proxy->bypassEnabled()) {
@@ -95,18 +100,27 @@ void FetchWorker::run(seimi::FetchRequest req, quint64 jobId) {
     QObject::connect(timer, &QTimer::timeout, reply, &QNetworkReply::abort);
     QObject::connect(reply, &QNetworkReply::finished, this, [this, jobId, reply]() {
         FetchResult r;
-        const bool canceled = reply->error() == QNetworkReply::OperationCanceledError;
-        r.timedOut = canceled;
-        r.ok = reply->error() == QNetworkReply::NoError;
-        r.error = reply->errorString();
+        // QNAM 对 HTTP 4xx 会置 error（401 AuthenticationRequired / 403 ContentAccessDenied /
+        // 404 ContentNotFoundError…），但这本质是「拿到了 HTTP 响应」而非传输失败——
+        // 判据：HttpStatusCodeAttribute 有值即为 HTTP 层结果，如实按状态码透出（body 可读）。
+        // 真正的传输失败（DNS/连接拒绝/TLS/超时）不携带状态码。
+        // （真实场景教训：401 被误报 502 让 agent 把「掉登录」当网络故障排查，
+        // 2026-09-16 Jira 会话实撞；404 同理。）
+        const QNetworkReply::NetworkError e = reply->error();
+        const bool canceled = e == QNetworkReply::OperationCanceledError;
         r.statusCode = reply->attribute(
             QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        r.timedOut = canceled;
+        r.ok = (e == QNetworkReply::NoError) || r.statusCode > 0;
+        r.error = reply->errorString();
         r.finalUrl = reply->url().toString();
-        for (const QByteArray& h : reply->rawHeaderList()) {
-            r.responseHeaders.emplace_back(h, reply->rawHeader(h));
+        // rawHeaderPairs 而非 rawHeaderList+rawHeader：后者对同名头（尤其多条 Set-Cookie）
+        // 会合并/丢失，回写登录态轮换需要每条 Set-Cookie 原样保留。
+        for (const auto& p : reply->rawHeaderPairs()) {
+            r.responseHeaders.emplace_back(p.first, p.second);
         }
         if (!canceled) {
-            r.body = reply->readAll();
+            r.body = reply->readAll();   // 4xx 的响应体也可读（如 404/登录页 HTML）
         }
         reply->deleteLater();   // worker 线程事件循环处理 deferred delete，安全
         emit done(jobId, r);

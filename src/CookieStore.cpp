@@ -128,6 +128,99 @@ int CookieStore::record(const std::vector<Cookie>& cookies) {
 }
 
 // ============================================================
+// recordFromSetCookie —— /fetch 回写（Set-Cookie → store）
+// ============================================================
+
+// 解析单条 Set-Cookie（"name=value; Domain=.gwm.cn; Path=/; Expires=...; Secure; HttpOnly"）。
+// responseHost 用于无 Domain 属性时的 hostOnly 归属与 Domain 同源校验。非法/跨域返回 false。
+static bool parseOneSetCookie(const QByteArray& raw, const QString& responseHost,
+                              CookieStore::Cookie* out) {
+    // Set-Cookie 内部用 ';' 分隔；值里的属性不含 ';'（RFC 6265 cookie-value 禁用分号）。
+    const QList<QByteArray> parts = raw.split(';');
+    if (parts.isEmpty()) return false;
+    // 首段必须是 name=value（值可含 '='，如 base64 padding——只在第一个 '=' 处切）。
+    const int eq = parts[0].indexOf('=');
+    if (eq <= 0) return false;
+    const QByteArray name = parts[0].left(eq).trimmed();
+    if (name.isEmpty()) return false;
+    out->name = std::string(name.constData(), size_t(name.size()));
+    const QByteArray value = parts[0].mid(eq + 1).trimmed();
+    out->value = std::string(value.constData(), size_t(value.size()));
+
+    const QString host = responseHost.toLower();
+    QString domain;
+    bool haveDomain = false;
+    for (int i = 1; i < parts.size(); ++i) {
+        const QByteArray seg = parts[i].trimmed();
+        if (seg.isEmpty()) continue;
+        const int sep = seg.indexOf('=');
+        const QByteArray keyB = (sep >= 0 ? seg.left(sep) : seg).toLower();
+        const QByteArray valB = sep >= 0 ? seg.mid(sep + 1).trimmed() : QByteArray();
+        if (keyB == QByteArrayLiteral("domain")) {
+            domain = QString::fromUtf8(valB).toLower();
+            if (domain.startsWith(QLatin1Char('.'))) domain.remove(0, 1);
+            haveDomain = !domain.isEmpty();
+        } else if (keyB == QByteArrayLiteral("path")) {
+            out->path = valB.isEmpty() ? "/" : std::string(valB.constData(), size_t(valB.size()));
+        } else if (keyB == QByteArrayLiteral("expires")) {
+            // HTTP-date ≈ RFC2822（"Wed, 15 Sep 2026 06:00:00 GMT"）；容忍无星期前缀变体。
+            QDateTime dt = QDateTime::fromString(QString::fromUtf8(valB), Qt::RFC2822Date);
+            if (!dt.isValid()) {
+                dt = QDateTime::fromString(QString::fromUtf8(valB),
+                                           QStringLiteral("dd MMM yyyy hh:mm:ss"));
+            }
+            if (dt.isValid()) {
+                out->expirationDate = dt.toSecsSinceEpoch();
+            } else {
+                // 解析不了的过期时间按会话 cookie 处理（宁短勿误长）。
+                out->expirationDate = 0;
+            }
+        } else if (keyB == QByteArrayLiteral("max-age")) {
+            bool ok = false;
+            const qint64 secs = QString::fromUtf8(valB).toLongLong(&ok);
+            if (ok) out->expirationDate = QDateTime::currentSecsSinceEpoch() + secs;
+        } else if (keyB == QByteArrayLiteral("secure")) {
+            out->secure = true;
+        } else if (keyB == QByteArrayLiteral("httponly")) {
+            out->httpOnly = true;
+        }
+    }
+    // 同源规则：Domain 必须等于响应 host 或是其父域，否则跨域投毒（浏览器同款约束）。
+    if (haveDomain) {
+        if (host != domain && !host.endsWith(QLatin1Char('.') + domain)) return false;
+        out->domain = domain.toStdString();
+        out->hostOnly = false;
+    } else {
+        out->domain = host.toStdString();
+        out->hostOnly = true;
+    }
+    return true;
+}
+
+int CookieStore::recordFromSetCookie(const QString& responseHost,
+                                     const std::vector<std::pair<QByteArray, QByteArray>>& headers) {
+    if (responseHost.isEmpty()) return 0;
+    std::vector<Cookie> batch;
+    for (const auto& h : headers) {
+        if (h.first.compare(QByteArrayLiteral("set-cookie"), Qt::CaseInsensitive) != 0) continue;
+        // Qt 把同名多值头合并为 '\n' 连接的单值（QHttpHeaders 语义）：一个响应多条
+        // Set-Cookie 会拼成一条。必须逐段拆开独立解析——不拆的话后一条的 Domain
+        // 属性会污染前一条（实测：SESSIONID + TRACK(.host) + POISON(evil.com) 三条
+        // 合并后 evil.com 赢得 Domain，被同源规则整批拒收）。不能按逗号拆：Expires
+        // 日期里合法含逗号。
+        for (const QByteArray& one : QByteArray(h.second).split('\n')) {
+            if (one.trimmed().isEmpty()) continue;
+            Cookie c;
+            if (parseOneSetCookie(one, responseHost, &c)) {
+                batch.push_back(std::move(c));
+            }
+        }
+    }
+    if (batch.empty()) return 0;
+    return record(batch);
+}
+
+// ============================================================
 // applyTo —— GUI 线程
 // ============================================================
 

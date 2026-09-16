@@ -289,6 +289,7 @@ add_executable(seimi-render
     src/RenderPool.cpp
     src/HttpServer.h
     src/HttpServer.cpp
+    src/AuthWall.h
     src/FetchService.h
     src/FetchService.cpp
     src/WsServer.h

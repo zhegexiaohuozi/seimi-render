@@ -53,6 +53,8 @@ NO_AUTH_PORTS = {"http": 18088, "ws": 18089, "mcp": 18090}
 AUTH_PORTS = {"http": 18188, "ws": 18189, "mcp": 18190}
 HAR_PORTS = {"http": 18288, "ws": 18289, "mcp": 18290}  # 带 --remote-debugging-port 的录制实例
 BYPASS_PORTS = {"http": 18388, "ws": 18389, "mcp": 18390}  # 带 --proxy + --proxy-bypass 的分流实例
+COOKIE_RW_PORTS = {"http": 18488, "ws": 18489, "mcp": 18490}  # --no-ssrf 回写测试实例（打本地受控服务）
+COOKIE_RW_HTTPD_PORT = 18499  # 用例内起的受控 Set-Cookie 服务（回测进程内 threading）
 
 # HAR 录制实例的 Chromium remote debugging 端口（CDP 端点）。
 HAR_CDP_PORT = 19222
@@ -591,7 +593,8 @@ class Case:
 class CaseContext:
     def __init__(self, no_auth_http, no_auth_ws_port, no_auth_mcp_port,
                  auth_http=None, auth_ws_port=None, har_http=None,
-                 bypass_http=None, bypass_stderr_file=None):
+                 bypass_http=None, bypass_stderr_file=None,
+                 cookie_rw_http=None):
         self.http = no_auth_http
         self.ws_port = no_auth_ws_port
         self.mcp_port = no_auth_mcp_port
@@ -600,6 +603,7 @@ class CaseContext:
         self.har_http = har_http                        # HAR 录制实例 HttpClient，可能 None
         self.bypass_http = bypass_http                  # 代理分流实例 HttpClient，可能 None
         self.bypass_stderr_file = bypass_stderr_file    # 分流实例启动日志（scheme 纠错断言用）
+        self.cookie_rw_http = cookie_rw_http            # cookie 回写测试实例（--no-ssrf）HttpClient
 
 
 class Runner:
@@ -1969,6 +1973,106 @@ def group_l(ctx):
     cases.append(Case("L9", "file 落盘+文件名净化", "L",
                       "/fetch response_format:file + filename 含 ../ → 净化落盘 + saved_path 有效", l9))
 
+    def l10(c):
+        # HTTP 401 必须如实按状态码透出（QNAM 会把 401 置为 AuthenticationRequiredError，
+        # 若误当传输失败回 502，agent 会把「session 过期」误判成网络/服务故障——
+        # 2026-09-16 Jira 真实会话实撞）。用无效 GitHub token 造稳定 401。
+        r = _fetch(c, {"url": "https://api.github.com/user",
+                       "headers": {"Authorization": "token invalid-token-regression"},
+                       "timeout_ms": 15000}, timeout=25)
+        check(r.status == 200, f"L10: 状态 {r.status}: {r.text[:150]}")
+        j = r.json or {}
+        check("error" not in j, f"L10: 401 被误判为错误路径: {r.text[:150]}")
+        check(j.get("status_code") == 401, f"L10: status_code={j.get('status_code')}（应 401）")
+        check("Bad credentials" in (j.get("body") or ""), "L10: 缺 401 响应体")
+    cases.append(Case("L10", "401 状态码透出", "L",
+                      "/fetch 401（无效 github token）→ status_code:401 + body，非 502", l10))
+
+    def l11(c):
+        # 登录墙检测（backlog #10）：会话失效后目标 302 到登录页，最终 200 + 登录 HTML——
+        # 服务端必须显式标记 auth_wall，而不是让 agent 靠猜。
+        # 正例：直接请求登录页 URL（path 段命中启发式）；反例：正常 API 无标记。
+        r = _fetch(c, {"url": "https://gitee.com/login", "timeout_ms": 15000}, timeout=25)
+        check(r.status == 200, f"L11: 状态 {r.status}: {r.text[:150]}")
+        j = r.json or {}
+        check(j.get("auth_wall") is True, f"L11: 登录页未标 auth_wall: {r.text[:200]}")
+        check("login" in (j.get("auth_wall_reason") or ""),
+              f"L11: auth_wall_reason 未命中 login: {j.get('auth_wall_reason')}")
+        # 反例：正常 JSON API 不应有 auth_wall
+        r2 = _fetch(c, {"url": "https://api.github.com/", "timeout_ms": 15000}, timeout=25)
+        j2 = r2.json or {}
+        check("auth_wall" not in j2, f"L11: 正常 API 误标 auth_wall: {r2.text[:150]}")
+    cases.append(Case("L11", "fetch 登录墙标记", "L",
+                      "/fetch gitee.com/login → auth_wall:true + reason；正常 API 无标记", l11))
+
+    def l12(c):
+        # content-type 交叉校验（backlog #10 方向②）：请求带二进制扩展名的 URL 却收到
+        # text/html → warning 字段（"伪装 200"的服务端指纹）。用 gitee 404 页（html）+
+        # .tar.gz 后缀 URL 造稳定场景。
+        r = _fetch(c, {"url": "https://gitee.com/nonexistent-attachment.tar.gz",
+                       "timeout_ms": 15000}, timeout=25)
+        check(r.status == 200, f"L12: 状态 {r.status}: {r.text[:150]}")
+        j = r.json or {}
+        warn = (j.get("warning") or "").lower()
+        check("text/html" in warn and "gz" in warn,
+              f"L12: 缺 warning 或内容不符: {j.get('warning')}")
+    cases.append(Case("L12", "二进制扩展名收 html 告警", "L",
+                      "/fetch *.tar.gz 收到 text/html → warning 字段", l12))
+
+    def l13(c):
+        # Set-Cookie 回写（backlog #11）：响应的新 cookie 应回流 CookieStore——服务端
+        # 轮换的会话标识被记住，快照变活会话。
+        # 用【本地受控服务】断言（跑在 --no-ssrf 实例 E 上）——公网站点按流量画像/UA
+        # 分流决定是否下发 cookie（bing 对回测多实例并发 TLS 触发软风控回精简页，
+        # gitee/baidu 对 Chrome UA 不发探针），作为断言目标本质脆弱。
+        import threading
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        seen_cookies = {"v": ""}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen_cookies["v"] = self.headers.get("Cookie", "")
+                body = ("{\"got_cookie\":\"%s\"}" % seen_cookies["v"]).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if self.path == "/rotate":
+                    # 轮换新会话 + 一条合法 Domain + 一条跨域投毒（必须被拒）
+                    self.send_header("Set-Cookie", "SESSIONID=second-gen; Path=/; HttpOnly")
+                    self.send_header("Set-Cookie", "TRACK=t1; Domain=127.0.0.1; Path=/")
+                    self.send_header("Set-Cookie", "POISON=1; Domain=evil.com; Path=/")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a): pass
+
+        srv = HTTPServer(("127.0.0.1", COOKIE_RW_HTTPD_PORT), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{COOKIE_RW_HTTPD_PORT}"
+            http_e = c.cookie_rw_http
+            # 1) 轮换端点：回写 SESSIONID(hostOnly) + TRACK(Domain)；POISON 跨域拒收
+            r1 = http_e.post("/fetch", json_body={"url": base + "/rotate", "timeout_ms": 8000},
+                             timeout=20)
+            check(r1.status == 200, f"L13: 状态 {r1.status}: {r1.text[:150]}")
+            j1 = r1.json or {}
+            check(j1.get("cookies_updated") == 2,
+                  f"L13: cookies_updated={j1.get('cookies_updated')}（应 2：SESSIONID+TRACK）: {r1.text[:200]}")
+            # 2) 概览：出现回写域、无跨域投毒域
+            ov = http_e.get("/cookies")
+            domains = [d.get("domain") for d in (ov.json or {}).get("domains", [])]
+            check(any("127.0.0.1" in (d or "") for d in domains), f"L13: 概览未见回写域: {domains[:8]}")
+            check(not any("evil.com" in (d or "") for d in domains), "L13: 跨域投毒未被拒绝（evil.com 入库）")
+            # 3) 闭环：下次请求自动携带轮换出的新值（活会话的核心证明）
+            r2 = http_e.post("/fetch", json_body={"url": base + "/plain", "timeout_ms": 8000},
+                             timeout=20)
+            j2 = r2.json or {}
+            check("SESSIONID=second-gen" in (j2.get("body") or ""),
+                  f"L13: 未自动携带轮换新值: body={j2.get('body')!r}")
+        finally:
+            srv.shutdown()
+    cases.append(Case("L13", "Set-Cookie 回写+同源拒投毒", "L",
+                      "本地受控服务：回写2条 + 拒evil.com + 下次自动携带新值", l13))
+
     return cases
 
 
@@ -2111,9 +2215,20 @@ def main():
             cleanup_all(keep=args.keep_servers)
             return EXIT_ENV
 
+    # cookie 回写测试实例 E：--no-ssrf（L13 需打回测进程内的本地受控 Set-Cookie 服务，
+    # SSRF 会拦回环）。轻量（无代理无 CDP 无密码），始终启动——测试零外部网络依赖。
+    cookie_rw_proc = start_instance(binary, COOKIE_RW_PORTS,
+                                    extra_args=["--no-ssrf"], tag="实例E(cookie回写)",
+                                    stderr_file="build/test-reports/cookie-rw.stderr.log")
+    if not cookie_rw_proc or not wait_ready(COOKIE_RW_PORTS["http"], tag="实例E"):
+        cleanup_all(keep=args.keep_servers)
+        return EXIT_ENV
+
     instances = {
         "no_auth": {"http_port": NO_AUTH_PORTS["http"], "ws_port": NO_AUTH_PORTS["ws"],
                     "mcp_port": NO_AUTH_PORTS["mcp"], "pid": no_auth_proc.pid, "ready": True},
+        "cookie_rw": {"http_port": COOKIE_RW_PORTS["http"], "pid": cookie_rw_proc.pid,
+                      "ready": True},
     }
     if auth_proc:
         instances["auth"] = {"http_port": AUTH_PORTS["http"], "ws_port": AUTH_PORTS["ws"],
@@ -2141,6 +2256,7 @@ def main():
         har_http=har_http,
         bypass_http=bypass_http,
         bypass_stderr_file=BYPASS_STDERR_FILE if bypass_proc else None,
+        cookie_rw_http=HttpClient(COOKIE_RW_PORTS["http"], verbose=args.verbose),
     )
 
     only_groups = args.group.split(",") if args.group else None

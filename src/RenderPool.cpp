@@ -4,6 +4,7 @@
 #include "RenderPool.h"
 
 #include "BlockDetect.h"
+#include "AuthWall.h"
 #include "CookieStore.h"
 #include "HarRecorder.h"
 #include "ProxyConfig.h"
@@ -724,42 +725,6 @@ static QString detectChromeErrorPage(const QString& html) {
 void RenderWorker::decCollect() {
     if (m_busy && m_pendingCollect > 0) --m_pendingCollect;
     tryFinishCollect();
-}
-
-// 登录墙启发式（保守，仅 URL 路径特征）：final_url 任一路径段命中登录特征词即判定。
-// 场景：Jira 等 session 过期后渲染 state=succeeded 但内容是登录页，agent 无从分辨——
-// auth_wall 让「该提示重新同步 cookie」可被自动判读。
-// 刻意不做内容特征（title/body 含 "Log in"）：误报会把正常内容页标成登录墙，代价高于
-// 漏报；漏报的兜底是 final_url 本身已透出，调用方可自行判断。
-static void detectAuthWall(const QString& finalUrl, bool* hit, QString* reason) {
-    *hit = false;
-    reason->clear();
-    if (finalUrl.isEmpty()) return;
-    const QString path = QUrl(finalUrl).path().toLower();
-    if (path.isEmpty()) return;
-    for (const QString& seg : path.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
-        // contains 类：login.jsp / wp-login.php / signin / sign-in / logon 等变体。
-        if (seg.contains(QLatin1String("login")) || seg.contains(QLatin1String("signin"))
-            || seg.contains(QLatin1String("sign-in")) || seg.contains(QLatin1String("logon"))) {
-            *hit = true;
-            *reason = QStringLiteral("path segment '%1'").arg(seg);
-            return;
-        }
-        // 精确类：sso / oauth / cas——SSO 网关的标志性一级路径段。
-        if (seg == QLatin1String("sso") || seg == QLatin1String("oauth")
-            || seg == QLatin1String("cas")) {
-            *hit = true;
-            *reason = QStringLiteral("path segment '%1'").arg(seg);
-            return;
-        }
-        // 前缀类：auth / authenticate / authorize（注意排除 /author/ 博客作者页）。
-        if (seg == QLatin1String("auth") || seg.startsWith(QLatin1String("authenticat"))
-            || seg.startsWith(QLatin1String("authorize")) || seg.startsWith(QLatin1String("authoris"))) {
-            *hit = true;
-            *reason = QStringLiteral("path segment '%1'").arg(seg);
-            return;
-        }
-    }
 }
 
 // HTML/markdown/pdf 全部到齐 -> 组装结果 -> 报告成功。

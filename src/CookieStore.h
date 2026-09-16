@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +46,14 @@ public:
 
     // HTTP 线程：批量存入 cookie，返回入库数。注入由 GUI 线程异步完成。
     int record(const std::vector<Cookie>& cookies);
+
+    // 任意线程（/fetch 回写路径）：解析响应的 Set-Cookie 头并回写本 store——服务端
+    // 轮换出的新会话标识回流，快照变「活会话」（用进废退保活，2026-09-16 设计）。
+    // 仅接受与响应 host 匹配的 Domain 属性（浏览器同源规则，防恶意目标跨域投毒其它
+    // 域的登录态）；无 Domain 属性按 hostOnly 记给响应 host。过期删除语义
+    // （name=; Expires=过去）经 cookiesForHost 的过期过滤自然生效。返回回写条数。
+    int recordFromSetCookie(const QString& responseHost,
+                            const std::vector<std::pair<QByteArray, QByteArray>>& headers);
 
     // GUI 线程：把待注入 cookie 写进 profile->cookieStore()，清空缓冲。
     // profile 为 nullptr 时跳过。同时处理 pendingClear/pendingPurge 并 flush 落盘。
