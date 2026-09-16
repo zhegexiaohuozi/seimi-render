@@ -5,20 +5,25 @@
 
 #include "CookieStore.h"
 #include "Environment.h"
+#include "FetchService.h"
 #include "HarStore.h"
 #include "McpServer.h"
 #include "ProxyConfig.h"
 #include "IpNet.h"
+#include "StealthProfile.h"
 #include "TokenCompare.h"
 #include "UrlGuard.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QNetworkCookie>
 #include <QUrl>
 
 #include <cerrno>
@@ -167,6 +172,9 @@ HttpServer::HttpServer(RenderQueue* queue, CookieStore* cookies, int settleDefau
 
 HttpServer::~HttpServer() {
     stop();
+    // stop() 已等 httplib 线程收尾，再回收 fetch 专职线程（顺序保证 execute 不在途）。
+    delete m_fetch;
+    m_fetch = nullptr;
 }
 
 std::string HttpServer::computeToken(const std::string& password) {
@@ -181,6 +189,9 @@ void HttpServer::setTrustedProxies(const std::string& csv) {
 
 bool HttpServer::start(const std::string& host, int port, int threadCount) {
     m_srv = std::make_unique<httplib::Server>();
+    // /fetch 直取执行器（必须在 registerRoutes 前、各 setter 之后创建；非 QObject，
+    // 由析构显式回收，内部自带专职 QThread）。
+    m_fetch = new FetchService(m_proxy);
     m_srv->new_task_queue = [threadCount] {
         // httplib 内置线程池：每个连接由线程池里一个线程处理。
         return new httplib::ThreadPool(threadCount);
@@ -246,6 +257,11 @@ std::string HttpServer::jsonStateResp(const RenderQueue::Snapshot& s, OutputMask
         out += ",\"error\":\"" + esc(s.error) + "\"";
         if (s.blocked) out += ",\"blocked\":true";   // 反爬拦截类型化标记（C3）
     }
+    // final_url：重定向/SSO/登录墙跳转的可见性载体（成功与失败路径都可能有值；
+    // 失败时多为 chrome-error 页或超时瞬间的 URL）。
+    if (!s.finalUrl.isEmpty()) {
+        out += ",\"final_url\":\"" + esc(s.finalUrl) + "\"";
+    }
     out += ",\"elapsed_ms\":" + std::to_string(elapsed < 0 ? 0 : elapsed);
 
     // 成功时按 outMask 返回对应输出。html/markdown 内嵌 JSON；pdf 给元信息
@@ -274,6 +290,19 @@ std::string HttpServer::jsonStateResp(const RenderQueue::Snapshot& s, OutputMask
         // 不能过 esc() 否则破坏内部结构）。
         if (!s.serpJson.isEmpty()) {
             out += ",\"serp_json\":" + s.serpJson.toStdString();
+        }
+        // exec_js 结果（裸嵌入合法 JSON 值文本：可能是对象/数组/字符串/数字）。
+        // 未请求 exec_js 或脚本无返回值（void）时不出现该字段。
+        if (!s.jsJson.isEmpty()) {
+            out += ",\"js_result\":" + s.jsJson.toStdString();
+        }
+        // 登录墙启发式：成功渲染出的"登录页"（session 过期等）与正常内容可区分，
+        // agent 据此提示重新同步 cookie 而非把登录页 markdown 当业务数据继续分析。
+        if (s.authWall) {
+            out += ",\"auth_wall\":true";
+            if (!s.authWallReason.isEmpty()) {
+                out += ",\"auth_wall_reason\":\"" + esc(s.authWallReason) + "\"";
+            }
         }
     }
     out += "}";
@@ -854,10 +883,12 @@ void HttpServer::registerRoutes() {
             res.set_content(R"({"error":"url must be http/https"})", "application/json; charset=utf-8");
             return;
         }
-        // SSRF 防护：拒绝指向内网/回环/链路本地/元数据地址的目标。
-        // --no-ssrf 关闭（本机自用 Agent 场景，允许访问一切目标）。
+        // resolved IP：随任务存一份，网络类失败时附进错误信息做自诊断（proxy/fake-ip
+        // hint；agent 读错误即可自修复）。--no-ssrf 下不做判定，但仍解析一次（诊断价值
+        // 大于毫秒级 DNS 开销）。
+        std::string resolvedIp;
         if (m_ssrfGuardEnabled) {
-            std::string ssrfReason = urlSsrfCheck(qurl);
+            std::string ssrfReason = urlSsrfCheck(qurl, &resolvedIp);
             if (!ssrfReason.empty()) {
                 // 入口拒绝也是请求异常（客户端视角即失败）：记入异常日志，供统一分析。
                 m_queue->anomalyLog().recordRejected(
@@ -868,6 +899,8 @@ void HttpServer::registerRoutes() {
                 res.set_content(body, "application/json; charset=utf-8");
                 return;
             }
+        } else {
+            resolvedIp = resolveHostIp(qurl);
         }
 
         int settleMs = int(obj.value(QStringLiteral("settle_ms")).toInt(m_settleDefaultMs));
@@ -882,9 +915,21 @@ void HttpServer::registerRoutes() {
         ExtractAlgorithm extractAlg = parseExtractAlgorithm(obj.value(QStringLiteral("extract")));
         // HAR 网络录制：record_network=true 开启该任务的 CDP 网络录制，结果走 GET /har/<id>。
         const bool recordHar = obj.value(QStringLiteral("record_network")).toBool(false);
+        // exec_js：settle 后在页面主世界执行调用方 JS（结果 JSON 内嵌 js_result 字段）。
+        // 代码体上限 1MB（防滥用）；超时 1~30s 钳制（页面内 Promise.race + C++ 轮询双兜底）。
+        QString execJs = obj.value(QStringLiteral("exec_js")).toString();
+        if (execJs.size() > 1024 * 1024) {
+            res.status = 400;
+            res.set_content(R"({"error":"exec_js too large, limit 1MB"})",
+                            "application/json; charset=utf-8");
+            return;
+        }
+        int execJsTimeout = obj.value(QStringLiteral("exec_js_timeout_ms")).toInt(10000);
+        execJsTimeout = std::clamp(execJsTimeout, 1000, 30000);
 
         QString id = m_queue->submit(url, settleMs, outputs, imgFmt, mdAlg, nowMsec(),
-                                     extractAlg, recordHar);
+                                     extractAlg, recordHar, execJs, execJsTimeout,
+                                     QString::fromStdString(resolvedIp));
         if (id.isEmpty()) {
             // 任务表过载（洪泛提交/积压）：背压拒绝，让客户端稍后重试。
             res.status = 503;
@@ -909,6 +954,277 @@ void HttpServer::registerRoutes() {
             return;
         }
         res.set_content(jsonStateResp(s, s.done ? outputs : 0), "application/json; charset=utf-8");
+    });
+
+    // 轻量直取端点（绕过 Chromium 页面管线）：带登录态 cookie + 全局代理直接请求
+    // JSON/REST 端点，返回原始响应体。场景：agent 多轮 API 探索（Jira /search 等）——
+    // 整页渲染管线（新建 page → load → settle → toHtml）单请求 5-6s，这里压到百毫秒级，
+    // 且无需从 <pre> 里反解 JSON。网络栈用 QNetworkAccessManager：自动跟随全局代理
+    //（http/socks5）与 --proxy-bypass 分流，与页面渲染网络路径一致，行为可互相印证。
+    // 跑在 httplib 工作线程：栈上 QEventLoop 同步等待（HarRecorder::discoverTargetId 同款
+    // 先例），不碰 GUI 线程与 WebEngine。
+    m_srv->Post("/fetch", [this](const httplib::Request& req, httplib::Response& res) {
+        SEIMI_AUTH(req, res);
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(
+            QByteArray::fromStdString(req.body), &err);
+        if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json body"})", "application/json; charset=utf-8");
+            return;
+        }
+        QJsonObject obj = doc.object();
+        QString url = obj.value(QStringLiteral("url")).toString().trimmed();
+        if (url.isEmpty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"missing 'url'"})", "application/json; charset=utf-8");
+            return;
+        }
+        QUrl qurl(url);
+        if (!qurl.isValid() || (qurl.scheme() != QStringLiteral("http")
+                                && qurl.scheme() != QStringLiteral("https"))) {
+            res.status = 400;
+            res.set_content(R"({"error":"url must be http/https"})", "application/json; charset=utf-8");
+            return;
+        }
+        // method：GET（默认）/ POST / PUT / PATCH / DELETE / HEAD。
+        QString method = obj.value(QStringLiteral("method")).toString(QStringLiteral("GET"))
+                             .trimmed().toUpper();
+        if (method != QStringLiteral("GET") && method != QStringLiteral("POST")
+            && method != QStringLiteral("PUT") && method != QStringLiteral("PATCH")
+            && method != QStringLiteral("DELETE") && method != QStringLiteral("HEAD")) {
+            res.status = 400;
+            res.set_content(R"({"error":"method must be GET/POST/PUT/PATCH/DELETE/HEAD"})",
+                            "application/json; charset=utf-8");
+            return;
+        }
+        // SSRF 防护：与 /render 同一判定（fetch 是比渲染更直接的 SSRF 载体，绝不能豁免）。
+        if (m_ssrfGuardEnabled) {
+            std::string ssrfReason = urlSsrfCheck(qurl);
+            if (!ssrfReason.empty()) {
+                m_queue->anomalyLog().recordRejected(
+                    url, QStringLiteral("ssrf_blocked"), QString::fromStdString(ssrfReason));
+                res.status = 400;
+                std::string body = R"({"error":"url blocked by SSRF guard","detail":")"
+                                 + escJson(ssrfReason) + R"("})";
+                res.set_content(body, "application/json; charset=utf-8");
+                return;
+            }
+        }
+        int timeoutMs = obj.value(QStringLiteral("timeout_ms")).toInt(15000);
+        timeoutMs = std::clamp(timeoutMs, 1000, 60000);
+        QString reqBody = obj.value(QStringLiteral("body")).toString();
+        // 输出模式：text（默认，JSON 字符串内嵌，二进制会经 UTF-8 有损转换）/ base64
+        //（二进制安全，>50MB 拒绝）/ file（落盘到 data-dir/fetch/，返回 saved_path）。
+        QString responseFormat = obj.value(QStringLiteral("response_format"))
+                                     .toString(QStringLiteral("text")).trimmed().toLower();
+        if (responseFormat != QStringLiteral("text")
+            && responseFormat != QStringLiteral("base64")
+            && responseFormat != QStringLiteral("file")) {
+            res.status = 400;
+            res.set_content(R"({"error":"response_format must be text/base64/file"})",
+                            "application/json; charset=utf-8");
+            return;
+        }
+        QString saveFileName = obj.value(QStringLiteral("filename")).toString().trimmed();
+
+        // —— 构造请求（headers 顺序：默认 UA → 调用方头 → 登录 Cookie；worker 逐条
+        //    setRawHeader，同名后写覆盖先写，语义与原实现一致）——
+        FetchRequest freq;
+        freq.url = qurl;
+        freq.method = method;
+        freq.timeoutMsec = timeoutMs;
+        freq.body = reqBody.toUtf8();
+        freq.headers.emplace_back(QByteArrayLiteral("User-Agent"),
+                                  QByteArray(StealthProfile::userAgent()));
+        bool callerSetCookie = false;
+        bool callerSetContentType = false;
+        {
+            QJsonValue hv = obj.value(QStringLiteral("headers"));
+            if (hv.isObject()) {
+                // 注意必须先落局部变量再迭代：toObject() 返回临时对象，
+                // 直接 constBegin/constEnd 各自绑定不同临时（且语句结束即销毁），
+                // it.value() 解引用悬垂内存 → SIGSEGV（回测 L3 实撞）。
+                const QJsonObject headersObj = hv.toObject();
+                for (auto it = headersObj.constBegin(); it != headersObj.constEnd(); ++it) {
+                    QByteArray name = it.key().toUtf8();
+                    QByteArray value = it.value().toString().toUtf8();
+                    // Content-Length/Host/Connection 由 Qt 网络栈自管，调用方设置只会打架。
+                    QByteArray lname = name.toLower();
+                    if (lname == QByteArrayLiteral("content-length")
+                        || lname == QByteArrayLiteral("host")
+                        || lname == QByteArrayLiteral("connection")) {
+                        continue;
+                    }
+                    if (lname == QByteArrayLiteral("cookie")) callerSetCookie = true;
+                    if (lname == QByteArrayLiteral("content-type")) callerSetContentType = true;
+                    freq.headers.emplace_back(name, value);
+                }
+            }
+        }
+        // 登录态注入：CookieStore 里该域 cookie 自动携带（调用方显式给了 Cookie 头则尊重调用方）。
+        int cookiesApplied = 0;
+        if (!callerSetCookie && m_cookies) {
+            const auto cookies = m_cookies->cookiesForHost(
+                qurl.host(), qurl.scheme() == QStringLiteral("https"));
+            QString cookieHeader;
+            for (const auto& c : cookies) {
+                QNetworkCookie qc(QByteArray::fromStdString(c.name),
+                                  QByteArray::fromStdString(c.value));
+                if (!cookieHeader.isEmpty()) cookieHeader += QLatin1String("; ");
+                cookieHeader += QString::fromUtf8(qc.toRawForm(QNetworkCookie::NameAndValueOnly));
+                ++cookiesApplied;
+            }
+            if (!cookieHeader.isEmpty()) {
+                freq.headers.emplace_back(QByteArrayLiteral("Cookie"), cookieHeader.toUtf8());
+            }
+        }
+        // 带 body 的方法：默认 application/json（agent JSON-first 场景），可覆盖。
+        const bool hasBody = (method == QStringLiteral("POST") || method == QStringLiteral("PUT")
+                              || method == QStringLiteral("PATCH")) && !freq.body.isEmpty();
+        if (hasBody && !callerSetContentType) {
+            freq.headers.emplace_back(QByteArrayLiteral("Content-Type"),
+                                      QByteArrayLiteral("application/json"));
+        }
+
+        // —— 同步执行（FetchService 专职线程：长命 QNAM + 事件循环；httplib 线程仅
+        //    条件变量等待。取代早期「栈上 QNAM+QEventLoop」——大响应体场景稳定崩溃，
+        //    见 FetchService.h 头注释）——
+        const qint64 startedMsec = nowMsec();
+        const FetchResult fr = m_fetch->execute(freq);
+        const qint64 elapsedMs = nowMsec() - startedMsec;
+        const QString host = qurl.host().toLower();
+        if (fr.timedOut) {
+            m_queue->metrics().record(host.toStdString(), false, elapsedMs, 0, 0, false);
+            qWarning("[fetch] url=%s method=%s TIMEOUT after %dms",
+                     url.left(160).toUtf8().constData(), method.toUtf8().constData(), timeoutMs);
+            res.status = 504;
+            res.set_content(R"({"error":"fetch timed out"})", "application/json; charset=utf-8");
+            return;
+        }
+        if (!fr.ok) {
+            m_queue->metrics().record(host.toStdString(), false, elapsedMs, 0, 0, false);
+            qWarning("[fetch] url=%s method=%s FAILED: %s",
+                     url.left(160).toUtf8().constData(), method.toUtf8().constData(),
+                     fr.error.toUtf8().constData());
+            res.status = 502;
+            std::string body = R"({"error":"fetch failed","detail":")"
+                             + escJson(fr.error.toStdString()) + R"("})";
+            res.set_content(body, "application/json; charset=utf-8");
+            return;
+        }
+
+        // —— 成功：按输出模式组装响应 ——
+        m_queue->metrics().record(host.toStdString(), true, elapsedMs, 0, 0, false);
+        qWarning("[fetch] url=%s method=%s -> %d (%zuB, %lldms, %s)",
+                 url.left(160).toUtf8().constData(), method.toUtf8().constData(), fr.statusCode,
+                 static_cast<size_t>(fr.body.size()), elapsedMs, responseFormat.toUtf8().constData());
+
+        std::string out = "{\"url\":\"" + esc(url) +
+                          "\",\"final_url\":\"" + esc(fr.finalUrl) +
+                          "\",\"status_code\":" + std::to_string(fr.statusCode) +
+                          ",\"elapsed_ms\":" + std::to_string(elapsedMs) +
+                          ",\"cookies_applied\":" + std::to_string(cookiesApplied);
+        // 响应头：同名多值（如 Set-Cookie）逗号拼接。回显服务端会话 cookie 有泄漏面，跳过。
+        {
+            std::string headersJson;
+            QString lastKey;
+            for (const auto& h : fr.responseHeaders) {
+                const QString key = QString::fromUtf8(h.first).toLower();
+                if (key == QLatin1String("set-cookie")) continue;
+                const QString value = QString::fromUtf8(h.second);
+                if (value.isEmpty()) continue;
+                if (key == lastKey && !headersJson.empty()) {
+                    // 同名头追加（QNAM 按收到顺序平铺，同名相邻；极端乱序时退化为独立键，
+                    // 后写覆盖——与旧行为一致，可接受）。
+                    headersJson += ",\"" + esc(key) + "\":\"" + esc(value) + "\"";
+                } else {
+                    if (!headersJson.empty()) headersJson += ",";
+                    headersJson += "\"" + esc(key) + "\":\"" + esc(value) + "\"";
+                }
+                lastKey = key;
+            }
+            out += ",\"headers\":{" + headersJson + "}";
+        }
+
+        if (responseFormat == QStringLiteral("base64")) {
+            // 二进制安全输出：超限（50MB）明确拒绝——base64 会把体积再撑大 1/3，
+            // 塞进 JSON 对调用方与传输都不友好，超大文件请用 file 模式落盘。
+            static constexpr qsizetype kFetchMaxBase64Bytes = 50 * 1024 * 1024;
+            if (fr.body.size() > kFetchMaxBase64Bytes) {
+                res.status = 413;
+                std::string body = R"({"error":"body too large for base64 output","max_bytes":)"
+                                 + std::to_string(int(kFetchMaxBase64Bytes))
+                                 + ",\"actual_bytes\":" + std::to_string(int(fr.body.size()))
+                                 + R"(,"hint":"use response_format=file to save to disk"})";
+                res.set_content(body, "application/json; charset=utf-8");
+                return;
+            }
+            out += ",\"body_bytes\":" + std::to_string(int(fr.body.size()));
+            out += ",\"body_base64\":\"" + fr.body.toBase64().toStdString() + "\"}";
+            res.set_content(out, "application/json; charset=utf-8");
+            return;
+        }
+        if (responseFormat == QStringLiteral("file")) {
+            if (m_fetchSaveDir.isEmpty()) {
+                res.status = 500;
+                res.set_content(R"({"error":"file output not configured: no save dir"})",
+                                "application/json; charset=utf-8");
+                return;
+            }
+            // 文件名：调用方 filename 或 URL 末段，净化为 basename（仅字母数字._-，防路径
+            // 穿越/控制符），冲突时加序号后缀；默认兜底 fetch-<epochms>。
+            QString fname = saveFileName;
+            if (fname.isEmpty()) {
+                fname = qurl.path().section(QLatin1Char('/'), -1);
+            }
+            QString safe;
+            for (const QChar ch : fname) {
+                const ushort u = ch.unicode();
+                const bool okChar = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z')
+                                    || (u >= '0' && u <= '9') || ch == QLatin1Char('.')
+                                    || ch == QLatin1Char('-') || ch == QLatin1Char('_');
+                if (okChar) safe += ch;
+            }
+            if (safe.isEmpty() || safe == QLatin1String(".")
+                || safe == QLatin1String("..")) {
+                safe = QStringLiteral("fetch-%1").arg(startedMsec);
+            }
+            safe = safe.left(120);
+            QDir saveDir(m_fetchSaveDir);
+            saveDir.mkpath(QStringLiteral("."));
+            QString target = saveDir.filePath(safe);
+            for (int i = 1; QFileInfo::exists(target); ++i) {
+                target = saveDir.filePath(QStringLiteral("%1-%2").arg(safe).arg(i));
+                if (i > 999) {   // 防极端冲突死循环
+                    target = saveDir.filePath(
+                        QStringLiteral("fetch-%1-%2").arg(startedMsec).arg(i));
+                    break;
+                }
+            }
+            QFile f(target);
+            if (!f.open(QIODevice::WriteOnly) || f.write(fr.body) != fr.body.size()) {
+                res.status = 500;
+                std::string body = R"({"error":"failed to save file","detail":")"
+                                 + escJson(f.errorString().toStdString()) + R"("})";
+                res.set_content(body, "application/json; charset=utf-8");
+                return;
+            }
+            out += ",\"saved\":true,\"saved_path\":\"" + esc(QDir::toNativeSeparators(target))
+                 + "\",\"bytes\":" + std::to_string(int(fr.body.size())) + "}";
+            res.set_content(out, "application/json; charset=utf-8");
+            return;
+        }
+
+        // text（默认）：10MB 截断（JSON 字符串内嵌；二进制经 UTF-8 有损转换，二进制场景
+        // 请用 base64/file）。
+        static constexpr qsizetype kFetchMaxBodyBytes = 10 * 1024 * 1024;
+        const bool truncated = fr.body.size() > kFetchMaxBodyBytes;
+        QByteArray textBody = fr.body;
+        if (truncated) textBody.truncate(kFetchMaxBodyBytes);
+        out += ",\"body_truncated\":" + std::string(truncated ? "true" : "false");
+        out += ",\"body\":\"" + esc(QString::fromUtf8(textBody)) + "\"}";
+        res.set_content(out, "application/json; charset=utf-8");
     });
 
     // 非阻塞状态查询（不含 html/markdown，只状态 + 计时）

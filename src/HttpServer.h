@@ -27,6 +27,7 @@ class ProxyConfig;
 class Environment;
 class McpServer;
 class HarStore;
+class FetchService;
 
 // HTTP 接口层（cpp-httplib，内置线程池）。
 // 路由：POST /render、GET /status/:id、GET /result/:id?timeout=、GET /stats、GET /health、
@@ -72,6 +73,9 @@ public:
     // SSRF 入口防护开关（--no-ssrf）：关闭后 /render 不再做 UrlGuard 校验，
     // 允许渲染内网/回环/元数据目标（本机自用 Agent 场景）。默认开启。必须在 start() 前调用。
     void setSsrfGuardEnabled(bool enabled) { m_ssrfGuardEnabled = enabled; }
+
+    // /fetch 的 response_format=file 落盘目录（data-dir/fetch/）。必须在 start() 前调用。
+    void setFetchSaveDir(const QString& dir) { m_fetchSaveDir = dir; }
 
 private:
     void registerRoutes();
@@ -125,6 +129,8 @@ private:
     int m_settleDefaultMs;
     std::unique_ptr<httplib::Server> m_srv;
     std::atomic<bool> m_running{false};
+    FetchService* m_fetch = nullptr;   // /fetch 直取执行器（start() 里创建，专职 QThread）
+    QString m_fetchSaveDir;            // /fetch file 模式落盘目录（空=未配置）;
 
     std::string m_adminUiDir;          // admin-ui 资源目录（空=不启用管理页）
     std::string m_password;            // 非空=启用密码保护

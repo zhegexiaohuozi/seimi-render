@@ -18,6 +18,11 @@
 - **运行时监控指标**：成功率、延迟分位数（p50/p90/p99）、吞吐、域名分布，适合运维大盘
 - **请求异常明细日志**：所有失败 / 反爬拦截（含重试后成功）/ 入口拒绝（SSRF、过载）逐条落盘为 JSONL（`data/anomalies/`，按天轮转），携带失败阶段、分段耗时、队列负载、代理状态等根因上下文，配合 `metrics.json` 聚合可做站点成功率归因与优化决策（详见 [请求异常日志](#请求异常日志anomalies)）
 - **网络录制与 HAR 导出**：开启 `--remote-debugging-port` 后，渲染时带 `record_network=true` 即可录制页面加载全过程（请求/响应/headers/响应体/timing，类似 Chrome F12 Network），产出标准 HAR 1.2 文件，可直接导入 Chrome DevTools / Charles / haralyzer 分析。可以极大的提高自动化信息挖掘效率。
+- **页面内 JS 执行（exec_js）**：渲染任务带 `exec_js` 参数，页面加载 + settle 后在**页面主世界**执行调用方 JS（同源上下文：cookie 生效、fetch 自动带凭据），执行结果以 `js_result` 字段回传（JSON 值；脚本无返回值为 void 则该字段不出现）。裸表达式自动作为结果（控制台补全语义），多语句用 `return`；async/Promise 自动等待；异常/超时则任务失败并精确报错。典型用途：在已登录页面内调站点私有 API、提取运行时状态。
+- **JSON/REST 直取（`POST /fetch` / MCP `fetch_url`）**：带登录态 cookie + 全局代理直接请求 API 端点，返回原始响应体，**完全绕过 Chromium 页面管线**（整页渲染 ~6s → 直取百毫秒级）。agent 对已登录站点的 REST API 探索（如 Jira `/rest/api/2/search`）无需再从 `<pre>` 里反解 JSON。
+- **登录态可见性（final_url / auth_wall）**：终态透出重定向后的最终 URL；命中登录墙特征（`/login`、`/sso` 等路径）时标记 `auth_wall=true`——session 过期渲染出的「登录页」与正常内容可区分，agent 据此提示重新同步 cookie 而非把登录页 markdown 当业务数据。
+- **网络失败自诊断**：网络类失败的 `error` 附带 proxy 快照、目标解析 IP 与针对性 hint（fake-ip 段劫持、代理够不着内网、代理切换过渡期），agent 读错误即可自修复，不必碰壁求助人工。
+- **代理分流（`--proxy-bypass`）**：内网+外网混合目标场景，指定域名/CIDR 直连、其余走代理（`QNetworkProxyFactory` per-host 分流）。
 - **多种渲染输出**：html、markdown、pdf、png/jpg、搜索结果json结构化。
 - **无头运行**：默认 offscreen 平台，无需显示器,不会干扰本地浏览器操作，本地操作也不会干扰浏览结果获取。
 - **基础防浏览器指纹识别**：基础反爬识别能力。
@@ -130,7 +135,8 @@ curl -X POST http://localhost:8088/render \
 | `--no-admin` | 关闭（admin 开启） | 禁用内置管理界面；默认 `GET /` 提供管理控制台 |
 | `--no-ssrf` | 关闭（SSRF 防护开启） | 关闭 SSRF 防护：允许渲染内网/回环/链路本地/云元数据地址。**仅供本机自用 Agent 场景**（你完全信任调用方可触达整个内网）；入口校验与 Chromium 请求层拦截同步关闭。默认开启防护。切勿与对外 `--host` 组合使用（启动时会打 DANGER 警告） |
 | `--trusted-proxy <list>` | — | 逗号分隔的受信反向代理 IP/CIDR（如 `10.8.0.0/16,127.0.0.1`）。设置后 `/api/login` 限流基于从 `X-Forwarded-For` 提取的真实客户端 IP；未设置时使用 TCP 对端地址（忽略 XFF，防伪造） |
-| `--proxy <url>` | — | 所有 Chromium 流量的上游代理。格式 `http://[user:pass@]host:port` 或 `socks5://[user:pass@]host:port`。经 `QNetworkProxy::setApplicationProxy` 设置，支持运行时 `POST /proxy` 热切换无需重启。`type=direct` 清除 |
+| `--proxy <url>` | — | 所有 Chromium 流量的上游代理。格式 `http://[user:pass@]host:port` 或 `socks5://[user:pass@]host:port`（scheme 拼写错误会自动纠正并打 WARN，如 `socket5://` → `socks5://`）。经 `QNetworkProxy` 设置，支持运行时 `POST /proxy` 热切换无需重启。`type=direct` 清除 |
+| `--proxy-bypass <list>` | —（不分流） | 逗号分隔的**直连**目标列表：域名后缀（`gwm.cn` 覆盖 `jira.gwm.cn`）/ 精确主机名 / IP 字面量 / IPv4 CIDR（如 `gwm.cn,10.0.0.0/8`）。命中列表的目标不走 `--proxy` 直接连接，其余流量走代理——内网+外网混合目标（企业 Agent 常态）一步到位。回环地址永远直连。**限制**：仅命令行参数；此模式下**渲染侧代理在启动时固定**（经 Chromium `--proxy-server`/`--proxy-bypass-list` flag 实现 per-host 分流——Qt 的代理机制对渲染栈无按 host 分流能力，实测如此），`POST /proxy` 热切换仅对 `/fetch` 生效；需要代理热切换就别配 bypass（改 direct + 系统级路由）。另：Chromium flag 代理不支持内联认证凭据。**提示：TUN 模式代理（Clash 等）已开时优先不配 `--proxy`**（TUN 已接管路由；再配显式代理会双重分流、丢失代理的私网直连规则） |
 | `--no-stealth` | 关闭（stealth 开启） | 禁用浏览器指纹统一。默认开启 stealth，将所有渲染实例伪装成同一 Chrome 桌面环境（UA/screen/WebGL/canvas），融入人群以绕过基础反爬（如 Google） |
 | `--no-warmup` | 关闭（warmup 开启） | 关闭启动 Google 会话预热。默认开启：进程启动时先以隐藏 page 加载一次 `--warmup-url`（默认 https://www.google.com/）拿到 NID/CONSENT 等会话 cookie，**再**启动 dispatch 定时器接业务请求——冷启动零 cookie 直打搜索是 Google 风控的最高危窗口，预热能显著降低首条搜索的 sorry 概率 |
 | `--warmup-url <url>` | `https://www.google.com/` | 会话预热目标 URL（必须 http/https）。仅在 warmup 开启时使用；一般无需改，特殊环境（如走代理时 google.com 不通）可换成能稳定返回 google 域 cookie 的镜像。warmup 自带失败自适应：连续 3 次预热失败（约 90min，Google 不可达）会自动暂停 30min 周期、改用 5min 低频探活；探活成功立即恢复正常周期。状态变化在服务日志里以 `[warmup] SUSPENDED` / `[warmup] RESUMED` 标记 |
@@ -166,7 +172,7 @@ seimi-render 内置一个浏览器管理控制台(`GET /`,访问根路径即打�
 | **渲染测试台**(English) | 同一界面切到 English(右上角「中」切回中文),演示 Google 搜索结果结构化提取(`extract=google_serp`)。 | <a href="docs/images/google-search-extract-en.png" target="_blank"><img src="docs/images/google-search-extract-en.png" width="420" alt="英文界面 - Google 搜索结果提取"></a> |
 | **Cookie 状态** | 查看渲染服务持有的登录态 cookie,按域名展示「携带 cookie 数量」(不含 value,防泄露),与浏览器插件对账。「清空当前会话」/「永久删除」分别清内存会话与加密持久化存储(`data/cookies.dat`)。 | <a href="docs/images/cookies.png" target="_blank"><img src="docs/images/cookies.png" width="420" alt="Cookie 状态"></a> |
 | **配置示例** | 一键复制 Agent 接入与调用配置:Claude Code / Cursor 的 `mcpServers` JSON、curl 调 `/render` 示例、WebSocket 示例,以及当前访问 token(启用 `--password` 时显示)。 | <a href="docs/images/config-show.png" target="_blank"><img src="docs/images/config-show.png" width="420" alt="配置示例"></a> |
-| **接口文档** | 交互式 API 文档:左目录按「HTTP REST / MCP 工具 / WebSocket」分组(17 HTTP 端点 + 5 MCP 工具 + WS 的 render/subscribe/auth),右详情含参数表、curl/JSON 示例、响应示例与错误码,均可一键复制。 | <a href="docs/images/api-docs.png" target="_blank"><img src="docs/images/api-docs.png" width="420" alt="接口文档"></a> |
+| **接口文档** | 交互式 API 文档:左目录按「HTTP REST / MCP 工具 / WebSocket」分组(18 HTTP 端点 + 6 MCP 工具 + WS 的 render/subscribe/auth),右详情含参数表、curl/JSON 示例、响应示例与错误码,均可一键复制。 | <a href="docs/images/api-docs.png" target="_blank"><img src="docs/images/api-docs.png" width="420" alt="接口文档"></a> |
 
 > cookie 同步来源见上文 [浏览器插件](#浏览器插件) 章节。管理界面是纯静态资源([`admin-ui/`](admin-ui/)),随二进制打包分发,不依赖外部服务。远程访问需显式 `--host 0.0.0.0` 并强烈建议配置 `--password`(管理界面可改代理、注入 cookie,是高权限入口)。
 
@@ -220,6 +226,7 @@ seimi-render 默认Chromum内核渲染,没有你的登录态。要渲染「登�
 |------|------|------|
 | GET  | `/` | 管理界面 |
 | POST | `/render` | 提交渲染任务（可带 `long_poll_ms` 同步等结果） |
+| POST | `/fetch` | 轻量直取：带登录态 cookie + 全局代理直接请求 JSON/REST 端点，绕过 Chromium 管线（详见 [轻量直取](#轻量直取post-fetch)） |
 | GET  | `/status/:id` | 查询单个任务状态（非阻塞） |
 | GET  | `/status` | 运行时全景：累计计数、成功率、延迟分布、吞吐、域名分布、队列快照 |
 | GET  | `/result/:id?timeout=N` | 长轮询拉取 HTML（默认 25s） |
@@ -237,8 +244,11 @@ seimi-render 默认Chromum内核渲染,没有你的登录态。要渲染「登�
 | `url` | 提交的 URL |
 | `state` | `pending` / `running` / `succeeded` / `failed` |
 | `html` | 渲染后的完整 HTML（仅 `succeeded` 时有） |
+| `js_result` | `exec_js` 的执行结果（任意 JSON 值：对象/数组/字符串/数字/null）。仅请求了 `exec_js` 且脚本有返回值时出现；脚本无返回值（void）时该字段不出现；脚本异常/超时则任务 `failed`，`error` 以 `exec_js` 开头 |
 | `error` | 失败原因（仅 `failed` 时有）。**反爬拦截类失败**的 `error` 以 `blocked:` 开头，典型形如 `blocked: google /sorry/ page (2 retries exhausted)`（命中 Google 验证页 → 自动退避重试 → 重试耗尽判 blocked） |
 | `blocked` | 布尔，仅在 `state=failed` 且失败因反爬拦截时为 `true`（典型场景：Google `/sorry/` 验证页重试耗尽）。配合上面的 `error` 前缀 `blocked:`，调用方可显式区分「反爬拦截」与「超时/网络错」两条失败路径 |
+| `final_url` | 渲染结束时页面的**实际 URL**（重定向/SSO 跳转/登录墙跳转可见；成功与失败路径都可能有值，失败时多为错误页或超时瞬间的 URL） |
+| `auth_wall` | 布尔，仅 `succeeded` 时可能出现，为 `true` 表示渲染出的是**登录页**（final_url 路径命中登录特征，如 `/login`、`/sso`、`/signin`）。session 过期的典型信号：调用方应提示重新同步 cookie（浏览器插件或 `POST /cookies`）并重试，而不是把登录页内容当业务数据。保守启发式（仅 URL 特征，不做内容判断），漏报时可用 `final_url` 自行判断；命中时附 `auth_wall_reason`（命中的路径段） |
 | `elapsed_ms` | 从开始渲染到当前的耗时（ms） |
 
 ### 提交任务（异步）
@@ -266,6 +276,21 @@ curl -X POST http://localhost:8088/render \
 - `url`（必填）：http/https 地址
 - `settle_ms`（可选，默认 2000）：`loadFinished` 后等待 JS 执行的毫秒数（0–30000）；搜狐这类内容多的页面建议 2500+
 - `long_poll_ms`（可选，默认 0）：长轮询等待结果的毫秒数（>0 时阻塞至完成或超时，上限 60000）
+- `exec_js`（可选）：页面加载 + settle 后在页面主世界执行的 JS 代码（≤1MB）。代码在 async 函数体内运行：裸表达式片段自动作为结果（如 `1+1` → `js_result:2`），多语句/含 `await` 用 `return` 显式回传（结果需可 JSON 序列化，上限 16MB）；无返回值 = void（响应无 `js_result` 字段）。脚本抛错/超时/语法错误 → 任务 `failed`，`error` 形如 `exec_js error: <原因>`（含精确的语法错误信息）。可用来在已登录页面同源调用站点 API（`fetch` 自动带 cookie）
+- `exec_js_timeout_ms`（可选，默认 10000，钳制 1000–30000）：`exec_js` 执行超时（页面内 Promise.race 兜底，超时的脚本仍在后台运行但任务按失败终结）
+
+`exec_js` 示例——在已注入登录态的页面里调站点私有接口：
+
+```bash
+curl -X POST http://localhost:8088/render -H "Content-Type: application/json" -d '{
+  "url": "https://example.com/console",
+  "output": "",
+  "exec_js": "var r = await fetch(\"/api/data\", {credentials:\"include\"}); return await r.json();",
+  "exec_js_timeout_ms": 15000,
+  "settle_ms": 3000,
+  "long_poll_ms": 60000}'
+# => {"state":"succeeded","js_result":{...接口返回的 JSON...},"elapsed_ms":...}
+```
 
 ### 查询状态
 
@@ -288,6 +313,33 @@ curl "http://localhost:8088/result/a3f1...?timeout=30000"
 ```
 
 > **反爬失败类型化**：当渲染 Google 等站点命中验证页（典型为 `/sorry/`）时，seimi-render 会自动退避重试（全新 page，2 次），重试仍命中则判为 `blocked` 失败——响应里 `error` 前缀 `blocked:` + `blocked:true` 双标记，调用方可据此显式区分「反爬拦截」与「超时/网络错」，前者建议换引擎/走代理/IP 池，后者只需重试。统计层 `/status` 同时累加 `blocked_exhausted`（见下）。
+
+### 轻量直取（`POST /fetch`）
+
+「带浏览器登录态的取数服务」：对 JSON/REST 端点直接发请求，**不建 Chromium page、不跑 JS、不渲染**。自动携带 CookieStore 里目标域的登录 cookie，跟随全局代理（http/socks5）与 `--proxy-bypass` 分流——与页面渲染网络路径一致，行为可互相印证。适合 agent 对已登录站点的 API 多轮探索（发现字段元数据 → 试 JQL → 翻页），比 `render_url` + `exec_js` 页内 fetch 快一个数量级。
+
+```bash
+curl -X POST http://localhost:8088/fetch \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://jira.example.com/rest/api/2/search","method":"POST","body":"{\"jql\":\"project=CUXV5VR\",\"maxResults\":50}"}'
+# => {"url":"...","final_url":"...","status_code":200,"elapsed_ms":180,
+#     "cookies_applied":6,"headers":{"content-type":"application/json;charset=utf-8",...},
+#     "body_truncated":false,"body":"{\"expand\":\"schema\",\"issues\":[...]}"}%`
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `url` | 必填 | http/https 目标（过 SSRF 校验，与 `/render` 同规则） |
+| `method` | `GET` | `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`HEAD` |
+| `headers` | — | 请求头对象（如 `{"Accept":"application/json"}`）。显式给 `Cookie` 会**覆盖**自动注入的登录 cookie；`Content-Length`/`Host`/`Connection` 由网络栈自管，忽略 |
+| `body` | — | 请求体字符串（POST/PUT/PATCH；默认按 `application/json` 发送，可经 headers 覆盖） |
+| `timeout_ms` | `15000` | 钳制 1000–60000 |
+| `response_format` | `text` | 响应体输出模式：`text`（JSON 字符串内嵌，适合 JSON/HTML API；**二进制会经 UTF-8 有损转换，勿用于附件**，>10MB 截断标 `body_truncated`）/ `base64`（二进制安全，字段 `body_base64`+`body_bytes`，**超过 50MB 返回 413 明确拒绝**——base64 再撑大 1/3 对传输不友好，超大文件用 file）/ `file`（落盘到 `data-dir/fetch/`，返回 `saved_path`+`bytes`，适合大附件） |
+| `filename` | URL 末段 | 仅 `response_format=file` 时的落盘文件名；净化为 basename（仅字母数字 `._-`，防路径穿越），同名冲突自动加序号 |
+
+响应：`status_code` / `final_url`（重定向后）/ `headers`（对象，`set-cookie` 不回显）/ `body`（text 模式）或 `body_base64`+`body_bytes`（base64 模式）或 `saved_path`+`bytes`（file 模式）/ `cookies_applied`（自动携带的 cookie 数，session 是否健康的直观信号——为 0 通常意味着还没同步该域登录态）。默认 UA 与 stealth 统一指纹一致。失败（超时 504 / 网络错 502 / SSRF 400 / base64 超限 413）返回 `{"error":...,...}`。MCP 通道对应工具为 `fetch_url`（支持 `response_format` 透传）。
+
+> 判断拿到的是不是有效数据：REST API session 过期常返回 `200 + {}` 或登录页 HTML——结合 `cookies_applied` 与 `render_url` 的 `auth_wall` 字段判断，必要时先用插件重同步 cookie。
 
 ### 运行时状态（`GET /status`）
 
@@ -552,6 +604,7 @@ Agent 可通过两个 MCP 工具完成完整录制闭环：
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `render_url` | `record_network`(bool, 默认 false) | 渲染时录制网络流量，结果用 `get_har` 取 |
+| `render_url` | `exec_js`(string) / `exec_js_timeout_ms`(number, 默认 10000) | 页面加载后执行 JS 并把结果作为 `[exec_js result]` 小节附在文本输出（void 标注 `[exec_js result: void]`）；语义与 HTTP `/render` 一致 |
 | `get_har` | `task_id`(必填) | 取指定任务的 HAR，返回 HAR 1.2 JSON。归档有 ~0.3s 延时，渲染刚结束立即取可能提示「not available」，稍等重试即可 |
 
 ### HAR 内容
@@ -597,13 +650,14 @@ seimi-render 内置一个 **MCP（Model Context Protocol）server**（默认端�
 
 ### 暴露的 tools
 
-共 5 个工具，按「语义层级」从高到低排列——agent 优先用高层工具，底层 `render_url` 兜底所有它覆盖不到的场景：
+共 6 个工具，按「语义层级」从高到低排列——agent 优先用高层工具，底层 `render_url` 兜底所有它覆盖不到的场景：
 
 | tool | 作用 | 必填参数 | 可选参数 |
 |------|------|----------|----------|
 | `browser_search` | 关键词搜索：自动构造搜索引擎 URL 并渲染，返回结果列表。**没给具体 URL、只想「搜一下/查一下」时优先用** | `query` | `engine`(google/bing/baidu/duckduckgo，默认 google)、`settle_ms`(2500)、`timeout_ms`(45000) |
 | `get_web_content` | 读单篇文章正文：用 readability 提取干净 markdown（去导航/广告/侧栏）。**给了具体 URL 要读全文时优先用** | `url` | `md_algorithm`(readability/conservative，默认 readability)、`settle_ms`(2500)、`timeout_ms`(45000) |
-| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000)、`record_network`(false，开启 HAR 网络录制，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network)) |
+| `fetch_url` | 轻量直取：带登录态 cookie + 全局代理直接请求 JSON/REST 端点，返回原始响应体（不走浏览器渲染，百毫秒级）。**目标是 API/JSON 端点时优先用** | `url` | `method`(GET/POST/PUT/PATCH/DELETE/HEAD，默认 GET)、`body`(请求体，默认按 JSON 发)、`headers`(请求头对象，显式 Cookie 覆盖登录态)、`timeout_ms`(15000)、`response_format`(text 默认/base64 二进制安全——附件下载场景，>50MB 拒绝) |
+| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000)、`record_network`(false，开启 HAR 网络录制，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network))、`exec_js`、`exec_js_timeout_ms` |
 | `get_har` | 按 task_id 取网络录制 HAR：配合 `render_url` 的 `record_network=true` 使用，返回标准 HAR 1.2 JSON | `task_id` | — |
 | `get_render_result` | 按 task_id 补取已提交任务的结果：`render_url` 超时返回 `running` 后轮询，或重新拉取已完成产物 | `task_id` | `output`(markdown/html/screenshot/pdf，默认 markdown)、`timeout_ms`(5000) |
 
@@ -611,7 +665,8 @@ seimi-render 内置一个 **MCP（Model Context Protocol）server**（默认端�
 
 - 用户说「搜一下 / 查一下 / Google it / 帮我了解…」但没给 URL → `browser_search`
 - 用户给了文章/页面 URL 要读正文 → `get_web_content`
-- 需要 PDF / 截图 / 原始 HTML / conservative markdown / 手动拼搜索引擎 URL / 调 settle → `render_url`
+- 目标是 API/JSON 端点（含已登录站点的私有 REST API）→ `fetch_url`（比渲染快一个数量级，无需 HTML 反解）
+- 需要 PDF / 截图 / 原始 HTML / conservative markdown / 手动拼搜索引擎 URL / 调 settle / 页面内执行 JS → `render_url`
 - 上一步返回 `state=running`（慢站点/反爬没渲完）→ `get_render_result` 轮询补取
 
 **输出格式说明**（`render_url` 的 `output` 参数）：

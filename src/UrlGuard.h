@@ -96,6 +96,8 @@ struct HostDnsResult {
     HostDnsVerdict verdict = HostDnsVerdict::Allow;
     QHostAddress badAddress;   // BlockPrivate 时命中的首个内网地址
     QString errorString;       // BlockUnresolved 时解析错误描述
+    QHostAddress resolvedAddress;  // Allow 时解析出的首个地址（IPv4 优先）。失败自诊断用：
+                                   //   透出到任务错误信息，agent 可据此识别 fake-ip/私网等网络形态
 };
 
 // 对域名做同步 DNS 解析并判定网段。跳过未指定地址（:: / 0.0.0.0，不可路由），
@@ -109,24 +111,31 @@ inline HostDnsResult checkHostDns(const QString& host) {
         r.errorString = info.errorString();
         return r;
     }
+    QHostAddress firstV4;   // IPv4 优先（诊断信息里 v4 比 v6 直观，fake-ip/私网段判定也以 v4 为主）
+    QHostAddress firstAny;
     for (const QHostAddress& a : info.addresses()) {
         if (a == QHostAddress(QLatin1String("::"))
             || a == QHostAddress(QLatin1String("0.0.0.0"))) {
             continue;  // 未指定地址不可路由，跳过（字面量分支仍拦截它们）
         }
+        if (firstAny.isNull()) firstAny = a;
+        if (a.protocol() == QAbstractSocket::IPv4Protocol && firstV4.isNull()) firstV4 = a;
         if (isPrivateOrLoopbackAddress(a)) {
             r.verdict = HostDnsVerdict::BlockPrivate;
             r.badAddress = a;
             return r;
         }
     }
+    r.resolvedAddress = firstV4.isNull() ? firstAny : firstV4;
     return r;  // Allow
 }
 
 // 综合 SSRF 判定：URL 是否可安全渲染。
 // 先对 host 字面量（可能是 IP）判；若是域名，再经 checkHostDns 解析判定。
 // 返回空串表示通过；非空串为拒绝原因（可回传给客户端）。
-inline std::string urlSsrfCheck(const QUrl& url) {
+// resolvedIpOut（可选）：通过时写出解析出的目标 IP（字面量直接回填，域名取 DNS 首个
+// 解析结果，v4 优先）。供调用方存进任务做失败自诊断（proxy/fake-ip 提示），不影响判定。
+inline std::string urlSsrfCheck(const QUrl& url, std::string* resolvedIpOut = nullptr) {
     if (!url.isValid()) return "invalid url";
     QString host = url.host().trimmed();
     if (host.isEmpty()) return "missing host";
@@ -138,6 +147,7 @@ inline std::string urlSsrfCheck(const QUrl& url) {
             return ("target IP " + host.toStdString()
                     + " is private/loopback/link-local (blocked by SSRF guard)");
         }
+        if (resolvedIpOut) *resolvedIpOut = host.toStdString();
         return std::string();  // 公网 IP 字面量，放行
     }
 
@@ -152,9 +162,29 @@ inline std::string urlSsrfCheck(const QUrl& url) {
             return ("target " + host.toStdString() + " resolves to private/loopback "
                     + r.badAddress.toString().toStdString() + " (blocked by SSRF guard)");
         case HostDnsVerdict::Allow:
+            if (resolvedIpOut) *resolvedIpOut = r.resolvedAddress.toString().toStdString();
             return std::string();  // 全部解析结果均为公网，放行
     }
     return std::string();
+}
+
+// 仅解析、不判定：返回 URL host 的目标 IP（字面量直接回；域名 DNS 首个结果，v4 优先；
+// 解析失败返回空）。供 --no-ssrf 模式下的失败自诊断使用——此时不做 SSRF 判定，
+// 但网络类失败仍需要知道目标 IP 形态（fake-ip/私网 hint）。
+inline std::string resolveHostIp(const QUrl& url) {
+    const QString host = url.host().trimmed();
+    if (host.isEmpty()) return std::string();
+    QHostAddress literal(host);
+    if (!literal.isNull()) return host.toStdString();
+    const HostDnsResult r = checkHostDns(host);
+    if (r.verdict == HostDnsVerdict::Allow) {
+        return r.resolvedAddress.toString().toStdString();
+    }
+    // BlockPrivate：badAddress 即解析出的（内网）地址——诊断场景恰恰最关心它。
+    if (r.verdict == HostDnsVerdict::BlockPrivate) {
+        return r.badAddress.toString().toStdString();
+    }
+    return std::string();  // 解析失败
 }
 
 } // namespace seimi

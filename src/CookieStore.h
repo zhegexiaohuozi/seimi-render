@@ -77,6 +77,13 @@ public:
     // 任意线程：取概览。maxDomains 限制返回条数（默认 200）。
     Overview snapshot(int maxDomains = 200) const;
 
+    // 任意线程（POST /fetch）：取出向指定目标 host 发请求应携带的 cookie，
+    // 供绕过 Chromium 管线的直取请求手工构造 Cookie 头。匹配语义（RFC 6265 简化）：
+    //   hostOnly 精确匹配；否则 domain 后缀匹配（gwm.cn 命中 jira.gwm.cn）；
+    //   过期剔除（session cookie 保留）；secure cookie 仅 https 目标返回；
+    //   path 不做区分（API 直取场景 path 语义弱化，宁可多带）。
+    std::vector<Cookie> cookiesForHost(const QString& host, bool targetIsHttps) const;
+
 private:
     // 把单条 Cookie 注入 profile（GUI 线程内）。
     static void injectOne(QWebEngineProfile* profile, const Cookie& c);
@@ -87,7 +94,7 @@ private:
     void deletePersistedFile();    // 删除 cookies.dat
     // cookie 全量 JSON 序列化/反序列化（明文中间态）。
     QByteArray serializeStore() const;
-    void parseStore(const QByteArray& json);
+    bool parseStore(const QByteArray& json);   // false = JSON 损坏（调用方告警）
     // 加密：AES-256-CBC + HMAC-SHA256(Encrypt-then-MAC)。失败返回空。
     QByteArray encryptData(const QByteArray& plain) const;
     QByteArray decryptData(const QByteArray& cipher) const;

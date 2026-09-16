@@ -20,6 +20,8 @@
 #include <QWebEngineCookieStore>
 #include <QWebEngineProfile>
 
+#include <QtLogging>
+
 #include <algorithm>
 
 namespace seimi {
@@ -268,6 +270,33 @@ CookieStore::Overview CookieStore::snapshot(int maxDomains) const {
 }
 
 // ============================================================
+// 按目标 host 取 cookie（POST /fetch 直取路径）
+// ============================================================
+
+std::vector<CookieStore::Cookie> CookieStore::cookiesForHost(const QString& host,
+                                                             bool targetIsHttps) const {
+    const QString h = host.toLower();
+    if (h.isEmpty()) return {};
+    const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+    QMutexLocker locker(&m_mutex);
+    std::vector<Cookie> out;
+    for (const auto& kv : m_store) {
+        const Cookie& c = kv.second;
+        if (!targetIsHttps && c.secure) continue;              // secure 仅 https 携带
+        if (c.expirationDate > 0 && c.expirationDate <= nowSec) continue;  // 过期剔除
+        const QString domain = QString::fromStdString(c.domain).toLower();
+        if (domain.isEmpty()) continue;
+        if (c.hostOnly) {
+            if (h != domain) continue;
+        } else {
+            if (h != domain && !h.endsWith(QLatin1Char('.') + domain)) continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+// ============================================================
 // ====== 加密持久化 ======
 // ============================================================
 
@@ -333,7 +362,14 @@ QByteArray CookieStore::decryptData(const QByteArray& data) const {
     QByteArray encKey = pbkdf2(key, "enc", 1, kKeyLen);
     QAESEncryption aes(QAESEncryption::AES_256, QAESEncryption::CBC,
                        QAESEncryption::PKCS7);
-    return aes.decode(cipher, encKey, iv);
+    QByteArray plain = aes.decode(cipher, encKey, iv);
+    // 关键：成员 decode() 返回的明文【带 PKCS7 padding 字节】（qaes 文档明确要求另行
+    // RemovePadding）。不去掉则尾部 padding 让 QJsonDocument::fromJson 报
+    // "garbage at the end"，parseStore 静默失败 → 重启后 cookie 全部"丢失"。
+    bool padOk = false;
+    plain = aes.removePadding(plain, &padOk);
+    if (!padOk) return QByteArray();   // padding 非法 = 密文损坏或密钥不匹配
+    return plain;
 }
 
 QByteArray CookieStore::serializeStore() const {
@@ -356,11 +392,12 @@ QByteArray CookieStore::serializeStore() const {
     return doc.toJson(QJsonDocument::Compact);
 }
 
-void CookieStore::parseStore(const QByteArray& json) {
-    // 解析明文 JSON，填充 m_store + m_pending（让首次 applyTo 注入）+ 重建概览
+bool CookieStore::parseStore(const QByteArray& json) {
+    // 解析明文 JSON，填充 m_store + m_pending（让首次 applyTo 注入）+ 重建概览。
+    // 返回 false = JSON 损坏（loadFromDisk 据此告警，不再静默）。
     QJsonParseError err;
     QJsonDocument doc = QJsonDocument::fromJson(json, &err);
-    if (err.error != QJsonParseError::NoError || !doc.isArray()) return;
+    if (err.error != QJsonParseError::NoError || !doc.isArray()) return false;
     for (const QJsonValue& v : doc.array()) {
         if (!v.isObject()) continue;
         QJsonObject o = v.toObject();
@@ -382,34 +419,58 @@ void CookieStore::parseStore(const QByteArray& json) {
         m_overview[dk] = m_overview.count(dk) ? m_overview[dk] + 1 : 1;
         ++m_total;
     }
+    return true;
 }
 
 void CookieStore::saveToDisk() {
-    // 调用者持锁。把 m_store 序列化 + 加密 + 写文件。
+    // 调用者持锁。把 m_store 序列化 + 加密 + 原子写文件。
+    // 原子写（tmp + rename，同 metrics.json）：进程在写入瞬间被硬杀也不会把既有
+    // vault 截断成半截文件——原地 truncate+write 一旦中断整个 cookie 库即告损坏。
     if (m_dataDir.isEmpty()) return;
     QByteArray plain = serializeStore();
     QByteArray cipher = encryptData(plain);
     if (cipher.isEmpty()) return; // 加密失败（无盐/无密钥）静默跳过
-    QFile f(m_dataDir + "/cookies.dat");
-    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        f.write(cipher);
-        f.close();
-        f.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+    const QString finalPath = m_dataDir + "/cookies.dat";
+    const QString tmpPath = finalPath + ".tmp";
+    QFile tmp(tmpPath);
+    if (!tmp.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    tmp.write(cipher);
+    tmp.close();
+    tmp.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+    // rename 覆盖：POSIX 原子。Windows 下 QFile::rename 目标存在会失败，先删目标。
+    if (QFile::exists(finalPath)) QFile::remove(finalPath);
+    if (!tmp.rename(finalPath)) {
+        QFile::remove(tmpPath);   // 清理残留 tmp
     }
 }
 
 void CookieStore::loadFromDisk() {
-    // 构造期调用（单线程）。读文件 + 解密 + 解析。
+    // 构造期调用（单线程）。读文件 + 解密 + 解析。失败一律告警（不静默）——
+    // cookie 凭空消失会直接表现为"登录态丢失"，排查必须可见。
     if (m_dataDir.isEmpty()) return;
     QFile f(m_dataDir + "/cookies.dat");
     if (!f.exists()) return;            // 首次运行，无文件
-    if (!f.open(QIODevice::ReadOnly)) return;
+    if (!f.open(QIODevice::ReadOnly)) {
+        qWarning("[cookies] WARN: cannot open %s for read, starting fresh",
+                 f.fileName().toUtf8().constData());
+        return;
+    }
     QByteArray cipher = f.readAll();
     f.close();
     if (cipher.isEmpty()) return;
     QByteArray plain = decryptData(cipher);
-    if (plain.isEmpty()) return;        // 解密失败（篡改/盐不匹配）→ 安全降级：视为无持久化
-    parseStore(plain);
+    if (plain.isEmpty()) {
+        // 解密/完整性校验失败（密钥不匹配或文件损坏）→ 安全降级：视为无持久化。
+        qWarning("[cookies] WARN: %s failed integrity check or decryption "
+                 "(key mismatch / corrupted file), starting fresh",
+                 f.fileName().toUtf8().constData());
+        return;
+    }
+    if (!parseStore(plain)) {
+        qWarning("[cookies] WARN: %s content is not valid JSON, starting fresh",
+                 f.fileName().toUtf8().constData());
+        return;
+    }
 }
 
 void CookieStore::deletePersistedFile() {

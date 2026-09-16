@@ -42,7 +42,9 @@ public:
     QString submit(QString url, int settleDelayMsec, OutputMask outputs,
                    ImageFormat imageFormat, MdAlgorithm mdAlgorithm, qint64 nowMsec,
                    ExtractAlgorithm extractAlgorithm = ExtractAlgorithm::None,
-                   bool recordHar = false);
+                   bool recordHar = false,
+                   QString execJs = QString(), int execJsTimeoutMsec = 10000,
+                   QString resolvedIp = QString());
 
     // 消费者：GUI 渲染线程【非阻塞】取一个 Pending 任务并置 Running。
     // 队列空时立即返回 nullptr——供事件循环回调轮询，绝不阻塞。
@@ -58,6 +60,10 @@ public:
         bool imageTruncated{false};              // 截图是否因超高度上限被截断
         MdAlgorithm mdAlgorithmUsed{MdAlgorithm::Conservative};  // markdown 实际算法（可观测性）
         QString serpJson;                   // SERP 结构化提取结果 JSON（extract!=None 且成功时填）
+        QString jsJson;                     // exec_js 结果值的 JSON 文本（空=void/未请求）
+        QString finalUrl;                   // 渲染结束时页面实际 URL（重定向/SSO/登录墙跳转可见）
+        bool authWall{false};               // 登录墙启发式命中（final_url 路径特征）
+        QString authWallReason;             // 命中特征描述（供调用方复核）
     };
 
     // 任务的可观测快照（持锁拷贝）。供 HTTP/WS 工作线程安全读取任务字段——
@@ -77,7 +83,11 @@ public:
         ImageFormat resolvedImageFmt{ImageFormat::Png};  // 截图实际编码格式
         bool imageTruncated = false;       // 截图是否因超高度上限被截断
         MdAlgorithm mdAlgorithmUsed{MdAlgorithm::Conservative};  // markdown 实际算法
-        QString serpJson;                   // SERP 结构化提取结果 JSON（成功时）
+        QString serpJson;                   // SERP 提取结果 JSON（成功时）
+        QString jsJson;                     // exec_js 结果值的 JSON 文本（成功时；空=void/未请求）
+        QString finalUrl;                   // 渲染结束时页面实际 URL（成功与失败都可能有值）
+        bool authWall = false;              // 登录墙启发式命中（成功时；登录页是"成功渲染出的登录页"）
+        QString authWallReason;             // 命中特征描述
         OutputMask outputs = 0;            // 请求的输出类型位标记
         qint64 createdAtMsec = 0;
         qint64 startedAtMsec = 0;
@@ -88,7 +98,9 @@ public:
     void reportSucceeded(const QString& id, const RenderResult& result, qint64 nowMsec);
 
     // GUI 渲染线程：把任务标记为失败，唤醒所有等待该任务的长轮询线程。
-    void reportFailed(const QString& id, QString error, qint64 nowMsec);
+    // finalUrl 为渲染失败瞬间的页面 URL（chrome-error 页/超时时可能拿到），可为空。
+    void reportFailed(const QString& id, QString error, qint64 nowMsec,
+                      const QString& finalUrl = QString());
 
     // 长轮询：阻塞至多 timeoutMsec，直到该任务到达终态。
     // 超时则返回当前指针（可能仍非终态，由调用方判 done）。仅供同线程（GUI）使用，跨线程读用 snapshot()。

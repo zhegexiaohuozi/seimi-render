@@ -49,6 +49,9 @@ public:
     // 使迟到的异步回调命中 if(!m_busy||!m_task||!m_page) 早退守卫。
     void abort();
 
+    // 失败自诊断上下文（RenderPool::start 注入，可空）：网络类失败时读代理快照/切换时刻。
+    void setProxyConfig(ProxyConfig* pc) { m_proxyConfig = pc; }
+
 signals:
     // 单任务终态完成信号（携带 task id），供主线程转发给 WebSocket 推送。
     void taskFinished(const QString& id);
@@ -66,7 +69,11 @@ private:
     void onHtmlCollected(const QString& html);
     void decCollect();          // 异步采集计数递减 + 收尾检查
     void tryFinishCollect();    // 检查采集是否全部到齐
-    void finishFailure(const QString& reason);
+    // 终结任务为失败。networkRelated=true 时在错误信息里追加自诊断上下文
+    //（proxy 快照/resolved IP/fake-ip 与过渡期 hint），让 agent 读错误即可自修复。
+    void finishFailure(const QString& reason, bool networkRelated = false);
+    // 网络类失败的自诊断后缀（"proxy=... | resolved=... | hint: ..."）。
+    QString netDiagSuffix() const;
     // —— Google 反爬 sorry 页检测 + worker 内退避重试 ——
     // loadFinished 后查最终 URL（BlockDetect::isGoogleSorryUrl）。命中则以全新 page 退避
     // 重试（铁律 3：每次尝试全新 QWebEnginePage），耗尽后标记 blocked 失败透出（C3）。
@@ -104,6 +111,21 @@ private:
     void extractSerp();
     void readSerpChunks(int idx, int total, const QString& acc);
 
+    // —— exec_js：settle 后在页面主世界执行调用方 JS 并回传结果 ——
+    // task->execJs 非空时在 collect() 阶段与 toHtml/pdf/截图并行执行（参与 m_pendingCollect 计数）。
+    // 包装协议：用户代码以 JSON 字符串字面量嵌入，页面内 AsyncFunction 构造器双探测——
+    // 裸表达式片段按 return (U) 包装（控制台补全语义，自动作为结果），SyntaxError 再按语句体
+    // 构造（多语句 + 显式 return/await）；仍失败则精确上报语法错误。Promise.race 做页面内超时
+    // 兜底；结果 JSON.stringify 后分块存 window.__seimiExec.chunks（防 runJavaScript 大返回值
+    // 截断，与 readability/serp 同协议），C++ 逐块读取拼接。
+    // void 语义：脚本无返回值 -> m_execJsResult 留空 -> 响应不含 js_result 字段。
+    // 异常/超时/结果超限 -> m_execJsError 非空 -> tryFinishCollect 走 finishFailure（不静默吞错）。
+    void runExecJs();
+    void pollExecJsStatus(int attemptsLeft);       // 轮询 window.__seimiExec.n（Qt 不等待 Promise 时的兜底）
+    void readExecJsChunks(int idx, int total, const QString& acc);
+    // exec_js 轮询间隔。选 200ms：人无感、事件循环零负担（QTimer::singleShot 链）。
+    static constexpr int kExecJsPollIntervalMsec = 200;
+
     // —— 截图（PNG，所见即所得，区别于 pdf 的打印输出）——
     // 异步状态机：
     //   1) JS 取页全高 H 和视口宽
@@ -137,6 +159,7 @@ private:
     RenderQueue* m_queue;
     qint64 m_loadTimeoutMsec;
     HarRecorder* m_harRecorder;   // HAR 录制中枢（可空，未开 --remote-debugging-port 时为 nullptr）
+    ProxyConfig* m_proxyConfig = nullptr;  // 失败自诊断上下文（可空；RenderPool::start 注入）
     QWebEngineView* m_view;     // 当前任务专属 view（持有 page）
     QWebEnginePage* m_page;     // m_view->page()，缓存便于连信号；view 销毁时随之失效
 
@@ -162,6 +185,13 @@ private:
     // SERP 提取结果 JSON（仅 extractAlgorithm==BaiduSerp 时填充）。
     // 空则表示未启用或提取失败，tryFinishCollect 不透传 serpJson（降级正常渲染）。
     QString m_serpJsonResult;
+    // exec_js 结果值的 JSON 文本（仅 task->execJs 非空时填充；空 = void）。
+    QString m_execJsResult;
+    // exec_js 执行错误（异常/超时/结果超限/脚本无法解析）。非空时任务以失败终结。
+    QString m_execJsError;
+    // 采集起点（settle 后、toHtml 前）的页面最终 URL：重定向/SSO/登录墙跳转的可见性载体。
+    // 失败路径用 m_page->url() 现场取，不走此缓存。
+    QString m_finalUrl;
 public:
     // 视口是否用 stealth 统一尺寸（由 RenderPool::start 设置一次，所有 worker 共享）。
     // public static：RenderPool 需在 start() 设置，worker 在 assign() 读取。

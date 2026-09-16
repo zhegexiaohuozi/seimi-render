@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: 2026 wanghaomiao.cn
 # SPDX-License-Identifier: Apache-2.0
 
-"""seimi-render 全接口自动回测脚本：构建 → 起三实例(无密码/有密码/HAR录制) → 跑 10 组接口用例 → 报告。
+"""seimi-render 全接口自动回测脚本：构建 → 起四实例(无密码/有密码/HAR录制/代理分流) → 跑 13 组接口用例 → 报告。
 
 设计文档: docs/superpowers/specs/2026-06-28-regression-test-design.md
+v1.3.0 扩展：K 组 exec_js、L 组 /fetch 直取、M 组代理分流（scheme 纠错 + bypass 双栈 + 失败自诊断），
+B/E/G 组补 final_url / auth_wall / MCP fetch_url / serverInfo.version 断言。
 """
 import argparse
 import atexit
@@ -36,13 +38,38 @@ except ImportError:
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 
+# 净化代理环境变量（必须在任何 requests 调用与子进程启动之前）：
+# 1) requests 会尊重 http_proxy/https_proxy，把 127.0.0.1 的回测请求也送进系统代理——
+#    Clash 等对回环目标会间歇性返回空 body 的 502，造成大规模假失败；
+# 2) 子进程实例继承本环境，Qt 网络栈行为也会被代理 env 影响。
+# 回测只访问 127.0.0.1 与公网目标，一律直连。
+for _k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+    os.environ.pop(_k, None)
+os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+os.environ["no_proxy"] = "127.0.0.1,localhost"
+
 # 临时高位端口，避开默认 8088/8089/8090，防与开发中的实例冲突。
 NO_AUTH_PORTS = {"http": 18088, "ws": 18089, "mcp": 18090}
 AUTH_PORTS = {"http": 18188, "ws": 18189, "mcp": 18190}
 HAR_PORTS = {"http": 18288, "ws": 18289, "mcp": 18290}  # 带 --remote-debugging-port 的录制实例
+BYPASS_PORTS = {"http": 18388, "ws": 18389, "mcp": 18390}  # 带 --proxy + --proxy-bypass 的分流实例
 
 # HAR 录制实例的 Chromium remote debugging 端口（CDP 端点）。
 HAR_CDP_PORT = 19222
+
+# 分流实例（D）的「死代理」：故意指向无监听的回环端口。
+# --proxy 用拼写错误的 socket5://（验证 scheme 自动纠错），绕过列表放行 example.com，
+# 其余目标（example.org）走死代理必失败（验证 bypass 分流 + ERR_PROXY 失败自诊断）。
+DEAD_PROXY_HOST = "127.0.0.1"
+DEAD_PROXY_PORT = 17899
+BYPASS_PROXY_ARG = f"socket5://{DEAD_PROXY_HOST}:{DEAD_PROXY_PORT}"  # 正确拼写为 socks5
+# ⚠️ bypass/非 bypass 目标绝不能用 example.com/org/net：Chromium 对这些 RFC 2606 保留域
+# 有隐式永真直连规则（implicit bypass rules），无论是否在 bypass 列表都直连——
+# 验证不了分流。gitee.com（bypass 命中→直连成功）与 www.qq.com（非命中→走死代理失败）无歧义。
+BYPASS_LIST = "gitee.com"
+URL_BYPASS_HIT = "https://gitee.com/"        # 在 bypass 列表 → 死代理下仍直连成功
+URL_BYPASS_MISS = "http://www.qq.com/"       # 不在列表 → 走死代理必失败（ERR_PROXY）
+BYPASS_STDERR_FILE = "build/test-reports/bypass-instance.stderr.log"
 
 AUTH_PASSWORD = "testpass_2024"
 # token = sha256("seimi-render:" + password) 的 hex，须与服务端 HttpServer::computeToken 一致。
@@ -51,6 +78,13 @@ EXPECTED_TOKEN = hashlib.sha256(("seimi-render:" + AUTH_PASSWORD).encode()).hexd
 # 真实渲染目标（内容足够丰富，能验证 markdown/截图质量）。
 URL_SOHU = "https://www.sohu.com/"
 URL_BING_SEARCH = "https://www.bing.com/search?q=seimi+render"
+# 登录墙/重定向验证目标（优先选国内网络稳定可达的站点：github 直连在国内时通时断，
+# 会造成回测间歇性假失败）。
+URL_GITEE_LOGIN = "https://gitee.com/login"     # 200，路径段命中 auth_wall 启发式
+URL_GITEE_HTTP = "http://gitee.com/"            # 301 → https（验证重定向跟随 + final_url）
+URL_API_GITHUB = "https://api.github.com/"      # JSON API（未认证可能 403 限流；国内直连不稳，
+                                                 #   用例带网络不可达降级）
+URL_BLACKHOLE = "http://203.0.113.1/"           # TEST-NET-3 黑洞：SSRF 放行、必连接超时（504 用例）
 
 RENDER_LONG_POLL_MS = 45000   # B 系列长轮询
 RENDER_HTTP_TIMEOUT = 50      # HTTP 读超时（秒），略大于长轮询窗口
@@ -378,7 +412,8 @@ def find_qt_bin():
     return None
 
 
-def start_instance(binary, ports, password=None, tag="instance", remote_debug_port=None):
+def start_instance(binary, ports, password=None, tag="instance", remote_debug_port=None,
+                   extra_args=None, stderr_file=None):
     args = [
         binary,
         "--host", HOST,
@@ -393,13 +428,20 @@ def start_instance(binary, ports, password=None, tag="instance", remote_debug_po
         args += ["--password", password]
     if remote_debug_port:
         args += ["--remote-debugging-port", str(remote_debug_port)]
+    if extra_args:
+        args += list(extra_args)
 
     _log("boot", f"启动 {tag} http://127.0.0.1:{ports['http']} ...")
+    stderr_fh = None
     try:
         kwargs = dict(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        if stderr_file:
+            os.makedirs(os.path.dirname(stderr_file), exist_ok=True)
+            stderr_fh = open(stderr_file, "wb")
+            kwargs["stderr"] = stderr_fh
         env = os.environ.copy()
         # Windows 未部署二进制：把 Qt bin 前置到 PATH，否则 STATUS_DLL_NOT_FOUND。
         qt_bin = find_qt_bin()
@@ -429,6 +471,7 @@ def start_instance(binary, ports, password=None, tag="instance", remote_debug_po
         return None
     proc._ports = ports       # 挂个属性，收尾时打印用
     proc._tag = tag
+    proc._stderr_fh = stderr_fh
     _procs.append(proc)
     return proc
 
@@ -533,7 +576,8 @@ class CaseResult:
 
 
 class Case:
-    def __init__(self, cid, name, group, assertion, func, needs_auth=False, needs_har=False):
+    def __init__(self, cid, name, group, assertion, func, needs_auth=False, needs_har=False,
+                 needs_bypass=False):
         self.id = cid
         self.name = name
         self.group = group
@@ -541,27 +585,32 @@ class Case:
         self.func = func
         self.needs_auth = needs_auth  # 是否需要密码实例（用于 --no-auth 跳过）
         self.needs_har = needs_har    # 是否需要 HAR 录制实例（用于 --no-har 跳过）
+        self.needs_bypass = needs_bypass  # 是否需要代理分流实例（用于 --no-bypass 跳过）
 
 
 class CaseContext:
     def __init__(self, no_auth_http, no_auth_ws_port, no_auth_mcp_port,
-                 auth_http=None, auth_ws_port=None, har_http=None):
+                 auth_http=None, auth_ws_port=None, har_http=None,
+                 bypass_http=None, bypass_stderr_file=None):
         self.http = no_auth_http
         self.ws_port = no_auth_ws_port
         self.mcp_port = no_auth_mcp_port
         self.auth_http = auth_http                     # 有密码 HttpClient（带 token），可能 None
         self.auth_ws_port = auth_ws_port
         self.har_http = har_http                        # HAR 录制实例 HttpClient，可能 None
+        self.bypass_http = bypass_http                  # 代理分流实例 HttpClient，可能 None
+        self.bypass_stderr_file = bypass_stderr_file    # 分流实例启动日志（scheme 纠错断言用）
 
 
 class Runner:
     def __init__(self, ctx, only_groups=None, only_cases=None, no_auth=False, no_har=False,
-                 verbose=False):
+                 no_bypass=False, verbose=False):
         self.ctx = ctx
         self.only_groups = set(only_groups) if only_groups else None
         self.only_cases = set(only_cases) if only_cases else None
         self.no_auth = no_auth
         self.no_har = no_har
+        self.no_bypass = no_bypass
         self.verbose = verbose
         self.cases = []
         self.results = []
@@ -589,6 +638,10 @@ class Runner:
                 self.results.append(res)
                 continue
             if self.no_har and case.needs_har:
+                res.status = "skip"
+                self.results.append(res)
+                continue
+            if self.no_bypass and case.needs_bypass:
                 res.status = "skip"
                 self.results.append(res)
                 continue
@@ -736,14 +789,16 @@ def group_a(ctx):
 
 
 def _render_and_get(ctx, url, output, fmt=None, md_alg=None, long_poll_ms=RENDER_LONG_POLL_MS,
-                    expect_success=True, allow_retry=True):
-    """提交渲染 + 长轮询。expect_success=True 且首次仍 running 时用 /result/:id 补取一次。"""
+                    expect_success=True, allow_retry=True, http=None):
+    """提交渲染 + 长轮询。expect_success=True 且首次仍 running 时用 /result/:id 补取一次。
+    http：指定目标实例 HttpClient（默认 ctx.http 即无密码实例；M 组传分流实例）。"""
+    client = http or ctx.http
     body = {"url": url, "output": output, "long_poll_ms": long_poll_ms}
     if fmt:
         body["format"] = fmt
     if md_alg:
         body["md_algorithm"] = md_alg
-    r = ctx.http.post("/render", json_body=body, timeout=RENDER_HTTP_TIMEOUT)
+    r = client.post("/render", json_body=body, timeout=RENDER_HTTP_TIMEOUT)
     if r.status != 200:
         raise AssertionFailure(f"/render 状态 {r.status}: {r.text}")
     state = (r.json or {}).get("state")
@@ -751,9 +806,9 @@ def _render_and_get(ctx, url, output, fmt=None, md_alg=None, long_poll_ms=RENDER
 
     # 期望成功但首次仍 running：补取一次
     if expect_success and state == "running" and allow_retry and tid:
-        r2 = ctx.http.get(f"/result/{tid}",
-                          params={"output": output, "timeout": RETRY_POLL_TIMEOUT_MS},
-                          timeout=RETRY_POLL_HTTP_TIMEOUT)
+        r2 = client.get(f"/result/{tid}",
+                        params={"output": output, "timeout": RETRY_POLL_TIMEOUT_MS},
+                        timeout=RETRY_POLL_HTTP_TIMEOUT)
         if r2.status == 200 and r2.json and r2.json.get("state") == "succeeded":
             return r2
         # 补取后仍未成功：返回补取响应（让调用方断言失败并打印）
@@ -784,8 +839,10 @@ def group_b(ctx):
         tid = _check_succeeded(r, "B1")
         check(bool(r.json.get("markdown")), "B1: markdown 为空")
         check("md_algorithm_used" in r.json, f"B1: 缺 md_algorithm_used")
+        # v1.3.0：final_url 透出（重定向后最终地址，成功路径恒有）
+        check(bool(r.json.get("final_url")), f"B1: 缺 final_url: {r.text[:150]}")
     cases.append(Case("B1", "搜狐首页 markdown", "B",
-                      "POST /render output:markdown → succeeded + md 非空 + md_algorithm_used", b1))
+                      "POST /render output:markdown → succeeded + md 非空 + final_url", b1))
 
     def b2(c):
         r = _render_and_get(c, URL_SOHU, "html")
@@ -868,6 +925,28 @@ def group_b(ctx):
               f"B9: 期望 running/pending，实际 {state}: {r.text[:200]}")
     cases.append(Case("B9", "长轮询超时未成功", "B",
                       "long_poll_ms:1 → state∈{running,pending}（非 succeeded）", b9))
+
+    def b10(c):
+        # v1.3.0 登录墙检测：渲染 200 的登录页（gitee.com/login）→ auth_wall=true + reason 命中 login 段。
+        r = _render_and_get(c, URL_GITEE_LOGIN, "markdown", long_poll_ms=RENDER_LONG_POLL_MS)
+        _check_succeeded(r, "B10")
+        check(r.json.get("auth_wall") is True,
+              f"B10: auth_wall 非 true: auth_wall={r.json.get('auth_wall')} final_url={r.json.get('final_url')}")
+        check("login" in (r.json.get("auth_wall_reason") or ""),
+              f"B10: auth_wall_reason 未命中 login: {r.json.get('auth_wall_reason')}")
+        check("login" in (r.json.get("final_url") or ""),
+              f"B10: final_url 不含 login: {r.json.get('final_url')}")
+    cases.append(Case("B10", "登录墙检测 auth_wall", "B",
+                      "render gitee.com/login → succeeded + auth_wall:true + reason 含 login", b10))
+
+    def b11(c):
+        # v1.3.0 重定向可见性：http → https 301 后 final_url 反映最终地址。
+        r = _render_and_get(c, URL_GITEE_HTTP, "html", long_poll_ms=RENDER_LONG_POLL_MS)
+        _check_succeeded(r, "B11")
+        final_url = r.json.get("final_url") or ""
+        check(final_url.startswith("https://"), f"B11: final_url 未跟随到 https: {final_url}")
+    cases.append(Case("B11", "重定向 final_url", "B",
+                      "render http://gitee.com/（301→https）→ final_url 以 https:// 开头", b11))
 
     return cases
 
@@ -1078,6 +1157,25 @@ def group_e(ctx):
     cases.append(Case("E4", "多任务订阅", "E",
                       "WS 单连接连发 3 个 render → 收齐 3 个 finished（task_id 各异）", e4))
 
+    def e5(c):
+        # v1.3.0：finished 推送携带登录态可见性字段（final_url 恒有；auth_wall 命中时透出）。
+        ws = WsClient(ctx_ws_port(c))
+        ws.connect(timeout=10)
+        try:
+            ws.send_json({"action": "render", "url": URL_GITEE_LOGIN, "settle_ms": 2500})
+            got, ev = ws.recv_with_timeout(10)
+            check(got and ev.get("event") == "created", f"E5: 未收到 created: {ev}")
+            got2, ev2 = ws.recv_with_timeout(60)
+            check(got2 and ev2.get("event") == "finished", f"E5: 未收到 finished: {ev2}")
+            check(ev2.get("state") == "succeeded", f"E5: state={ev2.get('state')}")
+            check(bool(ev2.get("final_url")), f"E5: finished 缺 final_url: {ev2}")
+            check("login" in ev2.get("final_url", ""), f"E5: final_url 不含 login: {ev2}")
+            check(ev2.get("auth_wall") is True, f"E5: auth_wall 非 true: {ev2}")
+        finally:
+            ws.close()
+    cases.append(Case("E5", "finished 登录态字段", "E",
+                      "WS render gitee.com/login → finished 推送含 final_url + auth_wall:true", e5))
+
     return cases
 
 
@@ -1234,8 +1332,9 @@ def group_g(ctx):
         names = [t.get("name") for t in result.get("tools", [])]
         check("render_url" in names, f"G1: tools/list 无 render_url: {names}")
         check("get_render_result" in names, f"G1: tools/list 无 get_render_result: {names}")
+        check("fetch_url" in names, f"G1: tools/list 无 fetch_url: {names}")
     cases.append(Case("G1", "tools/list", "G",
-                      "MCP initialize + tools/list → 含 render_url + get_render_result", g1))
+                      "MCP initialize + tools/list → 含 render_url/get_render_result/fetch_url", g1))
 
     def g2(c):
         mcp = McpClient(c.mcp_port)
@@ -1286,6 +1385,31 @@ def group_g(ctx):
               f"G5: 错误内容未提到 url: {contents}")
     cases.append(Case("G5", "缺参数", "G",
                       "render_url 无 url → result.isError=true + 提示 url is required", g5))
+
+    def g6(c):
+        # v1.3.0：fetch_url 直取工具（POST /fetch 的 MCP 面）。
+        mcp = McpClient(c.mcp_port)
+        mcp.initialize()
+        result = mcp.call_tool("fetch_url", {"url": "https://example.com/"})
+        check(result.get("isError") is not True, f"G6: fetch_url 报错: {result}")
+        text = result.get("content", [{}])[0].get("text", "")
+        check("[fetch status=200" in text, f"G6: 头部缺 status=200: {text[:200]}")
+        check("Example Domain" in text, f"G6: body 缺 Example Domain: {text[:300]}")
+    cases.append(Case("G6", "fetch_url 直取", "G",
+                      "fetch_url(example.com) → [fetch status=200] + body 原文", g6))
+
+    def g7(c):
+        # v1.3.0：serverInfo.version 接 SEIMI_VERSION（非 unknown；semver 形态）。
+        mcp = McpClient(c.mcp_port)
+        result = mcp.initialize()
+        info = result.get("serverInfo", {})
+        ver = info.get("version", "")
+        check(info.get("name") == "seimi-render", f"G7: serverInfo.name={info.get('name')}")
+        check(ver != "unknown", f"G7: version 仍为 unknown: {info}")
+        check(re.fullmatch(r"\d+\.\d+\.\d+.*", ver) is not None,
+              f"G7: version 非 semver 形态: {ver}")
+    cases.append(Case("G7", "serverInfo.version", "G",
+                      "initialize → serverInfo.name=seimi-render + version 非 unknown（semver）", g7))
 
     return cases
 
@@ -1641,6 +1765,283 @@ def group_j(ctx):
 
 
 # ============================================================
+# §K exec_js 页面内 JS 执行（无密码实例；目标 example.com，快且稳定）
+# ============================================================
+def group_k(ctx):
+    cases = []
+
+    def _render_exec_js(c, code, timeout_ms=10000):
+        body = {"url": "https://example.com/", "output": "html", "settle_ms": 500,
+                "exec_js": code, "exec_js_timeout_ms": timeout_ms,
+                "long_poll_ms": RENDER_LONG_POLL_MS}
+        return ctx_http(c).post("/render", json_body=body, timeout=RENDER_HTTP_TIMEOUT)
+
+    def k1(c):
+        # 同步表达式：返回页面 URL 字符串
+        r = _render_exec_js(c, "location.href")
+        tid = _check_succeeded(r, "K1")
+        check(r.json.get("js_result") == "https://example.com/",
+              f"K1: js_result={r.json.get('js_result')!r}")
+    cases.append(Case("K1", "同步表达式", "K",
+                      "exec_js location.href → js_result == 页面 URL", k1))
+
+    def k2(c):
+        # async/Promise 自动等待
+        r = _render_exec_js(c, "(async () => 40 + 2)()")
+        _check_succeeded(r, "K2")
+        check(r.json.get("js_result") == 42, f"K2: js_result={r.json.get('js_result')!r}")
+    cases.append(Case("K2", "async/Promise", "K",
+                      "exec_js (async()=>40+2)() → js_result == 42", k2))
+
+    def k3(c):
+        # void：脚本无返回值 → js_result 字段不出现
+        r = _render_exec_js(c, "undefined")
+        _check_succeeded(r, "K3")
+        check("js_result" not in r.json, f"K3: void 不应出现 js_result: {r.text[:200]}")
+    cases.append(Case("K3", "void 无字段", "K",
+                      "exec_js undefined → 响应不含 js_result 字段", k3))
+
+    def k4(c):
+        # 脚本异常 → 任务失败且 error 指明 exec_js
+        r = _render_exec_js(c, "throw new Error('boom')")
+        state = (r.json or {}).get("state")
+        check(state == "failed", f"K4: 期望 failed，实际 {state}: {r.text[:200]}")
+        err = r.json.get("error") or ""
+        check("exec_js" in err, f"K4: error 未指明 exec_js: {err[:200]}")
+    cases.append(Case("K4", "脚本异常失败", "K",
+                      "exec_js throw → failed + error 含 exec_js", k4))
+
+    def k5(c):
+        # 同源 fetch：页面内调同源 API 拿结构化数据（exec_js 的核心场景）
+        r = _render_exec_js(c, "fetch('/').then(r => r.status)")
+        _check_succeeded(r, "K5")
+        check(r.json.get("js_result") == 200, f"K5: js_result={r.json.get('js_result')!r}")
+    cases.append(Case("K5", "同源 fetch", "K",
+                      "exec_js fetch('/').then(r=>r.status) → js_result == 200", k5))
+
+    return cases
+
+
+# ============================================================
+# §L /fetch 轻量直取（无密码实例）
+# ============================================================
+def _net_hijacked(j):
+    """探测网络路径劫持（路由器门户/DNS 劫持）：final_url 指向私网地址即视为被劫持。
+    实撞：家庭/企业路由（如中兴 zteRurl 门户）把不可达目标改写到 192.168.0.1 返回 200，
+    会把「黑洞超时」「重定向跟随」用例变成假失败。"""
+    try:
+        from urllib.parse import urlparse
+        h = urlparse(j.get("final_url") or "").hostname or ""
+        return h.startswith(("192.168.", "10.", "172.")) or h in ("127.0.0.1", "localhost")
+    except Exception:
+        return False
+
+
+def group_l(ctx):
+    cases = []
+
+    def _fetch(c, body, timeout=20):
+        return ctx_http(c).post("/fetch", json_body=body, timeout=timeout)
+
+    def l1(c):
+        # GET + 重定向跟随（gitee http→https 301）+ final_url + 响应头
+        r = _fetch(c, {"url": URL_GITEE_HTTP, "timeout_ms": 15000})
+        check(r.status == 200, f"L1: 状态 {r.status}: {r.text[:200]}")
+        j = r.json
+        check(j.get("status_code") == 200, f"L1: status_code={j.get('status_code')}")
+        if _net_hijacked(j):
+            return  # 网络路径被路由器劫持（重定向被门户吞掉），降级放行——链路本身已通
+        final_url = j.get("final_url") or ""
+        check(final_url.startswith("https://gitee.com/"),
+              f"L1: final_url 未跟随 301: {final_url}")
+        check(bool(j.get("body")), "L1: body 为空")
+        check("content-type" in (j.get("headers") or {}), f"L1: headers 缺 content-type: {j.get('headers')}")
+        check(j.get("body_truncated") is False, f"L1: body_truncated={j.get('body_truncated')}")
+        check(j.get("elapsed_ms", 0) >= 0, "L1: 缺 elapsed_ms")
+    cases.append(Case("L1", "GET+重定向", "L",
+                      "/fetch gitee(http→https) → 200 + final_url=https + body/headers", l1))
+
+    def l2(c):
+        # JSON API 直取（未认证可能 403 限流，body 恒为 JSON；国内直连 github 不稳，
+        # 网络不可达(502/504)时降级通过——链路本身已由 L1 覆盖）。
+        r = _fetch(c, {"url": URL_API_GITHUB, "timeout_ms": 10000})
+        check(r.status == 200, f"L2: 状态 {r.status}: {r.text[:200]}")
+        j = r.json
+        sc = j.get("status_code")
+        if sc in (200, 403):
+            body = j.get("body") or ""
+            check(body.lstrip().startswith("{"), f"L2: body 非 JSON 对象: {body[:120]}")
+        else:
+            check("error" in j, f"L2: 降级路径需为网络类 error 响应: {r.text[:150]}")
+    cases.append(Case("L2", "JSON API 直取", "L",
+                      "/fetch api.github.com → status∈{200,403}+JSON body（网络不可达降级通过）", l2))
+
+    def l3(c):
+        # 自定义 headers + POST + body（echo 语义验证：向 httpbin 发 JSON）
+        r = _fetch(c, {"url": "https://httpbin.org/post", "method": "POST",
+                       "body": '{"k":"v"}', "headers": {"X-Custom": "regression"},
+                       "timeout_ms": 15000})
+        if r.status == 200 and (r.json or {}).get("status_code") == 200:
+            body = r.json.get("body") or ""
+            check('"k"' in body and '"v"' in body, f"L3: 回显 body 缺发送内容: {body[:200]}")
+        else:
+            # httpbin.org 偶发限流/不可达：降级断言（请求链路本身已由 L1/L2 覆盖）
+            check(r.status in (200, 502, 504), f"L3: httpbin 异常状态 {r.status}: {r.text[:150]}")
+    cases.append(Case("L3", "POST+headers+body", "L",
+                      "/fetch httpbin.org/post → 回显 body 含发送的 JSON（httpbin 不可达时降级断言）", l3))
+
+    def l4(c):
+        # 非法 method → 400
+        r = _fetch(c, {"url": "https://example.com/", "method": "TRACE"})
+        check(r.status == 400, f"L4: 期望 400，实际 {r.status}")
+        check("method" in r.text, f"L4: body={r.text}")
+    cases.append(Case("L4", "非法 method", "L",
+                      "/fetch method:TRACE → 400 + method 提示", l4))
+
+    def l5(c):
+        # SSRF：回环目标被拦（/fetch 与 /render 同一判定）
+        r = _fetch(c, {"url": f"http://127.0.0.1:{NO_AUTH_PORTS['http']}/health"})
+        check(r.status == 400, f"L5: 期望 400，实际 {r.status}")
+        check("SSRF" in r.text, f"L5: body={r.text}")
+    cases.append(Case("L5", "SSRF 拦截", "L",
+                      "/fetch 127.0.0.1 → 400 + blocked by SSRF", l5))
+
+    def l6(c):
+        # 黑洞地址（TEST-NET-3，SSRF 放行）→ 504 超时。
+        # 路由器劫持场景：黑洞连接被门户改写 → 200 + final_url 指向私网（降级放行）。
+        r = _fetch(c, {"url": URL_BLACKHOLE, "timeout_ms": 1000}, timeout=15)
+        if r.status == 200 and _net_hijacked(r.json or {}):
+            return
+        check(r.status == 504, f"L6: 期望 504，实际 {r.status}: {r.text[:150]}")
+        check("timed out" in r.text, f"L6: body={r.text}")
+    cases.append(Case("L6", "超时 504", "L",
+                      "/fetch 203.0.113.1 timeout_ms:1000 → 504 + timed out", l6))
+
+    def l7(c):
+        # cookie 自动携带：注入 example.com 域 cookie → /fetch cookies_applied>=1
+        ctx_http(c).post("/cookies", json_body={"cookies": [
+            {"name": "reg_k", "value": "reg_v", "domain": "example.com", "path": "/"}]})
+        r = _fetch(c, {"url": "https://example.com/", "timeout_ms": 10000})
+        check(r.status == 200, f"L7: 状态 {r.status}: {r.text[:150]}")
+        check((r.json or {}).get("cookies_applied", 0) >= 1,
+              f"L7: cookies_applied<1: {r.text[:200]}")
+    cases.append(Case("L7", "登录态 cookie 携带", "L",
+                      "POST /cookies(example.com) + /fetch example.com → cookies_applied>=1", l7))
+
+    def l8(c):
+        # 二进制安全输出：base64 模式拉小图标，解码后与 body_bytes 一致且魔数正确
+        import base64 as b64mod
+        r = _fetch(c, {"url": "https://gitee.com/favicon.ico",
+                       "timeout_ms": 15000, "response_format": "base64"}, timeout=25)
+        check(r.status == 200, f"L8: 状态 {r.status}: {r.text[:150]}")
+        j = r.json or {}
+        check("body_base64" in j, f"L8: 缺 body_base64: {r.text[:150]}")
+        if "body_base64" not in j:
+            return
+        raw = b64mod.b64decode(j["body_base64"])
+        check(len(raw) == j.get("body_bytes", -1),
+              f"L8: 解码长度 {len(raw)} != body_bytes {j.get('body_bytes')}")
+        check(raw[:4] == b"\x00\x00\x01\x00", f"L8: ICO 魔数不对: {raw[:6]!r}")
+        check("body" not in j, "L8: base64 模式不应再出现 body 字段")
+    cases.append(Case("L8", "base64 二进制输出", "L",
+                      "/fetch gitee favicon response_format:base64 → 解码一致 + ICO 魔数", l8))
+
+    def l9(c):
+        # file 模式：落盘到 data-dir/fetch/ 并返回 saved_path；文件名净化（路径穿越拒入）
+        import os as _os
+        r = _fetch(c, {"url": "https://gitee.com/favicon.ico",
+                       "timeout_ms": 15000, "response_format": "file",
+                       "filename": "../../evil/../icon.ico"}, timeout=25)
+        check(r.status == 200, f"L9: 状态 {r.status}: {r.text[:150]}")
+        j = r.json or {}
+        check(j.get("saved") is True, f"L9: saved 非 true: {r.text[:200]}")
+        path = j.get("saved_path") or ""
+        check(bool(path), "L9: 缺 saved_path")
+        check(_os.path.isfile(path), f"L9: 文件不存在: {path}")
+        check(_os.path.getsize(path) == j.get("bytes", -1), "L9: 落盘大小不一致")
+        # 安全属性：穿越必须依赖分隔符——净化的目标是 basename 内无任何路径分隔符，
+        # 且文件直接位于 fetch 目录内（字面 ".." 字符在扁平名里无害）。
+        name = _os.path.basename(path)
+        check("/" not in name and "\\" not in name,
+              f"L9: basename 残留路径分隔符: {name!r}")
+        check(_os.path.dirname(path).endswith("fetch"),
+              f"L9: 未落盘在 fetch 目录内: {path}")
+    cases.append(Case("L9", "file 落盘+文件名净化", "L",
+                      "/fetch response_format:file + filename 含 ../ → 净化落盘 + saved_path 有效", l9))
+
+    return cases
+
+
+# ============================================================
+# §M 代理分流（分流实例 D：--proxy socket5://死端口 --proxy-bypass example.com）
+# ============================================================
+def group_m(ctx):
+    cases = []
+
+    def m1(c):
+        # scheme 拼写自动纠错：启动日志 socket5 → socks5 的 WARN
+        check(bool(c.bypass_stderr_file) and os.path.isfile(c.bypass_stderr_file),
+              f"M1: 启动日志文件不存在: {c.bypass_stderr_file}")
+        with open(c.bypass_stderr_file, "r", encoding="utf-8", errors="replace") as f:
+            log = f.read()
+        check("auto-corrected to 'socks5'" in log,
+              f"M1: 启动日志缺自动纠错 WARN: {log[:400]}")
+        check("'socket5'" in log, f"M1: WARN 未引用原始 typo: {log[:400]}")
+    cases.append(Case("M1", "scheme 自动纠错", "M",
+                      "--proxy socket5:// 启动 → WARN auto-corrected to 'socks5'", m1,
+                      needs_bypass=True))
+
+    def m2(c):
+        # 初始代理经纠错后生效：GET /proxy 回显 socks5 + host/port
+        r = c.bypass_http.get("/proxy")
+        check(r.status == 200, f"M2: 状态 {r.status}")
+        j = r.json or {}
+        check(j.get("type") == "socks5", f"M2: type={j.get('type')}（应已纠错为 socks5）: {r.text}")
+        check(j.get("host") == DEAD_PROXY_HOST, f"M2: host={j.get('host')}")
+        check(j.get("port") == DEAD_PROXY_PORT, f"M2: port={j.get('port')}")
+    cases.append(Case("M2", "初始代理回显", "M",
+                      "GET /proxy → type:socks5 + host/port（纠错后语义）", m2, needs_bypass=True))
+
+    def m3(c):
+        # 渲染栈 bypass 分流：gitee.com 在 bypass 列表 → 死代理下仍直连成功
+        #（gitee 非 Chromium 隐式直连域，成功只能归因于 bypass）。
+        r = _render_and_get(c, URL_BYPASS_HIT, "html",
+                            long_poll_ms=RENDER_LONG_POLL_MS, http=c.bypass_http)
+        _check_succeeded(r, "M3")
+    cases.append(Case("M3", "渲染 bypass 直连", "M",
+                      "分流实例 render gitee.com（bypass）→ 死代理下 succeeded", m3,
+                      needs_bypass=True))
+
+    def m4(c):
+        # 非 bypass 域名走死代理 → 失败 + 错误自诊断（ERR_PROXY + proxy= 快照）
+        r = _render_and_get(c, URL_BYPASS_MISS, "html",
+                            long_poll_ms=RENDER_LONG_POLL_MS, expect_success=False,
+                            allow_retry=False, http=c.bypass_http)
+        state = (r.json or {}).get("state")
+        check(state == "failed", f"M4: 期望 failed，实际 {state}: {r.text[:200]}")
+        err = r.json.get("error") or ""
+        check("ERR_PROXY" in err, f"M4: error 缺 ERR_PROXY: {err[:250]}")
+        check(f"proxy=socks5://{DEAD_PROXY_HOST}:{DEAD_PROXY_PORT}" in err,
+              f"M4: error 缺代理快照诊断: {err[:250]}")
+    cases.append(Case("M4", "走死代理失败+自诊断", "M",
+                      "分流实例 render qq.com（非 bypass）→ failed + ERR_PROXY + proxy= 诊断", m4,
+                      needs_bypass=True))
+
+    def m5(c):
+        # /fetch 侧 QNAM factory 分流与渲染一致：gitee.com 直连成功
+        r = c.bypass_http.post("/fetch", json_body={"url": URL_BYPASS_HIT,
+                                                    "timeout_ms": 15000}, timeout=25)
+        check(r.status == 200, f"M5: 状态 {r.status}: {r.text[:200]}")
+        check((r.json or {}).get("status_code") == 200,
+              f"M5: status_code={(r.json or {}).get('status_code')}")
+    cases.append(Case("M5", "fetch bypass 一致", "M",
+                      "分流实例 /fetch gitee.com（bypass）→ 200（与渲染分流一致）", m5,
+                      needs_bypass=True))
+
+    return cases
+
+
+# ============================================================
 # §7 main：参数解析 + 编排
 # ============================================================
 def parse_args():
@@ -1650,7 +2051,10 @@ def parse_args():
                     help="从零清理后全量重建（Windows 脚本自带每次清空；Linux rm -rf build；macOS 传 clean 给 package.sh）")
     ap.add_argument("--no-auth", action="store_true", help="只测无密码实例（跳过 F 组）")
     ap.add_argument("--no-har", action="store_true", help="不测 HAR 录制实例（跳过 J 组）")
-    ap.add_argument("--group", help="只跑某组（A/B/C/D/E/F/G/H/I/J），逗号分隔")
+    ap.add_argument("--no-bypass", action="store_true",
+                    help="不测代理分流实例（跳过 M 组；该实例走死代理端口验证 bypass 分流，"
+                         "需公网可达 example.com / example.org）")
+    ap.add_argument("--group", help="只跑某组（A/B/C/D/E/F/G/H/I/J/K/L/M），逗号分隔")
     ap.add_argument("--case", help="只跑指定用例，逗号分隔（如 B1,B6）")
     ap.add_argument("--keep-servers", action="store_true", help="测完不杀进程（调试用）")
     ap.add_argument("--verbose", action="store_true", help="打印每请求/响应详情")
@@ -1694,6 +2098,19 @@ def main():
             cleanup_all(keep=args.keep_servers)
             return EXIT_ENV
 
+    # 分流实例 D：--proxy 故意拼错的 socket5:// 指向死端口（验证 scheme 自动纠错），
+    # --proxy-bypass 放行 example.com（bypass 域名穿死代理直连成功，其余域名走死代理失败
+    # 并带自诊断）。启动日志落盘供 M1 断言纠错 WARN。
+    bypass_proc = None
+    if not args.no_bypass:
+        bypass_proc = start_instance(
+            binary, BYPASS_PORTS, tag="实例D(代理分流)",
+            extra_args=["--proxy", BYPASS_PROXY_ARG, "--proxy-bypass", BYPASS_LIST],
+            stderr_file=BYPASS_STDERR_FILE)
+        if not bypass_proc or not wait_ready(BYPASS_PORTS["http"], tag="实例D"):
+            cleanup_all(keep=args.keep_servers)
+            return EXIT_ENV
+
     instances = {
         "no_auth": {"http_port": NO_AUTH_PORTS["http"], "ws_port": NO_AUTH_PORTS["ws"],
                     "mcp_port": NO_AUTH_PORTS["mcp"], "pid": no_auth_proc.pid, "ready": True},
@@ -1705,10 +2122,16 @@ def main():
         instances["har"] = {"http_port": HAR_PORTS["http"], "ws_port": HAR_PORTS["ws"],
                             "mcp_port": HAR_PORTS["mcp"], "cdp_port": HAR_CDP_PORT,
                             "pid": har_proc.pid, "ready": True}
+    if bypass_proc:
+        instances["bypass"] = {"http_port": BYPASS_PORTS["http"], "ws_port": BYPASS_PORTS["ws"],
+                               "mcp_port": BYPASS_PORTS["mcp"],
+                               "proxy": BYPASS_PROXY_ARG, "bypass": BYPASS_LIST,
+                               "pid": bypass_proc.pid, "ready": True}
 
     no_auth_http = HttpClient(NO_AUTH_PORTS["http"], verbose=args.verbose)
     auth_http = HttpClient(AUTH_PORTS["http"], token=EXPECTED_TOKEN, verbose=args.verbose) if auth_proc else None
     har_http = HttpClient(HAR_PORTS["http"], verbose=args.verbose) if har_proc else None
+    bypass_http = HttpClient(BYPASS_PORTS["http"], verbose=args.verbose) if bypass_proc else None
     ctx = CaseContext(
         no_auth_http=no_auth_http,
         no_auth_ws_port=NO_AUTH_PORTS["ws"],
@@ -1716,12 +2139,15 @@ def main():
         auth_http=auth_http,
         auth_ws_port=AUTH_PORTS["ws"] if auth_proc else None,
         har_http=har_http,
+        bypass_http=bypass_http,
+        bypass_stderr_file=BYPASS_STDERR_FILE if bypass_proc else None,
     )
 
     only_groups = args.group.split(",") if args.group else None
     only_cases = args.case.split(",") if args.case else None
     runner = Runner(ctx, only_groups=only_groups, only_cases=only_cases,
-                    no_auth=args.no_auth, no_har=args.no_har, verbose=args.verbose)
+                    no_auth=args.no_auth, no_har=args.no_har, no_bypass=args.no_bypass,
+                    verbose=args.verbose)
 
     print()
     all_cases_by_group = []
@@ -1736,6 +2162,9 @@ def main():
         ("H. Cookie", group_h),
         ("I. Proxy", group_i),
         ("J. HAR网络录制", group_j),
+        ("K. exec_js 页面内JS", group_k),
+        ("L. fetch 轻量直取", group_l),
+        ("M. 代理分流与自诊断", group_m),
     ]:
         cases = group_fn(ctx)
         all_cases_by_group.append((group_name, cases))
@@ -1747,7 +2176,8 @@ def main():
         for case in runner.cases:
             if case.group == group_letter and runner._should_run(case) \
                     and not (runner.no_auth and case.needs_auth) \
-                    and not (runner.no_har and case.needs_har):
+                    and not (runner.no_har and case.needs_har) \
+                    and not (runner.no_bypass and case.needs_bypass):
                 return True
         return False
 

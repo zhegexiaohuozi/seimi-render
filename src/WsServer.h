@@ -55,7 +55,9 @@ public:
 
 public slots:
     // 主线程收到 RenderPool::taskFinished 时调用，向所有订阅者推送 finished。
-    void notifyFinished(const QString& taskId, const QString& state, bool blocked = false);
+    // finalUrl/authWall：登录态可见性（重定向/登录墙跳转），agent 据此判断掉登录。
+    void notifyFinished(const QString& taskId, const QString& state, bool blocked = false,
+                        const QString& finalUrl = QString(), bool authWall = false);
 
 private slots:
     void onNewConnection();

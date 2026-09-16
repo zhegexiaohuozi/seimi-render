@@ -9,6 +9,7 @@
 #include "ProxyConfig.h"
 #include "SsrfInterceptor.h"
 #include "StealthProfile.h"
+#include "UrlGuard.h"
 
 #include <QApplication>
 #include <QBuffer>
@@ -16,6 +17,7 @@
 #include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
+#include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPainter>
@@ -107,6 +109,7 @@ void RenderWorker::assign(RenderTaskPtr task) {
     m_pendingCollect = 0;
     m_retryCount = 0;
     m_sorryHits = 0;
+    m_finalUrl.clear();
     m_task->startedAtMsec = nowMsec();
     startAttempt();
 }
@@ -173,7 +176,7 @@ void RenderWorker::onLoadFinished(bool ok) {
         finishFailure(QStringLiteral(
             "page load failed: target unreachable (Chromium network error page). "
             "Likely DNS/connection/SSL failure. url=%1")
-            .arg(curUrl.toString()));
+            .arg(curUrl.toString()), /*networkRelated=*/true);
         return;
     }
 
@@ -193,7 +196,7 @@ void RenderWorker::onLoadFinished(bool ok) {
                 } else {
                     finishFailure(QStringLiteral(
                         "page load finished with error (http 4xx/5xx or network); "
-                        "body too small (%1 bytes)").arg(bodyLen));
+                        "body too small (%1 bytes)").arg(bodyLen), /*networkRelated=*/true);
                 }
             });
         return;
@@ -468,10 +471,188 @@ void RenderWorker::readSerpChunks(int idx, int total, const QString& acc) {
         readSerpChunks(idx + 1, total, acc + v.toString());
     });
 }
+
+// ============================================================
+// RenderWorker —— exec_js（页面主世界执行调用方 JS 并回传结果）
+// ============================================================
+
+// exec_js 结果体积上限。防超大返回值（如整页 fetch 大响应）撑爆任务表内存
+// （终态任务最多保留 300 个，html/pdf 均为原样透传，这里给 JS 结果设显式边界）。
+static constexpr qsizetype kExecJsMaxResultBytes = 16 * 1024 * 1024;
+
+// 把任意 QString 编码为 JS 字符串字面量（含引号，安全转义）。
+// exec_js 用户代码以字符串形态传入 AsyncFunction 构造器（而非语法拼接进包装器），
+// 这样语法错误能被构造器捕获并精确上报，而不是让整段包装器静默解析失败。
+static QString jsStringLiteral(const QString& s) {
+    QString out;
+    out.reserve(s.size() + 2);
+    out += QLatin1Char('"');
+    for (const QChar c : s) {
+        switch (c.unicode()) {
+            case '"':  out += QStringLiteral("\\\""); break;
+            case '\\': out += QStringLiteral("\\\\"); break;
+            case '\n': out += QStringLiteral("\\n"); break;
+            case '\r': out += QStringLiteral("\\r"); break;
+            case '\t': out += QStringLiteral("\\t"); break;
+            case '\b': out += QStringLiteral("\\b"); break;
+            case '\f': out += QStringLiteral("\\f"); break;
+            default:
+                if (c.unicode() < 0x20) {
+                    out += QStringLiteral("\\u%1").arg(int(c.unicode()), 4, 16, QLatin1Char('0'));
+                } else {
+                    out += c;
+                }
+        }
+    }
+    out += QLatin1Char('"');
+    return out;
+}
+
+// 注入 exec_js 包装器。协议（见 RenderPool.h 注释）：
+//   - 用户代码以 JSON 字符串字面量嵌入（jsStringLiteral），页面内用 AsyncFunction 构造器
+//     双探测：先按表达式包（return (U)，控制台补全语义——裸表达式片段自动作为结果），
+//     SyntaxError 再按语句体构造（多语句 + 显式 return / await）；仍 SyntaxError 则精确上报。
+//     非 SyntaxError（页面 CSP 禁 eval/Function 家族）如实上报不可用。
+//   - Promise.race 超时兜底：到期返回 {__seimiTimeout}，用户 Promise 照常运行但不等它。
+//   - settle() 把 {ok, isVoid?} / {ok:false, error} / {ok:true, json} JSON.stringify 后
+//     分块存 window.__seimiExec.chunks（48KB/块），返回 {n}（Qt 若等待 Promise 则直达）。
+//   - Qt runJavaScript 不等待 Promise 时回调拿不到 {n}，由 pollExecJsStatus 轮询兜底。
+void RenderWorker::runExecJs() {
+    if (!m_busy || !m_task || !m_page) { decCollect(); return; }
+
+    // 数值/字面量拼接（绝不用 .arg 注入用户内容）。
+    const QString wrapper = QStringLiteral(R"JS((function(){
+  var S = window.__seimiExec = {chunks: [], n: 0};
+  function settle(o){
+    var s;
+    try { s = JSON.stringify(o); } catch (e) { s = '{"ok":false,"error":"internal: settle stringify failed"}'; }
+    var CH = 48000;
+    for (var i = 0; i < s.length; i += CH) S.chunks.push(s.slice(i, i + CH));
+    S.n = S.chunks.length;
+    return {n: S.n};
+  }
+  var T = )JS")
+        + QString::number(m_task->execJsTimeoutMsec)
+        + QStringLiteral(R"JS(;
+  var U = )JS")
+        + jsStringLiteral(m_task->execJs)
+        + QStringLiteral(R"JS(;
+  var AF = Object.getPrototypeOf(async function(){}).constructor;
+  var f = null;
+  try {
+    f = new AF('return (' + U + ');');
+  } catch (eExpr) {
+    if (!(eExpr instanceof SyntaxError)) {
+      return settle({ok: false, error: 'exec_js unavailable: page CSP blocks dynamic function construction (' + String(eExpr && eExpr.message || eExpr) + ')'});
+    }
+    try {
+      f = new AF(U);
+    } catch (eBlock) {
+      if (eBlock instanceof SyntaxError) {
+        return settle({ok: false, error: 'exec_js syntax error: ' + String(eBlock && eBlock.message || eBlock)});
+      }
+      return settle({ok: false, error: 'exec_js unavailable: page CSP blocks dynamic function construction (' + String(eBlock && eBlock.message || eBlock) + ')'});
+    }
+  }
+  return Promise.race([
+    Promise.resolve().then(function(){ return f(); }).then(function(r){
+      if (r === undefined) return {__seimiVoid: true};
+      return {__seimiVal: r};
+    }),
+    new Promise(function(res){ setTimeout(function(){ res({__seimiTimeout: true}); }, T); })
+  ]).then(function(box){
+    if (box && box.__seimiVoid) return settle({ok: true, isVoid: true});
+    if (box && box.__seimiTimeout) return settle({ok: false, error: 'exec_js timed out after ' + T + ' ms'});
+    try { return settle({ok: true, json: JSON.stringify(box.__seimiVal)}); }
+    catch (e) { return settle({ok: false, error: 'result not JSON-serializable: ' + ((e && e.message) ? String(e.message) : String(e))}); }
+  }, function(err){
+    return settle({ok: false, error: (err && err.message) ? String(err.message) : String(err)});
+  });
+})())JS");
+
+    m_page->runJavaScript(wrapper, [this](const QVariant& v) {
+        if (!m_busy || !m_task || !m_page) { decCollect(); return; }
+        // 快路径：Qt 等待了 Promise，回调直接带 {n:N}。
+        const QJsonDocument d = QJsonDocument::fromJson(v.toString().toUtf8());
+        if (d.isObject() && d.object().value(QStringLiteral("n")).toInt(0) > 0) {
+            readExecJsChunks(0, d.object().value(QStringLiteral("n")).toInt(), QString());
+            return;
+        }
+        // 兜底：轮询 window.__seimiExec.n（超时预算 = exec 超时 + 2s 完成余量）。
+        const int polls = (m_task->execJsTimeoutMsec + 2000) / kExecJsPollIntervalMsec;
+        pollExecJsStatus(polls);
+    });
+}
+
+// 轮询 exec_js 完成标志（Qt runJavaScript 未等待 Promise 时的兜底路径）。
+// QTimer::singleShot 链推进，不阻塞事件循环；耗尽即超时失败。
+void RenderWorker::pollExecJsStatus(int attemptsLeft) {
+    if (!m_busy || !m_task || !m_page) { decCollect(); return; }
+    m_page->runJavaScript(
+        QStringLiteral("(window.__seimiExec && window.__seimiExec.n > 0) ? window.__seimiExec.n : 0"),
+        [this, attemptsLeft](const QVariant& v) {
+            if (!m_busy || !m_task || !m_page) { decCollect(); return; }
+            const int n = v.toInt(0);
+            if (n > 0) { readExecJsChunks(0, n, QString()); return; }
+            if (attemptsLeft <= 0) {
+                m_execJsError = QStringLiteral("exec_js timed out after %1 ms (poll)")
+                                    .arg(m_task->execJsTimeoutMsec + 2000);
+                decCollect();
+                return;
+            }
+            QTimer::singleShot(kExecJsPollIntervalMsec, this,
+                               [this, attemptsLeft]() { pollExecJsStatus(attemptsLeft - 1); });
+        });
+}
+
+// 逐块读取 exec_js 结果状态 JSON 并解析（与 readability/serp 分块协议一致）。
+void RenderWorker::readExecJsChunks(int idx, int total, const QString& acc) {
+    if (!m_busy || !m_task || !m_page) { decCollect(); return; }
+    if (acc.size() > kExecJsMaxResultBytes) {
+        m_execJsError = QStringLiteral("exec_js result exceeds %1 bytes limit")
+                            .arg(kExecJsMaxResultBytes);
+        decCollect();
+        return;
+    }
+    if (idx >= total) {
+        const QJsonDocument d = QJsonDocument::fromJson(acc.toUtf8());
+        if (!d.isObject()) {
+            // 包装器未按协议返回（脚本顶层语法错误会导致整段不执行，n 永远为 0 走轮询超时；
+            // 这里兜底协议破坏的情况）。
+            m_execJsError = QStringLiteral("exec_js wrapper returned malformed status");
+        } else {
+            const QJsonObject o = d.object();
+            if (!o.value(QStringLiteral("ok")).toBool()) {
+                m_execJsError = QStringLiteral("exec_js error: ")
+                                + o.value(QStringLiteral("error")).toString();
+            } else if (o.contains(QStringLiteral("json"))) {
+                m_execJsResult = o.value(QStringLiteral("json")).toString();
+            }
+            // ok && isVoid：保持 m_execJsResult 为空（void 语义）。
+        }
+        decCollect();
+        return;
+    }
+    QString js = QStringLiteral(
+        "(window.__seimiExec && window.__seimiExec.chunks ? "
+        "window.__seimiExec.chunks[%1] : null)").arg(idx);
+    m_page->runJavaScript(js, [this, idx, total, acc](const QVariant& v) {
+        if (!m_busy || !m_task || !m_page) { decCollect(); return; }
+        if (v.isNull()) {  // 页面重载致 window 变量丢失
+            m_execJsError = QStringLiteral("exec_js result lost (page reloaded during exec)");
+            decCollect();
+            return;
+        }
+        readExecJsChunks(idx + 1, total, acc + v.toString());
+    });
+}
 // settle 到期后发起采集。grab 同步、toHtml 异步，用 pendingCollect 协调：先同步截图，
 // 再 toHtml，回调到达后收尾。page/view 在 toHtml 回调返回前不能销毁。
 void RenderWorker::collect() {
     m_collectStarted = true;
+    // 最终 URL 在此刻定格（settle 已结束、采集尚未开始）：重定向/SSO/登录墙跳转的
+    // 可见性载体，透出到 final_url / auth_wall。
+    m_finalUrl = m_page->url().toString();
     m_collectedHtml.clear();
     m_collectedPdf.clear();
     m_collectedImage.clear();
@@ -502,6 +683,13 @@ void RenderWorker::collect() {
     if (m_task->wants(Output::Screenshot)) {
         ++m_pendingCollect;
         captureScreenshot();
+    }
+
+    // 4) exec_js：调用方 JS 在页面主世界执行（同源上下文，可发带 cookie 的 fetch）。
+    //    异步状态机（runJavaScript + 轮询兜底），完成后 decCollect() 收尾。
+    if (!m_task->execJs.isEmpty()) {
+        ++m_pendingCollect;
+        runExecJs();
     }
 }
 
@@ -538,6 +726,42 @@ void RenderWorker::decCollect() {
     tryFinishCollect();
 }
 
+// 登录墙启发式（保守，仅 URL 路径特征）：final_url 任一路径段命中登录特征词即判定。
+// 场景：Jira 等 session 过期后渲染 state=succeeded 但内容是登录页，agent 无从分辨——
+// auth_wall 让「该提示重新同步 cookie」可被自动判读。
+// 刻意不做内容特征（title/body 含 "Log in"）：误报会把正常内容页标成登录墙，代价高于
+// 漏报；漏报的兜底是 final_url 本身已透出，调用方可自行判断。
+static void detectAuthWall(const QString& finalUrl, bool* hit, QString* reason) {
+    *hit = false;
+    reason->clear();
+    if (finalUrl.isEmpty()) return;
+    const QString path = QUrl(finalUrl).path().toLower();
+    if (path.isEmpty()) return;
+    for (const QString& seg : path.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
+        // contains 类：login.jsp / wp-login.php / signin / sign-in / logon 等变体。
+        if (seg.contains(QLatin1String("login")) || seg.contains(QLatin1String("signin"))
+            || seg.contains(QLatin1String("sign-in")) || seg.contains(QLatin1String("logon"))) {
+            *hit = true;
+            *reason = QStringLiteral("path segment '%1'").arg(seg);
+            return;
+        }
+        // 精确类：sso / oauth / cas——SSO 网关的标志性一级路径段。
+        if (seg == QLatin1String("sso") || seg == QLatin1String("oauth")
+            || seg == QLatin1String("cas")) {
+            *hit = true;
+            *reason = QStringLiteral("path segment '%1'").arg(seg);
+            return;
+        }
+        // 前缀类：auth / authenticate / authorize（注意排除 /author/ 博客作者页）。
+        if (seg == QLatin1String("auth") || seg.startsWith(QLatin1String("authenticat"))
+            || seg.startsWith(QLatin1String("authorize")) || seg.startsWith(QLatin1String("authoris"))) {
+            *hit = true;
+            *reason = QStringLiteral("path segment '%1'").arg(seg);
+            return;
+        }
+    }
+}
+
 // HTML/markdown/pdf 全部到齐 -> 组装结果 -> 报告成功。
 void RenderWorker::tryFinishCollect() {
     if (!m_busy || !m_task) return;
@@ -572,6 +796,15 @@ void RenderWorker::tryFinishCollect() {
         result.serpJson = m_serpJsonResult;
     }
 
+    // exec_js 结果透传（空 = void / 未请求）。异常/超时不静默吞——显式失败。
+    if (!m_task->execJs.isEmpty()) {
+        if (!m_execJsError.isEmpty()) {
+            finishFailure(m_execJsError);
+            return;
+        }
+        result.jsJson = m_execJsResult;
+    }
+
     if (m_task->wants(Output::Pdf)) result.pdfData = m_collectedPdf;
 
     if (m_task->wants(Output::Screenshot)) {
@@ -586,9 +819,14 @@ void RenderWorker::tryFinishCollect() {
     if (!errCode.isEmpty()) {
         finishFailure(QStringLiteral(
             "page load failed: target unreachable (Chromium network error page %1). "
-            "Likely DNS/connection/SSL failure or proxy issue.").arg(errCode));
+            "Likely DNS/connection/SSL failure or proxy issue.").arg(errCode),
+            /*networkRelated=*/true);
         return;
     }
+
+    // 登录态可见性：final_url + auth_wall 启发式（见 detectAuthWall 注释）。
+    result.finalUrl = m_finalUrl;
+    detectAuthWall(m_finalUrl, &result.authWall, &result.authWallReason);
 
     QString id = m_task->id;
     m_queue->reportSucceeded(id, result, nowMsec());
@@ -596,11 +834,71 @@ void RenderWorker::tryFinishCollect() {
     emit taskFinished(id);
 }
 
-void RenderWorker::finishFailure(const QString& reason) {
+void RenderWorker::finishFailure(const QString& reason, bool networkRelated) {
     QString id = m_task->id;
-    m_queue->reportFailed(id, reason, nowMsec());
+    QString full = reason;
+    // 网络类失败附自诊断上下文：服务端自己知道的（当前代理、目标 IP 形态、代理切换时刻）
+    // 不该藏起来让调用方猜——把「Agent 碰壁求助人类」变成「Agent 读错误自修复」。
+    if (networkRelated) {
+        const QString diag = netDiagSuffix();
+        if (!diag.isEmpty()) full += QStringLiteral(" [%1]").arg(diag);
+    }
+    const QString finalUrl = m_page ? m_page->url().toString() : QString();
+    m_queue->reportFailed(id, full, nowMsec(), finalUrl);
     destroyPage();
     emit taskFinished(id);
+}
+
+// 网络类失败的自诊断后缀："proxy=... | resolved=... | hint: ..."。
+// 三类 hint（真实排障会话撞过的根因，backlog 条目 6/7）：
+//   1) resolved IP 落在 198.18.0.0/15 —— Clash TUN fake-ip 段被 DNS 抢答，直连/代理都掉坑；
+//   2) 代理开启且目标解析到私网地址 —— 代理节点通常够不着内网（建议 bypass 或 direct）；
+//   3) 代理刚切换（<60s）—— Chromium 网络栈轮询 + 在途连接残留的过渡期噪声。
+QString RenderWorker::netDiagSuffix() const {
+    QStringList parts;
+    QString proxySummary = QStringLiteral("direct");
+    qint64 lastChangeMsec = 0;
+    ProxySpec spec;
+    spec.type = ProxySpec::Type::Direct;
+    if (m_proxyConfig) {
+        spec = m_proxyConfig->snapshot();
+        proxySummary = proxySummaryOf(spec);
+        lastChangeMsec = m_proxyConfig->lastAppliedChangeMsec();
+    }
+    parts << QStringLiteral("proxy=%1").arg(proxySummary);
+
+    const QString rip = m_task ? m_task->resolvedIp : QString();
+    if (!rip.isEmpty()) {
+        parts << QStringLiteral("resolved=%1").arg(rip);
+        const QHostAddress addr(rip);
+        if (addr.protocol() == QAbstractSocket::IPv4Protocol) {
+            const quint32 v4 = addr.toIPv4Address();
+            if (v4 >= 0xC6120000u && v4 <= 0xC613FFFFu) {  // 198.18.0.0/15
+                parts << QStringLiteral(
+                    "hint: resolved IP is in the fake-ip range (198.18.0.0/15) - a TUN "
+                    "proxy's fake DNS is answering for this host; add the domain to the "
+                    "proxy's fake-ip-filter or fix dns.nameserver-policy");
+            }
+        }
+        if (spec.type != ProxySpec::Type::Direct && isPrivateOrLoopbackAddress(addr)) {
+            parts << QStringLiteral(
+                "hint: proxy is enabled but the target resolves to a private address - "
+                "the proxy node likely cannot reach the internal network "
+                "(bypass this domain via --proxy-bypass, or DELETE /proxy to go direct)");
+        }
+    }
+
+    if (m_proxyConfig && lastChangeMsec > 0) {
+        const qint64 since = nowMsec() - lastChangeMsec;
+        constexpr qint64 kProxyTransitionMsec = 60 * 1000;
+        if (since >= 0 && since < kProxyTransitionMsec) {
+            parts << QStringLiteral(
+                "hint: proxy was switched %1s ago - Chromium's network stack may still be "
+                "transitioning; retry in ~1min before concluding the target is broken")
+                .arg(since / 1000);
+        }
+    }
+    return parts.join(QStringLiteral(" | "));
 }
 
 // 命中 Google sorry 页：退避重试（全新 page），耗尽则标记 blocked 失败。
@@ -669,6 +967,8 @@ void RenderWorker::destroyPage() {
     m_readabilityHtml.clear();
     m_simplifiedHtml.clear();
     m_serpJsonResult.clear();
+    m_execJsResult.clear();
+    m_execJsError.clear();
     m_busy = false;          // 先标记不忙，但 m_view/m_page 保留（仍非 ready，等 destroyed 回调）
     if (m_page) {
         // 断开 loadFinished，避免旧 page 的陈旧加载信号。
@@ -939,6 +1239,8 @@ void RenderPool::start() {
     for (int i = 0; i < m_concurrency; ++i) {
         auto w = std::make_unique<RenderWorker>(m_profile, m_queue, m_loadTimeoutMsec,
                                                 m_harRecorder, this);
+        // 失败自诊断上下文：网络类错误附 proxy 快照 / 切换时刻 hint。
+        w->setProxyConfig(m_proxyConfig);
         connect(w.get(), &RenderWorker::taskFinished, this, &RenderPool::taskFinished);
         m_workers.push_back(std::move(w));
     }

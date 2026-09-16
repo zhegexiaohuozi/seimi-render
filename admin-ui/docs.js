@@ -24,8 +24,8 @@ const API_SPEC = {
       method: 'POST', path: '/render', auth: true, tryable: true,
       title: { zh: '提交渲染任务', en: 'Submit Render Task' },
       desc: {
-        zh: '提交 URL 进行 Chromium 渲染。可设置 JS 等待时间、输出格式（HTML/Markdown/PDF/截图）、长轮询直接取结果。目标 URL 需通过 SSRF 校验（拦截内网/回环/链路本地/云元数据地址）。',
-        en: 'Submit a URL for Chromium rendering. Options include JS wait time, output format (HTML/Markdown/PDF/screenshot), and long-poll to fetch the result directly. The target URL must pass SSRF validation (blocks intranet/loopback/link-local/cloud-metadata addresses).',
+        zh: '提交 URL 进行 Chromium 渲染。可设置 JS 等待时间、输出格式（HTML/Markdown/PDF/截图）、长轮询直接取结果。目标 URL 需通过 SSRF 校验（拦截内网/回环/链路本地/云元数据地址）。响应含 final_url（重定向/SSO/登录墙跳转后的最终地址）；渲染出的是登录页（session 过期）时带 auth_wall:true + auth_wall_reason——应提示重新同步 cookie 而非把登录页当业务数据。网络类失败的 error 附自诊断上下文（proxy 快照 / resolved IP / fake-ip、代理切换过渡期等 hint）。',
+        en: 'Submit a URL for Chromium rendering. Options include JS wait time, output format (HTML/Markdown/PDF/screenshot), and long-poll to fetch the result directly. The target URL must pass SSRF validation (blocks intranet/loopback/link-local/cloud-metadata addresses). The response carries final_url (the final address after redirects/SSO/login-wall jumps); when the rendered page is a login page (expired session), auth_wall:true + auth_wall_reason are set — re-sync cookies instead of treating the login page as business data. Network-type failures append self-diagnostics to error (proxy snapshot / resolved IP / hints such as fake-ip range or proxy-switch transition).',
       },
       params: [
         { name: 'url', type: 'string', required: true, desc: { zh: '目标 http(s) URL', en: 'Target http(s) URL' } },
@@ -36,13 +36,38 @@ const API_SPEC = {
         { name: 'md_algorithm', type: 'string', required: false, def: 'conservative', desc: { zh: 'Markdown 正文算法：conservative(零误伤) / readability(正文定位)', en: 'Markdown body algorithm: conservative (zero false-drop) / readability (body extraction)' } },
         { name: 'extract', type: 'string', required: false, def: 'none', desc: { zh: '站点特定结构化提取：baidu_serp(百度去广告) / bing_serp(必应) / google_serp(Google)。与 md_algorithm 互斥，设为非 none 时不转 markdown', en: 'Site-specific structured extraction: baidu_serp (Baidu, ad-removed) / bing_serp (Bing) / google_serp (Google). Mutually exclusive with md_algorithm; when set to non-none, markdown is not produced' } },
         { name: 'record_network', type: 'bool', required: false, def: 'false', desc: { zh: '是否录制网络并产出 HAR。需启动时带 --remote-debugging-port，否则静默降级（渲染正常但不产出 HAR）。录制会增加约 50-200ms 的 CDP attach 开销。结果用 GET /har/:id 取', en: 'Whether to record network traffic and produce a HAR. Requires --remote-debugging-port at startup; otherwise silently degrades (render succeeds but no HAR produced). Recording adds ~50-200ms of CDP attach overhead. Fetch the result via GET /har/:id' } },
+        { name: 'exec_js', type: 'string', required: false, def: '(不执行)', desc: { zh: 'settle 后在页面主世界执行的 JS（同源上下文：cookie 生效、fetch 自动带凭据）。最后一个表达式（或 return 值）作为结果经 js_result 回传；async/Promise 自动等待。上限 1MB。典型用途：在已登录页面内调站点私有 API、提取运行时状态', en: 'JS to execute in the page main world after settle (same-origin: cookies apply, fetch carries credentials). The last expression (or return value) is returned via js_result; async/Promise is awaited. Max 1MB. Typical use: call a site\'s private API inside a logged-in page, extract runtime state' } },
+        { name: 'exec_js_timeout_ms', type: 'int', required: false, def: '10000', desc: { zh: 'exec_js 执行超时毫秒，钳制 1000-30000（页面内 Promise.race + C++ 轮询双兜底）。超时任务失败', en: 'exec_js timeout in milliseconds, clamped to 1000-30000 (in-page Promise.race + C++ polling). Timeout fails the task' } },
       ],
       curl: `curl -X POST http://127.0.0.1:8088/render \\
   -H "Authorization: Bearer <token>" \\
   -H "Content-Type: application/json" \\
   -d '{"url":"https://example.com/","output":"markdown","long_poll_ms":30000}'`,
-      example: { task_id: 'abc123', url: 'https://example.com/', state: 'succeeded', elapsed_ms: 2341, markdown: '# Example Domain\n...' },
+      example: { task_id: 'abc123', url: 'https://example.com/', state: 'succeeded', final_url: 'https://example.com/', elapsed_ms: 2341, markdown: '# Example Domain\n...' },
       errors: [{ code: 400, msg: 'invalid json body / url required' }, { code: 403, msg: 'SSRF blocked: ...' }, { code: 401, msg: 'unauthorized' }],
+    },
+    {
+      method: 'POST', path: '/fetch', auth: true, tryable: true,
+      title: { zh: '轻量直取（JSON/REST API）', en: 'Lightweight Fetch (JSON/REST API)' },
+      desc: {
+        zh: '带登录态 cookie + 全局代理直接请求 JSON/REST 端点，返回原始响应体，完全绕过 Chromium 页面管线（整页渲染 ~6s → 直取百毫秒级），无需从渲染页的 <pre> 里反解 JSON。自动携带 CookieStore 中目标域的登录 cookie（cookies_applied 为 0 通常意味着还没同步该域登录态）；默认 UA 与 stealth 统一指纹一致；跟随全局代理（http/socks5）与 --proxy-bypass 分流，与页面渲染网络路径一致。重定向自动跟随（final_url 为最终地址）。响应体超过 10MB 截断（body_truncated=true）。目标 URL 需通过 SSRF 校验。',
+        en: 'Fetch a JSON/REST endpoint directly with saved login cookies and the global proxy, returning the raw response body — completely bypassing the Chromium page pipeline (full render ~6s → fetch in ~100ms), no need to extract JSON from a rendered <pre>. Automatically attaches the target domain\'s login cookies from the CookieStore (cookies_applied=0 usually means the domain\'s session has not been synced yet); the default UA matches the unified stealth fingerprint; follows the global proxy (http/socks5) and --proxy-bypass routing, consistent with the page-render network path. Redirects are followed automatically (final_url is the final address). Bodies over 10MB are truncated (body_truncated=true). The target URL must pass SSRF validation.',
+      },
+      params: [
+        { name: 'url', type: 'string', required: true, desc: { zh: '目标 http(s) URL', en: 'Target http(s) URL' } },
+        { name: 'method', type: 'string', required: false, def: 'GET', desc: { zh: 'HTTP 方法：GET(默认) / POST / PUT / PATCH / DELETE / HEAD', en: 'HTTP method: GET (default) / POST / PUT / PATCH / DELETE / HEAD' } },
+        { name: 'headers', type: 'object', required: false, def: '(无)', desc: { zh: '请求头对象，如 {"Accept":"application/json"}。显式给 Cookie 会覆盖自动注入的登录 cookie；Content-Length/Host/Connection 由网络栈自管（忽略）', en: 'Request headers object, e.g. {"Accept":"application/json"}. An explicit Cookie overrides the auto-injected login cookies; Content-Length/Host/Connection are managed by the network stack (ignored)' } },
+        { name: 'body', type: 'string', required: false, def: '(无)', desc: { zh: '请求体字符串（POST/PUT/PATCH）。默认按 application/json 发送，可经 headers 覆盖', en: 'Request body as a string (POST/PUT/PATCH). Sent as application/json by default; override via headers' } },
+        { name: 'timeout_ms', type: 'int', required: false, def: '15000', desc: { zh: '超时毫秒，钳制 1000-60000', en: 'Timeout in milliseconds, clamped to 1000-60000' } },
+        { name: 'response_format', type: 'string', required: false, def: 'text', desc: { zh: '响应体输出模式：text(默认，JSON 字符串内嵌，适合 JSON/HTML API；二进制会经 UTF-8 有损转换) / base64(二进制安全，附件下载；超过 50MB 返回 413 拒绝) / file(落盘到 data-dir/fetch/，返回 saved_path)', en: 'Response body mode: text (default, inlined JSON string, for JSON/HTML APIs; binary is lossily UTF-8 converted) / base64 (binary-safe, for attachments; bodies over 50MB are rejected with 413) / file (saved to data-dir/fetch/, returns saved_path)' } },
+        { name: 'filename', type: 'string', required: false, def: 'URL 末段', desc: { zh: '仅 response_format=file 时的落盘文件名；净化为 basename（仅字母数字._-，防路径穿越），冲突自动加序号', en: 'Save file name for response_format=file only; sanitized to a basename (alphanumerics ._- only, traversal-proof); conflicts get a numeric suffix' } },
+      ],
+      curl: `curl -X POST http://127.0.0.1:8088/fetch \\
+  -H "Authorization: Bearer <token>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"url":"https://jira.example.com/rest/api/2/search","method":"POST","body":"{\\"jql\\":\\"project=X\\",\\"maxResults\\":50}"}'`,
+      example: { url: 'https://jira.example.com/rest/api/2/search', final_url: 'https://jira.example.com/rest/api/2/search', status_code: 200, elapsed_ms: 182, cookies_applied: 6, headers: { 'content-type': 'application/json;charset=utf-8' }, body_truncated: false, body: '{ "expand": "schema", "issues": [ ... ] }' },
+      errors: [{ code: 400, msg: 'invalid json body / missing url / bad method / bad response_format' }, { code: 400, msg: 'url blocked by SSRF guard' }, { code: 413, msg: 'body too large for base64 output (max 50MB, use response_format=file)' }, { code: 502, msg: 'fetch failed (network/SSL/proxy error, see detail)' }, { code: 504, msg: 'fetch timed out' }, { code: 401, msg: 'unauthorized' }],
     },
     {
       method: 'GET', path: '/status', auth: true, tryable: true,
@@ -88,7 +113,7 @@ const API_SPEC = {
       ],
       curl: `curl -H "Authorization: Bearer <token>" \\
   "http://127.0.0.1:8088/result/abc123?output=markdown&timeout=30"`,
-      example: { task_id: 'abc123', state: 'succeeded', markdown: '# Example Domain\n...', md_algorithm_used: 'conservative' },
+      example: { task_id: 'abc123', state: 'succeeded', final_url: 'https://example.com/', markdown: '# Example Domain\n...', md_algorithm_used: 'conservative' },
       errors: [{ code: 404, msg: 'task not found' }, { code: 401, msg: 'unauthorized' }],
     },
     {
@@ -283,7 +308,7 @@ const API_SPEC = {
       curl: `# 推荐用 MCP Inspector 可视化调试（自动处理 initialize 握手与 session）
 npx @modelcontextprotocol/inspector
 # 打开后 URL 填 http://127.0.0.1:8090/mcp`,
-      example: { jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'seimi-render', version: '1.1.0' } } },
+      example: { jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'seimi-render', version: '1.3.0' } } },
     },
     {
       method: 'TOOL', path: 'render_url', endpoint: 'http://<host>:8090/mcp', auth: true,
@@ -300,6 +325,8 @@ npx @modelcontextprotocol/inspector
         { name: 'settle_ms', type: 'int', required: false, def: '2500', desc: { zh: 'loadFinished 后等待 JS 的毫秒', en: 'Milliseconds to wait for JS after loadFinished' } },
         { name: 'timeout_ms', type: 'int', required: false, def: '30000', desc: { zh: '长轮询超时毫秒', en: 'Long-poll timeout in milliseconds' } },
         { name: 'record_network', type: 'bool', required: false, def: 'false', desc: { zh: '设为 true 时录制本次渲染的全量网络流量（请求/响应/headers/响应体/timing），产出标准 HAR 1.2。前置条件：服务须以 --remote-debugging-port 启动；未开时静默降级（渲染正常但不产出 HAR，get_har 会提示 disabled）。录制后用 get_har 工具取结果。注意：开启录制模式会跳过 stealth 反爬标记，不适合反爬场景', en: 'When true, records all network traffic of this render (requests/responses/headers/bodies/timing), producing a standard HAR 1.2. Prerequisite: the server must be started with --remote-debugging-port; if not set, it silently degrades (render succeeds but no HAR is produced; get_har will report disabled). Fetch the result with the get_har tool. Note: recording mode skips the stealth anti-bot flag — not suitable for anti-bot scenarios' } },
+        { name: 'exec_js', type: 'string', required: false, def: '(不执行)', desc: { zh: 'settle 后在页面主世界执行的 JS（同源上下文：cookie 生效、fetch 自动带凭据），结果以 [exec_js result] 小节附加在文本尾部。async/Promise 自动等待；异常/超时任务失败。上限 1MB', en: 'JS to execute in the page main world after settle (same-origin: cookies apply, fetch carries credentials); the result is appended as an [exec_js result] section. async/Promise is awaited; exceptions/timeout fail the task. Max 1MB' } },
+        { name: 'exec_js_timeout_ms', type: 'int', required: false, def: '10000', desc: { zh: 'exec_js 执行超时毫秒，钳制 1000-30000', en: 'exec_js timeout in milliseconds, clamped to 1000-30000' } },
       ],
       curl: `# Claude Code 配置（~/.claude.json）
 {
@@ -310,8 +337,27 @@ npx @modelcontextprotocol/inspector
     }
   }
 }`,
-      example: { content: [{ type: 'text', text: 'task_id=abc state=succeeded url=https://example.com\n\n# Example Domain\n...' }] },
+      example: { content: [{ type: 'text', text: 'task_id=abc state=succeeded url=https://example.com final_url=https://example.com/\n\n# Example Domain\n...\n\n（登录墙命中时头部会附 [AUTH WALL DETECTED: ...] 提示，意为 session 过期需重新同步 cookie）' }] },
       errors: [{ code: 401, msg: 'unauthorized (missing/invalid token)' }],
+    },
+    {
+      method: 'TOOL', path: 'fetch_url', endpoint: 'http://<host>:8090/mcp', auth: true,
+      title: { zh: '轻量直取 JSON/REST API', en: 'Lightweight Fetch for JSON/REST APIs' },
+      desc: {
+        zh: 'MCP 工具：带登录态 cookie + 全局代理直接请求 JSON/REST 端点，返回原始响应体，不走浏览器渲染（比 render_url 快一个数量级，无需 HTML 反解）。目标是 API/JSON 端点（含已登录站点的私有 REST API）时优先用本工具；需要 JS 执行或渲染页面内容时用 render_url。返回头部含 status/final_url/cookies（自动携带的登录 cookie 数；REST API 回 200 + 空 {} 通常是 session 过期信号，结合该计数与 render_url 的 auth_wall 判断）。',
+        en: 'MCP tool: fetch a JSON/REST endpoint directly with saved login cookies and the global proxy, returning the raw response body without a browser render (an order of magnitude faster than render_url; no HTML unwrapping). Prefer this tool when the target is an API/JSON endpoint (including a logged-in site\'s private REST API); use render_url when you need JS execution or rendered page content. The returned header carries status/final_url/cookies (the number of auto-attached login cookies; a 200 with an empty {} body usually means the session expired — judge together with that count and render_url\'s auth_wall).',
+      },
+      params: [
+        { name: 'url', type: 'string', required: true, desc: { zh: '目标 http(s) URL', en: 'Target http(s) URL' } },
+        { name: 'method', type: 'string', required: false, def: 'GET', desc: { zh: 'HTTP 方法：GET(默认) / POST / PUT / PATCH / DELETE / HEAD', en: 'HTTP method: GET (default) / POST / PUT / PATCH / DELETE / HEAD' } },
+        { name: 'body', type: 'string', required: false, def: '(无)', desc: { zh: '请求体字符串（POST/PUT/PATCH），默认按 application/json 发送', en: 'Request body as a string (POST/PUT/PATCH); sent as application/json by default' } },
+        { name: 'headers', type: 'object', required: false, def: '(无)', desc: { zh: '请求头 JSON 对象，如 {"Accept":"application/json"}。显式 Cookie 覆盖自动携带的登录 cookie', en: 'Request headers as a JSON object, e.g. {"Accept":"application/json"}. An explicit Cookie overrides the auto-attached login cookies' } },
+        { name: 'timeout_ms', type: 'int', required: false, def: '15000', desc: { zh: '超时毫秒（上限 60000）', en: 'Timeout in milliseconds (max 60000)' } },
+        { name: 'response_format', type: 'string', required: false, def: 'text', desc: { zh: '响应体编码：text(默认，JSON/HTML API) / base64(二进制安全，附件下载；agent 解码 base64 即得原文件；>50MB 拒绝)', en: 'Body encoding: text (default, JSON/HTML APIs) / base64 (binary-safe for attachments; decode to reconstruct the file; >50MB rejected)' } },
+      ],
+      curl: '(通过 MCP 协议调用，非 HTTP)',
+      example: { content: [{ type: 'text', text: '[fetch status=200 cookies=6]\n\n{ "expand": "schema", "issues": [ { "key": "X-1", "status": "done" } ] }' }] },
+      errors: [{ code: 401, msg: 'unauthorized' }, { msg: 'fetch failed (SSRF blocked / timed out / network error — 详见返回文本)' }],
     },
     {
       method: 'TOOL', path: 'get_render_result', endpoint: 'http://<host>:8090/mcp', auth: true,
@@ -383,8 +429,8 @@ npx @modelcontextprotocol/inspector
       method: 'ACTION', path: 'render', events: ['created', 'finished'], auth: true,
       title: { zh: '提交渲染任务（WS）', en: 'Submit Render Task (WS)' },
       desc: {
-        zh: '通过 WebSocket 提交渲染任务。完成后服务端主动推送 finished 事件。鉴权通过连接 URL 的 ?token= 或首条 auth 消息。',
-        en: 'Submit a render task over WebSocket. The server pushes a finished event on completion. Auth via ?token= on the connect URL, or the first auth message.',
+        zh: '通过 WebSocket 提交渲染任务。完成后服务端主动推送 finished 事件（携带 state，终态可含 final_url / blocked / auth_wall 登录态可见性字段；结果内容另走 HTTP /result/:id 获取）。鉴权通过连接 URL 的 ?token= 或首条 auth 消息。',
+        en: 'Submit a render task over WebSocket. The server pushes a finished event on completion (carrying state; terminal pushes may include final_url / blocked / auth_wall login-visibility fields — fetch content via HTTP /result/:id). Auth via ?token= on the connect URL, or the first auth message.',
       },
       params: [
         { name: 'action', type: 'string', required: true, desc: { zh: '固定 "render"', en: 'Fixed "render"' } },
@@ -393,6 +439,8 @@ npx @modelcontextprotocol/inspector
         { name: 'output', type: 'string', required: false, desc: { zh: '输出格式', en: 'Output format' } },
         { name: 'format', type: 'string', required: false, desc: { zh: '截图编码', en: 'Screenshot encoding' } },
         { name: 'md_algorithm', type: 'string', required: false, desc: { zh: 'Markdown 算法', en: 'Markdown algorithm' } },
+        { name: 'exec_js', type: 'string', required: false, desc: { zh: 'settle 后在页面主世界执行的 JS（与 HTTP /render 同语义，结果经 /result/:id 的 js_result 取回）', en: 'JS to execute in the page main world after settle (same semantics as HTTP /render; result retrievable via js_result from /result/:id)' } },
+        { name: 'exec_js_timeout_ms', type: 'int', required: false, def: '10000', desc: { zh: 'exec_js 超时毫秒，钳制 1000-30000', en: 'exec_js timeout in milliseconds, clamped to 1000-30000' } },
       ],
       curl: `// 浏览器 JS
 const ws = new WebSocket('ws://127.0.0.1:8089/?token=<token>');
@@ -415,7 +463,7 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data));`,
         { name: 'task_id', type: 'string', required: true, desc: { zh: '要订阅的任务 ID', en: 'Task ID to subscribe to' } },
       ],
       curl: `ws.send(JSON.stringify({ action: 'subscribe', task_id: 'abc123' }));`,
-      example: { event: 'subscribed', task_id: 'abc123' },
+      example: { event: 'finished', task_id: 'abc123', state: 'succeeded', final_url: 'https://example.com/login', auth_wall: true },
       errors: [{ code: 1008, msg: 'unauthorized' }],
     },
     {

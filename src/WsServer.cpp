@@ -151,10 +151,11 @@ void WsServer::handleRender(QWebSocket* sock, const QJsonObject& obj) {
                         {QStringLiteral("message"), QStringLiteral("url must be http/https")}});
         return;
     }
-    // SSRF 防护，与 HTTP /render 保持一致：拒绝内网/回环/链路本地/元数据地址。
-    // --no-ssrf 关闭（本机自用 Agent 场景，允许访问一切目标）。
+    // resolved IP：随任务存一份，网络类失败时附进错误信息做自诊断（与 HTTP /render 一致）。
+    // --no-ssrf 下不做判定，但仍解析一次（诊断价值大于毫秒级 DNS 开销）。
+    std::string resolvedIp;
     if (m_ssrfGuardEnabled) {
-        std::string ssrfReason = urlSsrfCheck(qurl);
+        std::string ssrfReason = urlSsrfCheck(qurl, &resolvedIp);
         if (!ssrfReason.empty()) {
             // 入口拒绝也是请求异常：记入异常日志（与 HTTP /render 路径同构）。
             m_queue->anomalyLog().recordRejected(
@@ -165,6 +166,8 @@ void WsServer::handleRender(QWebSocket* sock, const QJsonObject& obj) {
                                  + QString::fromStdString(ssrfReason)}});
             return;
         }
+    } else {
+        resolvedIp = resolveHostIp(qurl);
     }
 
     int settleMs = int(obj.value(QStringLiteral("settle_ms")).toInt(m_settleDefaultMs));
@@ -205,9 +208,22 @@ void WsServer::handleRender(QWebSocket* sock, const QJsonObject& obj) {
         if (t == QStringLiteral("readability"))   mdAlg = MdAlgorithm::Readability;
     }
 
+    // exec_js：settle 后在页面主世界执行调用方 JS（与 HTTP /render 同语义）。
+    // 代码体上限 1MB + 超时钳制 1~30s。
+    QString execJs = obj.value(QStringLiteral("exec_js")).toString();
+    if (execJs.size() > 1024 * 1024) {
+        sendJson(sock, {{QStringLiteral("event"), QStringLiteral("error")},
+                        {QStringLiteral("message"), QStringLiteral("exec_js too large (limit 1MB)")}});
+        return;
+    }
+    int execJsTimeout = obj.value(QStringLiteral("exec_js_timeout_ms")).toInt(10000);
+    execJsTimeout = std::clamp(execJsTimeout, 1000, 30000);
+
     // 提交到渲染队列（线程安全）。render 请求自动订阅本任务，
     // 因此后续 finished 推送会通过 notifyFinished 回到这个连接。
-    QString taskId = m_queue->submit(url, settleMs, outputs, imgFmt, mdAlg, nowMsec());
+    QString taskId = m_queue->submit(url, settleMs, outputs, imgFmt, mdAlg, nowMsec(),
+                                     ExtractAlgorithm::None, false, execJs, execJsTimeout,
+                                     QString::fromStdString(resolvedIp));
     if (taskId.isEmpty()) {
         // 任务表过载（洪泛提交/积压）：背压拒绝，让客户端稍后重试。
         sendJson(sock, {{QStringLiteral("event"), QStringLiteral("error")},
@@ -255,7 +271,8 @@ void WsServer::onSocketDisconnected() {
     sock->deleteLater();
 }
 
-void WsServer::notifyFinished(const QString& taskId, const QString& state, bool blocked) {
+void WsServer::notifyFinished(const QString& taskId, const QString& state, bool blocked,
+                              const QString& finalUrl, bool authWall) {
     auto it = m_subscriptions.find(taskId);
     if (it == m_subscriptions.end()) return;
 
@@ -264,6 +281,9 @@ void WsServer::notifyFinished(const QString& taskId, const QString& state, bool 
         {QStringLiteral("task_id"), taskId},
         {QStringLiteral("state"), state}};
     if (blocked) msg.insert(QStringLiteral("blocked"), true);   // 反爬拦截类型化标记
+    // 登录态可见性：final_url 一直透出；auth_wall 命中时透出（正常内容页不打扰）。
+    if (!finalUrl.isEmpty()) msg.insert(QStringLiteral("final_url"), finalUrl);
+    if (authWall) msg.insert(QStringLiteral("auth_wall"), true);
 
     // 拷贝列表：发送可能触发对端关闭 → 修改原列表
     QList<QWebSocket*> subs = it.value();

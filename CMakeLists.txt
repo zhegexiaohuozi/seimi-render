@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(seimi-render
-    VERSION 1.2.0
+    VERSION 1.3.0
     LANGUAGES CXX
 )
 
@@ -259,6 +259,8 @@ target_include_directories(seimi-mcp PRIVATE
 target_compile_definitions(seimi-mcp PRIVATE
     MCP_MAX_SESSIONS=10
     MCP_SESSION_TIMEOUT=30
+    # serverInfo.version 依赖此宏；漏注入会 fallback 成 "unknown"（McpServer.cpp #ifndef 兜底）。
+    SEIMI_VERSION="${PROJECT_VERSION}"
 )
 # 绕过上游 bug：cpp-mcp 的 mcp_logger.h 用 `#if _CRT_SECURE_NO_WARNINGS`（应为 #ifdef），
 # 宏定义为空时 MSVC 报 C1017。定义成 1 让 #if 1 成立。
@@ -287,6 +289,8 @@ add_executable(seimi-render
     src/RenderPool.cpp
     src/HttpServer.h
     src/HttpServer.cpp
+    src/FetchService.h
+    src/FetchService.cpp
     src/WsServer.h
     src/WsServer.cpp
     src/CdpClient.h

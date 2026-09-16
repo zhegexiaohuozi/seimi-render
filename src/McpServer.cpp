@@ -228,6 +228,17 @@ bool McpServer::start(const std::string& host, int port,
             "be started with --remote-debugging-port. Retrieve the HAR afterwards via the "
             "get_har tool with the returned task_id. Default false.",
             false)
+        .with_string_param("exec_js",
+            "JavaScript to run in the page's main world AFTER the page has loaded and "
+            "settled (same origin as the page: cookies apply, fetch carries credentials). "
+            "The value of the last expression (or `return`) is delivered back as the "
+            "js_result section of the response; async/Promise results are awaited. "
+            "If the script returns nothing (void), the result is empty. A thrown error "
+            "or timeout fails the task. Limit 1MB; see exec_js_timeout_ms.",
+            false)
+        .with_number_param("exec_js_timeout_ms",
+            "Timeout for exec_js in milliseconds (default 10000, clamped to 1000-30000).",
+            false)
         .build();
 
     m_impl->srv->register_tool(renderTool,
@@ -276,8 +287,13 @@ bool McpServer::start(const std::string& host, int port,
             if (recordNetwork) {
                 body["record_network"] = true;
             }
-            mcpLog("render_url url=%s output=%s settle_ms=%d timeout_ms=%d record_network=%d",
-                   url.c_str(), outSpec.c_str(), settle, timeout, recordNetwork ? 1 : 0);
+            std::string execJs = params.value("exec_js", std::string());
+            if (!execJs.empty()) {
+                body["exec_js"] = execJs;
+                body["exec_js_timeout_ms"] = params.value("exec_js_timeout_ms", 10000);
+            }
+            mcpLog("render_url url=%s output=%s settle_ms=%d timeout_ms=%d record_network=%d exec_js=%zuB",
+                   url.c_str(), outSpec.c_str(), settle, timeout, recordNetwork ? 1 : 0, execJs.size());
             std::string resp = impl->httpPost("/render", body.dump());
             if (resp.empty()) {
                 mcpLog("render_url url=%s -> render service unreachable", url.c_str());
@@ -328,7 +344,21 @@ bool McpServer::start(const std::string& host, int port,
                        (wantShot && j.value("has_image", false)) ? "yes" : "no");
                 mcp::json contents = mcp::json::array();
                 std::string textPart;
-                textPart += "task_id=" + task_id + " state=" + state + " url=" + url + "\n\n";
+                textPart += "task_id=" + task_id + " state=" + state + " url=" + url;
+                // 登录态可见性：final_url（重定向后实际地址）+ auth_wall（登录墙命中）。
+                // agent 据此可判断 session 过期并提示用户重新同步 cookie。
+                {
+                    std::string finalUrl = j.value("final_url", std::string());
+                    if (!finalUrl.empty() && finalUrl != url) {
+                        textPart += " final_url=" + finalUrl;
+                    }
+                    if (j.value("auth_wall", false)) {
+                        textPart += "\n[AUTH WALL DETECTED: the rendered page is a login/sign-in "
+                                    "page - the saved session has likely expired. Ask the user to "
+                                    "re-sync cookies (browser extension or POST /cookies) and retry.]";
+                    }
+                }
+                textPart += "\n\n";
                 if (wantMd) {
                     std::string md = j.value("markdown", std::string());
                     if (j.contains("md_algorithm_used")) {
@@ -338,6 +368,15 @@ bool McpServer::start(const std::string& host, int port,
                 } else if (wantHtml) {
                     std::string html = j.value("html", std::string());
                     textPart += html.empty() ? "(html empty)" : html;
+                }
+                // exec_js 结果：JSON 值原文追加为独立小节。字段缺失 = void（脚本无返回值）；
+                // 字段存在但值为 null = 脚本确实返回了 null（与 void 语义不同，如实回显）。
+                if (!execJs.empty()) {
+                    if (j.contains("js_result")) {
+                        textPart += "\n\n[exec_js result]\n" + j["js_result"].dump(2);
+                    } else {
+                        textPart += "\n\n[exec_js result: void]";
+                    }
                 }
                 // pdf/screenshot 的元信息附在文本末尾
                 if (wantPdf && j.value("has_pdf", false)) {
@@ -778,6 +817,120 @@ bool McpServer::start(const std::string& host, int port,
                 text += md.empty() ? "(empty content — the page may be non-article; "
                                    "retry render_url with md_algorithm='conservative')"
                                    : md;
+                return toTextContent(text);
+            } catch (...) {
+                return toTextContent(resp);
+            }
+        });
+
+    // ---------- tool: fetch_url ----------
+    // 轻量直取（POST /fetch 的 MCP 面）：带登录态 cookie + 全局代理直接请求
+    // JSON/REST 端点，返回原始响应体。绕过 Chromium 页面管线，百毫秒级（整页渲染 ~6s）。
+    // 场景：agent 对已登录站点的 API 探索（Jira /rest/api/2/search 等）——比 render_url +
+    // exec_js fetch 快一个数量级，且无需 HTML 反解。
+    mcp::tool fetchTool = mcp::tool_builder("fetch_url")
+        .with_description(
+            "Fetch a single http(s) URL DIRECTLY (no browser page render) and return "
+            "the raw response body — the fast path for JSON/REST APIs. Automatically "
+            "attaches the saved login cookies for the target domain and follows the "
+            "server's proxy/bypass settings, so authenticated internal APIs (e.g. "
+            "Jira /rest/api/2/search) work out of the box. PREFER THIS over render_url "
+            "when the target is an API/JSON endpoint; use render_url when you need "
+            "JS execution or rendered page content. A JSON body of \"{}\" or an HTML "
+            "login page usually means the session expired (see render_url auth_wall).")
+        .with_string_param("url", "The http(s) URL to fetch")
+        .with_string_param("method",
+            "HTTP method: GET (default), POST, PUT, PATCH, DELETE or HEAD", false)
+        .with_string_param("body",
+            "Request body as a string (for POST/PUT/PATCH). Sent as application/json "
+            "unless a content-type header is given.", false)
+        .with_string_param("response_format",
+            "Response body encoding: 'text' (default, for JSON/HTML APIs) or 'base64' "
+            "(binary-safe, for attachments/downloads; bodies over 50MB are rejected — "
+            "agents should save and decode the base64 to reconstruct the file).", false)
+        .with_object_param("headers",
+            "Optional request headers as a JSON object, e.g. {\"Accept\": "
+            "\"application/json\"}. An explicit \"Cookie\" header overrides the "
+            "saved login cookies.", mcp::json::object(), false)
+        .with_number_param("timeout_ms",
+            "Max milliseconds to wait (default 15000)", false)
+        .build();
+
+    m_impl->srv->register_tool(fetchTool,
+        [impl](const mcp::json& params, const std::string&) -> mcp::json {
+            std::string url = params.value("url", "");
+            if (url.empty()) {
+                throw mcp::mcp_exception(mcp::error_code::invalid_params,
+                                         "'url' is required");
+            }
+            mcp::json body = {{"url", url}};
+            std::string method = params.value("method", "GET");
+            if (!method.empty()) body["method"] = method;
+            std::string reqBody = params.value("body", std::string());
+            if (!reqBody.empty()) body["body"] = reqBody;
+            if (params.contains("headers") && params.at("headers").is_object()) {
+                body["headers"] = params.at("headers");
+            }
+            int timeout = params.value("timeout_ms", 15000);
+            if (timeout > 0) body["timeout_ms"] = timeout;
+            std::string responseFormat = params.value("response_format", "text");
+            if (!responseFormat.empty()) body["response_format"] = responseFormat;
+            mcpLog("fetch_url url=%s method=%s timeout_ms=%d body=%zuB fmt=%s",
+                   url.c_str(), method.c_str(), timeout, reqBody.size(),
+                   responseFormat.c_str());
+            std::string resp = impl->httpPost("/fetch", body.dump());
+            if (resp.empty()) {
+                mcpLog("fetch_url url=%s -> render service unreachable", url.c_str());
+                return toTextContent("error: render service unreachable");
+            }
+            try {
+                auto j = mcp::json::parse(resp);
+                // /fetch 失败路径（SSRF 拦截 / 超时 / 网络错误）回 error JSON，转成可读文本。
+                if (j.contains("error")) {
+                    std::string err = j.value("error", "");
+                    std::string detail = j.value("detail", "");
+                    mcpLog("fetch_url url=%s -> FAILED (%s: %s)",
+                           url.c_str(), err.c_str(), detail.c_str());
+                    std::string text = "Fetch failed: " + err;
+                    if (!detail.empty()) text += " (" + detail + ")";
+                    if (err.find("timed out") != std::string::npos) {
+                        text += " — target too slow or unreachable via current proxy; "
+                                "raise timeout_ms or check proxy config";
+                    }
+                    return toTextContent(text + " url=" + url);
+                }
+                int statusCode = j.value("status_code", 0);
+                std::string finalUrl = j.value("final_url", std::string());
+                int cookiesApplied = j.value("cookies_applied", 0);
+                bool truncated = j.value("body_truncated", false);
+                std::string respBody = j.value("body", std::string());
+                std::string bodyB64 = j.value("body_base64", std::string());
+                std::string savedPath = j.value("saved_path", std::string());
+                mcpLog("fetch_url url=%s -> %d (%zuB%s, %d cookies)%s",
+                       url.c_str(), statusCode,
+                       bodyB64.empty() ? respBody.size() : j.value("body_bytes", bodyB64.size()),
+                       bodyB64.empty() ? "" : " binary",
+                       cookiesApplied,
+                       truncated ? " [truncated]" : "");
+                std::string text = "[fetch status=" + std::to_string(statusCode);
+                if (!finalUrl.empty() && finalUrl != url) text += " final_url=" + finalUrl;
+                text += " cookies=" + std::to_string(cookiesApplied);
+                if (!savedPath.empty()) {
+                    // file 模式：内容已落盘，只回元信息。
+                    text += " saved=" + savedPath + " bytes="
+                            + std::to_string(j.value("bytes", 0)) + "]\n";
+                    return toTextContent(text);
+                }
+                if (!bodyB64.empty()) {
+                    // base64 模式：二进制安全，agent 解码即得原文件。
+                    text += " encoding=base64 bytes="
+                            + std::to_string(j.value("body_bytes", bodyB64.size()))
+                            + "]\n\n" + bodyB64;
+                    return toTextContent(text);
+                }
+                text += "]\n\n";
+                text += respBody.empty() ? "(empty body)" : respBody;
+                if (truncated) text += "\n\n[body truncated at 10MB]";
                 return toTextContent(text);
             } catch (...) {
                 return toTextContent(resp);

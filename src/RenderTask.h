@@ -102,6 +102,11 @@ struct RenderTask {
     const MdAlgorithm mdAlgorithm;    // markdown 正文提取算法（仅 wants(Markdown) 时有意义）
     const ExtractAlgorithm extractAlgorithm;  // 站点特定提取算法（默认 None，不影响现有行为）
     const bool recordHar;             // 是否录制网络并产出 HAR（需启动 --remote-debugging-port）
+    const QString execJs;             // settle 后在页面主世界执行的 JS（空=不执行）。最后一个
+                                      // 表达式（或 return 值）作为结果回传；支持 async/Promise。
+    const int execJsTimeoutMsec;      // exec_js 执行超时（页面内 Promise.race 兜底 + C++ 轮询上限）
+    const QString resolvedIp;         // 提交期 UrlGuard DNS 解析出的目标 IP（v4 优先；空=未解析，
+                                      //   --no-ssrf 时为空）。仅用于失败自诊断，不影响渲染路径。
 
     // 受 RenderQueue 锁保护的可变字段
     TaskState state{TaskState::Pending};
@@ -114,6 +119,11 @@ struct RenderTask {
     // markdown 实际使用的算法（可观测性）：可能因 Readability 判定非文章页而回退 conservative。
     MdAlgorithm mdAlgorithmUsed{MdAlgorithm::Conservative};
     QString serpJson;                  // SERP 结构化提取结果 JSON 字符串（extract!=None 且成功时填）
+    QString jsJson;                    // exec_js 结果值的 JSON 文本（execJs 非空且成功时填；
+                                       //   空 = void 或未请求。是合法 JSON 值文本，嵌入响应时裸拼）
+    QString finalUrl;                  // 渲染结束时页面实际 URL（重定向/SSO/登录墙跳转可见）
+    bool authWall{false};              // 登录墙启发式命中（final_url 路径含登录特征词；保守检测）
+    QString authWallReason;            // 命中的特征（如 "path segment 'login'"），供调用方复核
     QString error;                    // 失败原因
     bool blocked{false};              // 终态失败是否因反爬拦截（google /sorry/ 重试耗尽）
     int  blockAttempts{0};            // 渲染期间累计反爬拦截页检测次数（Metrics 用）
@@ -125,7 +135,9 @@ struct RenderTask {
 
     RenderTask(QString id_, QString url_, qint64 createdAt, int settleDelay, OutputMask outs,
                ImageFormat imgFmt = ImageFormat::Auto, MdAlgorithm mdAlg = MdAlgorithm::Conservative,
-               ExtractAlgorithm extractAlg = ExtractAlgorithm::None, bool recordHarFlag = false)
+               ExtractAlgorithm extractAlg = ExtractAlgorithm::None, bool recordHarFlag = false,
+               QString execJsCode = QString(), int execJsTimeoutMs = 10000,
+               QString resolvedIpStr = QString())
         : id(std::move(id_))
         , url(std::move(url_))
         , createdAtMsec(createdAt)
@@ -134,7 +146,10 @@ struct RenderTask {
         , imageFormat(imgFmt)
         , mdAlgorithm(mdAlg)
         , extractAlgorithm(extractAlg)
-        , recordHar(recordHarFlag) {}
+        , recordHar(recordHarFlag)
+        , execJs(std::move(execJsCode))
+        , execJsTimeoutMsec(execJsTimeoutMs)
+        , resolvedIp(std::move(resolvedIpStr)) {}
 
     bool wants(Output o) const { return (outputs & static_cast<OutputMask>(o)) != 0; }
 };

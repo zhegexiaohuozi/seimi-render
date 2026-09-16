@@ -111,9 +111,11 @@ struct Config {
     bool ssrfGuardEnabled = true; // --no-ssrf：关闭 SSRF 防护（本机自用 Agent 场景，允许访问内网/回环目标）
     std::string trustedProxies;   // --trusted-proxy <list>：可信反代网段（精确 IP 或 CIDR，逗号分隔），
                                    // 非空时 /api/login 按 X-Forwarded-For 还原真实客户端 IP 限流。
-    // 网络代理：经 QNetworkProxy::setApplicationProxy 运行时动态配置（见 ProxyConfig）。
+    // 网络代理：经 QNetworkProxy 运行时动态配置（见 ProxyConfig）。
     // 初始代理可空（直连），运行时由 POST /proxy 动态更新，无需重启。
     ProxySpec initialProxy;       // 启动时 --proxy 指定的初始代理（默认 Direct 直连）
+    std::string proxyBypass;      // --proxy-bypass <list>：逗号分隔的直连域名/CIDR 列表
+                                   //（内网+外网混合目标分流；仅命令行，POST /proxy 不改它）
     bool stealthEnabled = true;   // 浏览器指纹统一（默认开启，--no-stealth 关闭）
     bool warmupEnabled = true;    // Google 会话预热（默认开启，--no-warmup 关闭）
     std::string warmupUrl = "https://www.google.com/";  // --warmup-url 自定义预热目标
@@ -153,9 +155,17 @@ static void printUsage() {
         "  --proxy <url>         upstream proxy for all Chromium traffic. Format:\n"
         "                          http://[user:pass@]host:port\n"
         "                          socks5://[user:pass@]host:port\n"
-        "                        Set via QNetworkProxy::setApplicationProxy so it can be\n"
-        "                        hot-swapped at runtime via POST /proxy (no restart needed).\n"
+        "                        Set via QNetworkProxy so it can be hot-swapped at\n"
+        "                        runtime via POST /proxy (no restart needed).\n"
         "                        Omit for direct connection; type=direct clears it.\n"
+        "  --proxy-bypass <list> comma-separated hosts that bypass --proxy and go\n"
+        "                        direct: domain suffix (gwm.cn covers jira.gwm.cn),\n"
+        "                        exact hostname, IP literal, or IPv4 CIDR\n"
+        "                        (e.g. gwm.cn,10.0.0.0/8). Loopback is always direct.\n"
+        "                        For mixed internal+external targets. Tip: if a TUN-mode\n"
+        "                        proxy (Clash etc.) is running, prefer NO --proxy at all\n"
+        "                        (TUN already routes; explicit proxy double-routes and\n"
+        "                        loses the proxy's private-net DIRECT rules).\n"
         "  --no-stealth          disable browser fingerprint unification (default: enabled).\n"
         "                        Stealth unifies all render instances into a single Chrome\n"
         "                        desktop fingerprint (UA/screen/WebGL/canvas) to blend into\n"
@@ -185,9 +195,32 @@ static std::string readPasswordFile(const std::string& path) {
     return line.toStdString();
 }
 
+// 编辑距离是否 ≤1（一次插入/删除/替换）。仅用于代理 scheme 拼写纠正，输入很短。
+static bool editDistanceAtMostOne(const QString& a, const QString& b) {
+    if (a == b) return true;
+    const int la = a.size(), lb = b.size();
+    if ((la > lb ? la - lb : lb - la) > 1) return false;
+    int i = 0, j = 0, diff = 0;
+    while (i < la && j < lb) {
+        if (a[i] == b[j]) { ++i; ++j; continue; }
+        if (++diff > 1) return false;
+        if (la == lb) { ++i; ++j; }   // 替换
+        else if (la > lb) { ++i; }    // a 多一个字符
+        else { ++j; }                 // b 多一个字符
+    }
+    if (i < la || j < lb) ++diff;     // 尾部剩余一个未配对字符
+    return diff <= 1;
+}
+
 // 解析代理 URL 为 ProxySpec。
 // 接受 "http://[user:pass@]host:port" 或 "socks5://[user:pass@]host:port"。
-// scheme 缺省视为 http。解析失败（无 host/port）返回 Direct。
+// scheme 缺省视为 http。未知 scheme 不再静默按 HTTP（真实排障撞过：socket5:// 拼写错误
+// 静默按 HTTP 代理，恰好混合端口能用，纯 SOCKS 端口则全部流量静默失败）：
+//   1) 常见拼写纠错表（socket5/socks5h/sock5 → socks5，编辑距离 2 兜不住的真实 typo）；
+//   2) 编辑距离 ≤1 命中已知 scheme 也纠正（htp/socks6 类）；
+//   3) https 特例：WARN 后按 HTTP（Qt 无 https 代理支持，纠正成 http 反而言过其实）；
+//   4) 其余 WARN 后按 HTTP 维持容错（混合端口下可能歪打正着，不拦死服务）。
+// 解析失败（无 host/port）WARN 后返回 Direct。
 static ProxySpec parseProxyUrl(const std::string& s) {
     ProxySpec spec;
     QString url = QString::fromStdString(s).trimmed();
@@ -195,7 +228,8 @@ static ProxySpec parseProxyUrl(const std::string& s) {
     int schemeEnd = url.indexOf(QStringLiteral("://"));
     QString scheme;
     QString rest;
-    if (schemeEnd > 0) {
+    bool hasExplicitScheme = schemeEnd > 0;
+    if (hasExplicitScheme) {
         scheme = url.left(schemeEnd).toLower();
         rest = url.mid(schemeEnd + 3);
     } else {
@@ -204,8 +238,45 @@ static ProxySpec parseProxyUrl(const std::string& s) {
     }
     if (scheme == QStringLiteral("socks5") || scheme == QStringLiteral("socks")) {
         spec.type = ProxySpec::Type::Socks5;
-    } else {
+    } else if (scheme == QStringLiteral("http")) {
         spec.type = ProxySpec::Type::Http;
+    } else {
+        // 纠正表：真实世界撞过的拼写（socket5 编辑距离 2，距离兜底够不着）。
+        static const struct { const char* typo; const char* fixed; } kTypoTable[] = {
+            {"socket5", "socks5"}, {"socks5h", "socks5"}, {"sock5", "socks5"},
+            {"socks4", "socks5"},
+        };
+        QString corrected;
+        for (const auto& t : kTypoTable) {
+            if (scheme == QLatin1String(t.typo)) { corrected = QLatin1String(t.fixed); break; }
+        }
+        if (corrected.isEmpty()
+            && editDistanceAtMostOne(scheme, QStringLiteral("socks5"))) {
+            corrected = QStringLiteral("socks5");
+        }
+        if (corrected.isEmpty()
+            && editDistanceAtMostOne(scheme, QStringLiteral("http"))) {
+            corrected = QStringLiteral("http");
+        }
+        if (!corrected.isEmpty()) {
+            std::fprintf(stderr,
+                         "[WARN] --proxy scheme '%s' unrecognized, auto-corrected to '%s' "
+                         "(accepted: http:// or socks5:// host:port)\n",
+                         scheme.toUtf8().constData(), corrected.toUtf8().constData());
+            spec.type = corrected == QLatin1String("socks5") ? ProxySpec::Type::Socks5
+                                                             : ProxySpec::Type::Http;
+        } else if (scheme == QStringLiteral("https")) {
+            std::fprintf(stderr,
+                         "[WARN] --proxy scheme 'https' is not supported as a proxy scheme by "
+                         "Qt (accepted: http:// or socks5://); treating as http proxy\n");
+            spec.type = ProxySpec::Type::Http;
+        } else {
+            std::fprintf(stderr,
+                         "[WARN] --proxy scheme '%s' unrecognized, falling back to http proxy "
+                         "(accepted: http:// or socks5:// host:port)\n",
+                         scheme.toUtf8().constData());
+            spec.type = ProxySpec::Type::Http;
+        }
     }
     // 剥离 user:pass@
     int at = rest.lastIndexOf(QLatin1Char('@'));
@@ -230,10 +301,16 @@ static ProxySpec parseProxyUrl(const std::string& s) {
         spec.host = rest.toStdString();
     }
     if (spec.host.empty() || spec.port == 0) {
-        // 无有效 host/port，退化为直连（启动期容错，不致命）。
+        // 无有效 host/port，退化为直连（启动期容错，不致命，但必须可见——
+        // 静默退化会让「以为配了代理实际直连」的排查非常痛苦）。
+        std::fprintf(stderr,
+                     "[WARN] --proxy '%s' has no valid host:port, falling back to DIRECT\n",
+                     url.toUtf8().constData());
         spec.type = ProxySpec::Type::Direct;
         spec.host.clear();
         spec.port = 0;
+        spec.user.clear();
+        spec.pass.clear();
     }
     return spec;
 }
@@ -264,6 +341,7 @@ static Config parseArgs(int argc, char** argv) {
         else if (a == "--no-ssrf")    c.ssrfGuardEnabled = false;
         else if (a == "--trusted-proxy" && i + 1 < argc) c.trustedProxies = argv[++i];
         else if (a == "--proxy" && i + 1 < argc) c.initialProxy = parseProxyUrl(argv[++i]);
+        else if (a == "--proxy-bypass" && i + 1 < argc) c.proxyBypass = argv[++i];
         else if (a == "--no-stealth") c.stealthEnabled = false;
         else if (a == "--no-warmup") c.warmupEnabled = false;
         else if (a == "--warmup-url" && i + 1 < argc) c.warmupUrl = argv[++i];
@@ -360,8 +438,35 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 网络代理：经 QNetworkProxy::setApplicationProxy 运行时动态配置（见 ProxyConfig）。
+    // 网络代理：经 QNetworkProxy 运行时动态配置（见 ProxyConfig）。
     // Qt WebEngine 轮询全局应用代理，运行时修改后 Chromium 在数秒内切换。具体 apply 由 RenderPool GUI 线程定时器驱动。
+
+    // --proxy-bypass 分流的渲染侧实现：实测（2026-09-15）QtWebEngine 渲染网络栈**不**按请求
+    // 查询 QNetworkProxyFactory（只轮询全局单值 applicationProxy），QNetworkProxyFactory 只对
+    // QNAM（POST /fetch）生效。要让 Chromium 渲染按 host 分流，唯一路径是 Chromium 原生
+    // --proxy-server + --proxy-bypass-list（经 QTWEBENGINE_CHROMIUM_FLAGS 注入，实测对当前
+    // Qt 构建的网络服务生效）。代价：flag 是启动期快照，bypass 模式下渲染代理不随 POST /proxy
+    // 热切换（/fetch 侧仍可热切换）；需要热切换就别配 --proxy-bypass（改 direct + 系统级路由）。
+    // Qt 侧 ProxyConfig 仍持有同值代理 + bypass（SeimiProxyFactory 给 /fetch 的 QNAM 分流，
+    // 与渲染行为一致）。Chromium flag 代理不支持内联凭据——带认证的代理 + bypass 组合不受支持。
+    if (cfg.initialProxy.type != ProxySpec::Type::Direct && !cfg.proxyBypass.empty()) {
+        const char* scheme = cfg.initialProxy.type == ProxySpec::Type::Socks5 ? "socks5" : "http";
+        QByteArray flags = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS").trimmed();
+        if (!flags.isEmpty()) flags += ' ';
+        flags += QByteArrayLiteral("--proxy-server=") + scheme + "://"
+                 + QByteArray::fromStdString(cfg.initialProxy.host) + ":"
+                 + QByteArray::number(cfg.initialProxy.port);
+        // Chromium bypass 语法与我们的语义兼容：域名后缀条目（gwm.cn 匹配自身与 *.gwm.cn）、
+        // IP 字面量、IPv4 CIDR；回环由 Chromium 隐式规则天然包含。
+        flags += QByteArrayLiteral(" --proxy-bypass-list=")
+                 + QByteArray::fromStdString(cfg.proxyBypass);
+        qputenv("QTWEBENGINE_CHROMIUM_FLAGS", flags);
+        std::fprintf(stderr,
+            "NOTE: --proxy-bypass active: Chromium render traffic splits per host "
+            "(bypassed hosts go direct).\n"
+            "      The render-side proxy is FIXED at startup (Chromium flag snapshot); "
+            "POST /proxy hot-swap only affects /fetch in this mode.\n");
+    }
 
 
     // offscreen 模式下的软件渲染（Linux + macOS，解决无头截图白屏）：
@@ -451,6 +556,10 @@ int main(int argc, char** argv) {
     if (cfg.initialProxy.type != ProxySpec::Type::Direct) {
         proxyConfig.setProxy(cfg.initialProxy);
     }
+    // --proxy-bypass：必须在首次 apply() 前配置（决定 apply 走 factory 还是全局单值）。
+    if (!cfg.proxyBypass.empty()) {
+        proxyConfig.setBypass(QString::fromStdString(cfg.proxyBypass));
+    }
 
     // HAR 网络录制中枢（仅当 --remote-debugging-port 开启时启用）。
     // HarStore 是线程安全的归档存储（HTTP 线程查询 + GUI 线程归档），
@@ -496,7 +605,10 @@ int main(int argc, char** argv) {
             QString state = t ? QString::fromLatin1(taskStateName(t->state))
                               : QStringLiteral("failed");
             bool blocked = t && t->blocked;   // 反爬拦截标记随推送透出
-            ws.notifyFinished(id, state, blocked);
+            // 登录态可见性：final_url / auth_wall 随推送透出，agent 据此判断掉登录。
+            QString finalUrl = t ? t->finalUrl : QString();
+            bool authWall = t && t->authWall;
+            ws.notifyFinished(id, state, blocked, finalUrl, authWall);
         });
 
     // 管理 UI 资源目录定位：优先二进制同级 admin-ui/；开发模式（同级没有）回退到源码目录。
@@ -532,6 +644,8 @@ int main(int argc, char** argv) {
     }
     // 网络代理配置：注册 GET/POST/DELETE /proxy 接口。
     http.setProxyConfig(&proxyConfig);
+    // /fetch 的 response_format=file 落盘目录（data-dir/fetch/）。
+    http.setFetchSaveDir(dataDir + QStringLiteral("/fetch"));
     // HAR 录制产物查询：GET /har/<task_id>。仅在 --remote-debugging-port 开启时挂载
     //（HarStore 虽然总是实例化，但未开 CDP 时没有录制能力，/har 应返回 503 而非 404）。
     if (harRecorder) {

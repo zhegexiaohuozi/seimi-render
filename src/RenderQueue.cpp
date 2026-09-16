@@ -58,7 +58,8 @@ static QByteArray outputMaskNames(OutputMask mask) {
 
 QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs,
                             ImageFormat imageFormat, MdAlgorithm mdAlgorithm, qint64 nowMsec,
-                            ExtractAlgorithm extractAlgorithm, bool recordHar) {
+                            ExtractAlgorithm extractAlgorithm, bool recordHar,
+                            QString execJs, int execJsTimeoutMsec, QString resolvedIp) {
     QMutexLocker locker(&m_mutex);
 
     // 过载背压：任务表已满（洪泛提交/积压未消化），拒绝新提交。调用方据此回 503。
@@ -77,7 +78,8 @@ QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs
     while (m_tasks.contains(id)) id = makeTaskId();
 
     auto task = RenderTaskPtr::create(id, std::move(url), nowMsec, settleDelayMsec,
-                                      outputs, imageFormat, mdAlgorithm, extractAlgorithm, recordHar);
+                                      outputs, imageFormat, mdAlgorithm, extractAlgorithm, recordHar,
+                                      std::move(execJs), execJsTimeoutMsec, std::move(resolvedIp));
     m_tasks.insert(id, task);
     m_pendingIds.push_back(id);
 
@@ -265,13 +267,21 @@ void RenderQueue::reportSucceeded(const QString& id, const RenderResult& result,
                     t.imageTruncated = result.imageTruncated;
                     t.mdAlgorithmUsed = result.mdAlgorithmUsed;
                     t.serpJson = result.serpJson;
+                    t.jsJson = result.jsJson;
+                    t.finalUrl = result.finalUrl;
+                    t.authWall = result.authWall;
+                    t.authWallReason = result.authWallReason;
                 },
                 nowMsec);
 }
 
-void RenderQueue::reportFailed(const QString& id, QString error, qint64 nowMsec) {
+void RenderQueue::reportFailed(const QString& id, QString error, qint64 nowMsec,
+                               const QString& finalUrl) {
     setTerminal(id, TaskState::Failed,
-                [&error](RenderTask& t) { t.error = std::move(error); },
+                [&error, &finalUrl](RenderTask& t) {
+                    t.error = std::move(error);
+                    t.finalUrl = finalUrl;
+                },
                 nowMsec);
 }
 
@@ -327,6 +337,10 @@ RenderQueue::Snapshot RenderQueue::snapshot(const QString& id) const {
     s.imageTruncated = t.imageTruncated;
     s.mdAlgorithmUsed = t.mdAlgorithmUsed;
     s.serpJson = t.serpJson;
+    s.jsJson = t.jsJson;
+    s.finalUrl = t.finalUrl;
+    s.authWall = t.authWall;
+    s.authWallReason = t.authWallReason;
     s.outputs = t.outputs;
     s.createdAtMsec = t.createdAtMsec;
     s.startedAtMsec = t.startedAtMsec;
