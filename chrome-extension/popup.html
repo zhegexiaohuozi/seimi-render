@@ -27,6 +27,19 @@
         <span class="endpoint-label" data-i18n-html="tokenLabel">访问 token <span class="hint">（设了 --password 才需填，否则留空）</span></span>
         <input id="token" type="password" data-i18n-ph="tokenPlaceholder" placeholder="（未设密码则留空）" spellcheck="false" autocomplete="off">
       </label>
+      <!-- 自动同步：后台 service worker + chrome.alarms 定时执行，popup 关闭后依然生效（默认关闭） -->
+      <div class="auto-sync" data-i18n-title="autoSyncTip" title="开启后由插件后台定时把浏览器 cookie 同步到 seimi-render（关闭弹窗后依然生效；只同步勾选的域名）">
+        <label class="auto-toggle">
+          <input id="auto-sync" type="checkbox">
+          <span data-i18n="autoSyncLabel">自动同步</span>
+        </label>
+        <label class="auto-interval">
+          <span data-i18n="autoSyncEvery">每</span>
+          <input id="auto-interval" type="number" min="30" max="86400" step="1" value="30">
+          <span data-i18n="autoSyncUnit">秒</span>
+        </label>
+        <div id="auto-last" class="auto-last"></div>
+      </div>
     </header>
 
     <!-- 工具栏：全选 + 搜索 + 统计 -->
@@ -56,6 +69,7 @@
     </footer>
   </div>
   <script src="i18n.js"></script>
+  <script src="sync-core.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

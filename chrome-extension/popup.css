@@ -99,6 +99,58 @@ body {
 }
 .endpoint input:focus { border-color: var(--primary); }
 
+/* ---------- 自动同步设置行（header 内，token 下方） ---------- */
+.auto-sync {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.auto-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.auto-interval {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.auto-interval input {
+  width: 54px;
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+.auto-interval input:focus { border-color: var(--primary); }
+.auto-interval input:disabled {
+  background: #f5f7fa;
+  color: #c0c6cd;
+  cursor: not-allowed;
+}
+/* 「上次自动同步」状态：右侧自适应，过长省略（hover 有 title 全文） */
+.auto-last {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.auto-last:empty { display: none; }   /* 未开启且无记录时整行不占位 */
+.auto-last.ok  { color: var(--success); }
+.auto-last.err { color: var(--danger); }
+
 /* ---------- 工具栏 ---------- */
 .toolbar {
   display: flex;

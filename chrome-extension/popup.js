@@ -3,8 +3,10 @@
 
 // seimi-render Cookie 同步插件
 //
-// 流程：chrome.cookies.getAll({}) -> 按 domain 聚合 -> 渲染勾选列表（默认全选）
+// 流程：chrome.cookies.getAll({}) -> 按 domain 聚合 -> 渲染勾选列表（默认全选，勾选状态跨会话记忆）
 //       -> 用户勾选/搜索/全选 -> 一键同步 POST /cookies -> 拉取 GET /cookies 对账
+//       -> 可选开启后台定时自动同步（background.js + chrome.alarms 执行，默认关闭，
+//          本文件只负责开关/周期设置与「上次自动同步」状态展示）
 //
 // 国际化：i18n.js 提供 t()/applyI18n()/initI18n()/toggleLang()。本文件所有面向
 // 用户的文案都走 t()，语言切换后重渲染动态部分。
@@ -67,9 +69,11 @@ function authFetch(url, opts = {}) {
     //     但语言切换是低频操作且同步极快，可接受。
     renderList();            // 内部已调 updateSummary()（含同步按钮文案）
     setConnBadge(lastConnState);
+    renderAutoLast();
     if (lastStatus) renderStatus(lastStatus.key, lastStatus.args);
   });
 
+  await initAutoSync();
   await loadCookies();
   checkConnection();
 })();
@@ -89,14 +93,23 @@ async function loadCookies() {
       .map(([domain, cs]) => ({ domain, count: cs.length, cookies: cs }))
       .sort((a, b) => b.count - a.count); // 登录态重的站排前面
 
-    // 默认全选
-    selected = new Set(allDomains.map((d) => d.domain));
-    $('select-all').checked = true;
+    // 默认全选，但恢复上次手动取消勾选的域名（后台自动同步共用这份排除集）
+    const { excludedDomains } = await chrome.storage.local.get('excludedDomains');
+    const excluded = new Set(excludedDomains || []);
+    selected = new Set(allDomains.filter((d) => !excluded.has(d.domain)).map((d) => d.domain));
+    $('select-all').checked = selected.size === allDomains.length;
 
     renderList();
   } catch (err) {
     $('list').innerHTML = `<div class="empty-hint">${t('loadCookieFail', escapeHtml(err.message))}</div>`;
   }
+}
+
+// 把当前勾选状态落库为排除集（未勾选的域名），供后台自动同步尊重同一份域名选择。
+// 仅在用户显式改动勾选时调用——打开 popup 本身不重置后台行为。
+function persistExcluded() {
+  const excluded = allDomains.filter((d) => !selected.has(d.domain)).map((d) => d.domain);
+  chrome.storage.local.set({ excludedDomains: excluded });
 }
 
 // ---------- 渲染域名列表（带搜索过滤）----------
@@ -127,6 +140,7 @@ function renderList() {
         if (e.target.checked) selected.add(dom);
         else selected.delete(dom);
         updateSummary();
+        persistExcluded();
         // 同步全选框状态（部分选中时变未勾）
         $('select-all').checked = (selected.size === allDomains.length);
       });
@@ -143,6 +157,7 @@ function onSelectAll() {
   } else {
     selected.clear();
   }
+  persistExcluded();
   renderList();
 }
 
@@ -166,26 +181,14 @@ async function onSync() {
   btn.disabled = true;
   btn.textContent = t('syncing');
 
-  // 收集选中域的所有 cookie
-  const payload = [];
-  for (const d of allDomains) {
-    if (!selected.has(d.domain)) continue;
-    for (const c of d.cookies) {
-      payload.push({
-        name: c.name,
-        value: c.value,
-        domain: c.domain,
-        path: c.path || '/',
-        hostOnly: !!c.hostOnly,
-        secure: !!c.secure,
-        httpOnly: !!c.httpOnly,
-        // Chrome 的 expirationDate 是自纪元起的秒数（浮点）；session cookie 为 -1。
-        expirationDate: c.expirationDate > 0 ? c.expirationDate : 0,
-      });
-    }
-  }
+  // 排除集 = 当前未勾选的域名；cookie 现读浏览器最新值（与后台自动同步共用
+  // sync-core.js 的 gatherCookiePayload，字段映射只有一份）。popup 打开后新
+  // 出现的域名也会被带上。
+  const excluded = allDomains.filter((d) => !selected.has(d.domain)).map((d) => d.domain);
+  let payload = [];
 
   try {
+    payload = await gatherCookiePayload(excluded);
     const resp = await authFetch(`${endpoint}/cookies`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -223,11 +226,92 @@ async function onClear() {
   try {
     const resp = await authFetch(`${endpoint}/cookies`, { method: 'DELETE' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    setStatus('clearSuccess', 'success');
+    if ($('auto-sync').checked) setStatus('clearSuccessAuto', 'success');
+    else setStatus('clearSuccess', 'success');
     setConnBadge('ok');
   } catch (err) {
     setStatus('clearFail', 'error', err.message);
     setConnBadge('off');
+  }
+}
+
+// ---------- 后台定时自动同步（由 background.js 执行，这里只做开关/周期/状态展示）----------
+const AUTO_SYNC_DEFAULT_SEC = 30;
+// 下限 30s = chrome.alarms 的最小周期（Chrome 120+；更老版本会被浏览器钳到 1 分钟）
+const AUTO_SYNC_MIN_SEC = 30;
+const AUTO_SYNC_MAX_SEC = 86400;
+
+// 最近一次后台同步结果 {at, ok, count, error} | null。缓存供语言切换后重译。
+let lastAutoSyncRecord = null;
+
+function clampAutoSyncSec(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return AUTO_SYNC_DEFAULT_SEC;
+  return Math.min(AUTO_SYNC_MAX_SEC, Math.max(AUTO_SYNC_MIN_SEC, n));
+}
+
+async function initAutoSync() {
+  const saved = await chrome.storage.local.get(['autoSyncEnabled', 'autoSyncIntervalSec', 'autoSyncLast']);
+  const cb = $('auto-sync');
+  const input = $('auto-interval');
+  cb.checked = !!saved.autoSyncEnabled;
+  input.value = clampAutoSyncSec(saved.autoSyncIntervalSec);
+  input.disabled = !cb.checked;
+  renderAutoLast(saved.autoSyncLast || null);
+
+  // 开关：落库即生效 —— background.js 监听 storage 变化重排 alarm
+  cb.addEventListener('change', async () => {
+    const on = cb.checked;
+    input.disabled = !on;
+    await chrome.storage.local.set({ autoSyncEnabled: on });
+    if (on) setStatus('autoSyncEnabledMsg', 'success', clampAutoSyncSec(input.value));
+    else setStatus('autoSyncDisabledMsg', 'info');
+    renderAutoLast();
+  });
+
+  // 周期：越界/非法输入自动钳回 30–86400 秒
+  input.addEventListener('change', async () => {
+    const raw = parseInt(input.value, 10);
+    const sec = clampAutoSyncSec(raw);
+    const adjusted = Number.isFinite(raw) && raw !== sec;
+    input.value = sec;
+    if (adjusted) setStatus('autoSyncIntervalClamped', 'info', AUTO_SYNC_MIN_SEC, AUTO_SYNC_MAX_SEC);
+    else setStatus('autoSyncIntervalSaved', 'info', sec);
+    await chrome.storage.local.set({ autoSyncIntervalSec: sec });
+  });
+
+  // popup 开着时，后台每次触发同步 → 实时刷新「上次自动同步」
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.autoSyncLast) {
+      renderAutoLast(changes.autoSyncLast.newValue || null);
+    }
+  });
+}
+
+// 渲染「上次自动同步」状态行。record 省略时沿用缓存；无记录时按开关状态
+// 显示「等待首次触发」或整行隐藏。
+function renderAutoLast(record) {
+  if (record !== undefined) lastAutoSyncRecord = record;
+  const el = $('auto-last');
+  const enabled = $('auto-sync').checked;
+  if (lastAutoSyncRecord && lastAutoSyncRecord.at) {
+    const time = new Date(lastAutoSyncRecord.at).toLocaleTimeString();
+    if (lastAutoSyncRecord.ok) {
+      el.textContent = t('autoLastOk', time, lastAutoSyncRecord.count);
+      el.className = 'auto-last ok';
+    } else {
+      el.textContent = t('autoLastFail', time, lastAutoSyncRecord.error || '?');
+      el.className = 'auto-last err';
+    }
+    el.title = el.textContent;   // 行内省略时 hover 看全文
+  } else if (enabled) {
+    el.textContent = t('autoLastPending');
+    el.className = 'auto-last';
+    el.title = '';
+  } else {
+    el.textContent = '';
+    el.className = 'auto-last';
+    el.title = '';
   }
 }
 
