@@ -110,6 +110,11 @@ fi
 
 # 运行时 JS（放 binary 同级 third_party/，各加载点统一按 applicationDirPath()/third_party/<sub> 查找）
 mkdir -p "$DIST_DIR/bin/third_party"
+# Markdown conversion is required at runtime; fail packaging if a dependency is missing.
+mkdir -p "$DIST_DIR/bin/third_party/markdown"
+for file in convert.js turndown.js turndown-plugin-gfm.js LICENSE.turndown LICENSE.turndown-plugin-gfm; do
+    cp "$ROOT_DIR/third_party/markdown/$file" "$DIST_DIR/bin/third_party/markdown/"
+done
 for sub in stealth readability serp; do
     if [[ -d "$ROOT_DIR/third_party/$sub" ]]; then
         cp -r "$ROOT_DIR/third_party/$sub" "$DIST_DIR/bin/third_party/"

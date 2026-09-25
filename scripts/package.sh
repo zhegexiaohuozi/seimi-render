@@ -201,6 +201,12 @@ if [[ -d "$ROOT_DIR/third_party/readability" ]]; then
     cp "$ROOT_DIR/third_party/readability/Readability.js" "$BUNDLE_APP/Contents/MacOS/third_party/readability/" 2>/dev/null || true
 fi
 
+# Markdown 转换器及许可证必须随包分发；缺文件直接失败。
+mkdir -p "$BUNDLE_APP/Contents/MacOS/third_party/markdown"
+for file in convert.js turndown.js turndown-plugin-gfm.js LICENSE.turndown LICENSE.turndown-plugin-gfm; do
+    cp "$ROOT_DIR/third_party/markdown/$file" "$BUNDLE_APP/Contents/MacOS/third_party/markdown/"
+done
+
 # 2a. stealth.js + serp/*.js（运行时从 binary 同级 third_party/ 加载）
 for sub in stealth serp; do
     if [[ -d "$ROOT_DIR/third_party/$sub" ]]; then

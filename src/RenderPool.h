@@ -91,19 +91,10 @@ private:
     const char* m_phase{"load"};
     void destroyPage();         // 销毁当前 page 并复位状态
 
-    // —— markdown Readability 正文提取（可选算法）——
-    // mdAlgorithm==Readability 且 wants(Markdown) 时，注入 extract.js 抽正文 HTML 存 m_readabilityHtml。
-    // tryFinishCollect 转换 markdown 时优先用它。失败（非文章页/异常）留空，回退保守策略。
-    void extractReadability();
-    // 分块读取结果（规避 runJavaScript 大返回值截断）。
-    void readReadabilityChunks(int idx, int total, const QString& acc);
-
-    // —— conservative 路径：DOM 简化（默认 markdown 算法）——
-    // mdAlgorithm==Conservative 且 wants(Markdown) 时，注入 simplify.js 在克隆 DOM 上删噪音，
-    // 简化后 HTML 存 m_simplifiedHtml。避免 html2md（字符串解析器）遇 script 内 '<' 状态错乱致 JS 泄漏。
-    // 失败则留空，回退 m_collectedHtml（等价旧行为）。
-    void extractSimplifiedHtml();
-    void readSimplifyChunks(int idx, int total, const QString& acc);
+    // ApplicationWorld 内完成 DOM 清洗/正文选择/转换；两个转换器共享同一规范化内容。
+    // legacy_cpp 回传 HTML，turndown 回传 Markdown。完整读完才进入其他输出的采集。
+    void extractMarkdown(bool legacyFallback = false, const QString& fallbackReason = QString());
+    void readMarkdownChunks(int idx, int total, int totalChars);
 
     // —— 站点特定 SERP 结构化提取（extract != None 时）——
     // extractAlgorithm==BaiduSerp 等时，注入对应引擎 JS 在 live DOM 结构构化抽取搜索结果，
@@ -169,19 +160,14 @@ private:
     RenderTaskPtr m_task;
     bool m_busy;
     bool m_collectStarted;      // 是否已发起采集（防止重入）
+    bool m_preparingCollect{false}; // 懒加载/Markdown 阶段也只能进入一次
 
     // 采集协调：toHtml/printToPdf 都是异步，需等全部返回再收尾（page 才能销毁）。
     int m_pendingCollect{0};    // 还在等待的异步采集数量
-    QString m_collectedHtml;    // 已采集的 HTML（html 输出 + markdown 转换依赖）
+    QString m_collectedHtml;    // 已采集的完整 HTML（html 输出 + 错误页检测）
     QByteArray m_collectedPdf;  // 已采集的 PDF
-    // Readability 抽取的正文 HTML（仅 mdAlgorithm==Readability 时填充）。
-    // 空则表示未启用或抽取失败，tryFinishCollect 回退到 m_collectedHtml（保守策略）。
-    QString m_readabilityHtml;
-    // extract.js（Readability 包装器）内容缓存，首次使用时从磁盘加载，之后复用。
-    static QString s_readabilityJs;
-    // conservative 路径：DOM 简化后的 HTML（仅 mdAlgorithm==Conservative 且 wants(Markdown) 时填充）。
-    // 空则表示未启用或简化失败，tryFinishCollect 回退到 m_collectedHtml（等价旧行为）。
-    QString m_simplifiedHtml;
+    QString m_markdownPayload; // turndown Markdown 或 legacy_cpp 规范化 HTML
+    QJsonObject m_markdownMeta;
     // SERP 提取结果 JSON（仅 extractAlgorithm==BaiduSerp 时填充）。
     // 空则表示未启用或提取失败，tryFinishCollect 不透传 serpJson（降级正常渲染）。
     QString m_serpJsonResult;
@@ -198,8 +184,6 @@ public:
     static bool s_stealthViewport;
 
 private:
-    // simplify.js（DOM 简化器）内容缓存，首次使用时从磁盘加载，之后复用。
-    static QString s_simplifyJs;
     // baidu_serp.js / bing_serp.js 内容缓存，按引擎名（baidu_serp/bing_serp）缓存。
     // 首次使用时从磁盘加载，之后复用。
     static QHash<QString, QString> s_serpJsCache;

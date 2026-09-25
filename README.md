@@ -244,6 +244,9 @@ seimi-render 默认Chromum内核渲染,没有你的登录态。要渲染「登�
 | `url` | 提交的 URL |
 | `state` | `pending` / `running` / `succeeded` / `failed` |
 | `html` | 渲染后的完整 HTML（仅 `succeeded` 时有） |
+| `markdown` | 提取并转换后的 Markdown（请求 `output=markdown` 且成功产出非空内容时返回） |
+| `md_algorithm_used` | 实际内容提取算法，保留原有字段：`conservative` / `readability` / `raw`；有非空 Markdown 时返回 |
+| `markdown_meta` | Markdown 诊断对象：`extractor`、`converter`、`warnings`（数组）、`conversion_ms`；发生回退时附 `fallback_reason`。仅返回 Markdown 的成功结果包含此字段，即使 Markdown 为空也保留诊断 |
 | `js_result` | `exec_js` 的执行结果（任意 JSON 值：对象/数组/字符串/数字/null）。仅请求了 `exec_js` 且脚本有返回值时出现；脚本无返回值（void）时该字段不出现；脚本异常/超时则任务 `failed`，`error` 以 `exec_js` 开头 |
 | `error` | 失败原因（仅 `failed` 时有）。**反爬拦截类失败**的 `error` 以 `blocked:` 开头，典型形如 `blocked: google /sorry/ page (2 retries exhausted)`（命中 Google 验证页 → 自动退避重试 → 重试耗尽判 blocked） |
 | `blocked` | 布尔，仅在 `state=failed` 且失败因反爬拦截时为 `true`（典型场景：Google `/sorry/` 验证页重试耗尽）。配合上面的 `error` 前缀 `blocked:`，调用方可显式区分「反爬拦截」与「超时/网络错」两条失败路径 |
@@ -273,7 +276,11 @@ curl -X POST http://localhost:8088/render \
 ```
 
 请求参数：
+
 - `url`（必填）：http/https 地址
+- `output`（可选，默认 `html`）：`html` / `markdown` / `pdf` / `screenshot`，支持逗号组合或数组
+- `md_algorithm`（可选，默认 `conservative`）：内容选择策略。`conservative` 清理整页 DOM；`readability` 定位文章正文，识别失败时回退 `conservative`
+- `md_converter`（可选，默认 `turndown`）：格式转换器。`turndown` 使用 DOM + Turndown/GFM；`legacy_cpp` 使用旧 C++ 转换器做兼容性对比。与 `md_algorithm` 独立，仅影响 Markdown；非法值或非字符串返回 400
 - `settle_ms`（可选，默认 2000）：`loadFinished` 后等待 JS 执行的毫秒数（0–30000）；搜狐这类内容多的页面建议 2500+
 - `long_poll_ms`（可选，默认 0）：长轮询等待结果的毫秒数（>0 时阻塞至完成或超时，上限 60000）
 - `exec_js`（可选）：页面加载 + settle 后在页面主世界执行的 JS 代码（≤1MB）。代码在 async 函数体内运行：裸表达式片段自动作为结果（如 `1+1` → `js_result:2`），多语句/含 `await` 用 `return` 显式回传（结果需可 JSON 序列化，上限 16MB）；无返回值 = void（响应无 `js_result` 字段）。脚本抛错/超时/语法错误 → 任务 `failed`，`error` 形如 `exec_js error: <原因>`（含精确的语法错误信息）。可用来在已登录页面同源调用站点 API（`fetch` 自动带 cookie）
@@ -291,6 +298,36 @@ curl -X POST http://localhost:8088/render -H "Content-Type: application/json" -d
   "long_poll_ms": 60000}'
 # => {"state":"succeeded","js_result":{...接口返回的 JSON...},"elapsed_ms":...}
 ```
+
+### Markdown 提取与转换
+
+默认流程是 **内容选择 → DOM 规范化 → Turndown + GFM → Markdown**。`md_algorithm` 继续决定选择整页内容还是文章正文，`md_converter` 单独决定转换器；两者可任意组合。提取和默认转换都在 Qt WebEngine 的 `ApplicationWorld` 隔离 JS 世界中完成，使用渲染后的 DOM，不需要 Node.js 运行时。完整 HTML 输出仍保持原页面内容。
+
+`legacy_cpp` 复用同一份选择、规范化后的 DOM，便于比较转换差异。默认转换器故障时可回退到 `legacy_cpp`，响应的 `markdown_meta.converter` 标明实际转换器，`warnings` 与 `fallback_reason` 说明原因；Readability 无法识别正文时同样记录回退到 conservative 的原因。共享提取流程不可用时任务失败，不返回看似正常的空结果。
+
+```bash
+curl -X POST http://localhost:8088/render \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/article","output":"markdown","md_algorithm":"readability","md_converter":"turndown","long_poll_ms":45000}'
+```
+
+成功响应示例（字段节选）：
+
+```json
+{
+  "state": "succeeded",
+  "markdown": "# Article\n\nText...",
+  "md_algorithm_used": "readability",
+  "markdown_meta": {
+    "extractor": "readability",
+    "converter": "turndown",
+    "warnings": [],
+    "conversion_ms": 12
+  }
+}
+```
+
+异步提交后用 `/result/:id?output=markdown` 获取同样的诊断。WebSocket 的 `finished` 推送也携带 `markdown_meta`；MCP 的 `render_url` / `get_web_content` 将其作为正文前的诊断信息返回，`get_render_result` 保留 HTTP 结果 JSON。
 
 ### 查询状态
 
@@ -655,9 +692,9 @@ seimi-render 内置一个 **MCP（Model Context Protocol）server**（默认端�
 | tool | 作用 | 必填参数 | 可选参数 |
 |------|------|----------|----------|
 | `browser_search` | 关键词搜索：自动构造搜索引擎 URL 并渲染，返回结果列表。**没给具体 URL、只想「搜一下/查一下」时优先用** | `query` | `engine`(google/bing/baidu/duckduckgo，默认 google)、`settle_ms`(2500)、`timeout_ms`(45000) |
-| `get_web_content` | 读单篇文章正文：用 readability 提取干净 markdown（去导航/广告/侧栏）。**给了具体 URL 要读全文时优先用** | `url` | `md_algorithm`(readability/conservative，默认 readability)、`settle_ms`(2500)、`timeout_ms`(45000) |
+| `get_web_content` | 读单篇文章正文：用 readability 提取干净 markdown（去导航/广告/侧栏）。**给了具体 URL 要读全文时优先用** | `url` | `md_algorithm`(readability/conservative，默认 readability)、`md_converter`(turndown/legacy_cpp，默认 turndown)、`settle_ms`(2500)、`timeout_ms`(45000) |
 | `fetch_url` | 轻量直取：带登录态 cookie + 全局代理直接请求 JSON/REST 端点，返回原始响应体（不走浏览器渲染，百毫秒级）。**目标是 API/JSON 端点时优先用** | `url` | `method`(GET/POST/PUT/PATCH/DELETE/HEAD，默认 GET)、`body`(请求体，默认按 JSON 发)、`headers`(请求头对象，显式 Cookie 覆盖登录态)、`timeout_ms`(15000)、`response_format`(text 默认/base64 二进制安全——附件下载场景，>50MB 拒绝) |
-| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000)、`record_network`(false，开启 HAR 网络录制，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network))、`exec_js`、`exec_js_timeout_ms` |
+| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`md_converter`(turndown/legacy_cpp，默认 turndown)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000)、`record_network`(false，开启 HAR 网络录制，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network))、`exec_js`、`exec_js_timeout_ms` |
 | `get_har` | 按 task_id 取网络录制 HAR：配合 `render_url` 的 `record_network=true` 使用，返回标准 HAR 1.2 JSON | `task_id` | — |
 | `get_render_result` | 按 task_id 补取已提交任务的结果：`render_url` 超时返回 `running` 后轮询，或重新拉取已完成产物 | `task_id` | `output`(markdown/html/screenshot/pdf，默认 markdown)、`timeout_ms`(5000) |
 
@@ -855,7 +892,7 @@ sequenceDiagram
 
     A->>M: tools/call get_web_content {url:"https://.../article"}
     M->>H: POST /render {url, output:markdown,<br/>md_algorithm:"readability", long_poll_ms:45000}
-    Note over H: 渲染 + Readability 正文定位<br/>（非文章页自动回退 conservative/raw）
+    Note over H: 渲染 + Readability 正文定位<br/>（非文章页自动回退 conservative）<br/>DOM 规范化 + Turndown/GFM
     H-->>M: {state:succeeded, markdown:"# 标题\n\n正文...",<br/>md_algorithm_used:"readability"}
     M-->>A: content:[text "[get_web_content url=... md=readability]\n\n# 标题\n\n正文..."]
 ```
@@ -945,6 +982,7 @@ curl -X DELETE http://localhost:8088/cookies
 | `settle_ms` | int | 否 | loadFinished 后等待 JS 执行的毫秒数（0–30000，默认 2000） |
 | `output` | string \| array | 否 | 产物类型，逗号分隔串（`"html,markdown,pdf,screenshot"`）或数组（与 HTTP `/render` 同语义；`md`/`image`/`png`/`jpg` 为别名）。默认 `html` |
 | `md_algorithm` | string | 否 | markdown 算法：`conservative`（默认）/ `readability`（与 HTTP 同语义） |
+| `md_converter` | string | 否 | Markdown 转换器：`turndown`（默认）/ `legacy_cpp`（与 HTTP 同语义）；非法值返回 `error` |
 | `format` | string | 否 | 截图编码：`auto`（默认）/ `png` / `jpg`（与 HTTP 同语义） |
 
 服务端收到后向渲染队列提交任务，**自动把本连接订阅到该任务**，并立即回 `created`；渲染完成时推送 `finished`。真实示例：
@@ -974,7 +1012,7 @@ curl -X DELETE http://localhost:8088/cookies
 |---------|----------|----------|
 | `created` | `render` 请求已受理并提交到渲染队列 | `task_id`、`url` |
 | `subscribed` | `subscribe` 请求合法，订阅成功 | `task_id` |
-| `finished` | 订阅的任务到达终态（成功或失败），**主动推送** | `task_id`、`state` |
+| `finished` | 订阅的任务到达终态（成功或失败），**主动推送** | `task_id`、`state`；Markdown 成功结果附 `md_algorithm_used`、`markdown_meta` |
 | `authorized` | 启用密码且鉴权通过（连接 URL `?token=` 或 `auth` 动作）；未启用密码时 `auth` 动作也会回此 | — |
 | `error` | 请求非法（缺字段 / 非 JSON / URL 非法 / 未知 action） | `message` |
 
@@ -1208,8 +1246,7 @@ sequenceDiagram
 | [Qt 6](https://www.qt.io/)（Qt WebEngine / Network / WebSockets 等） | Chromium 渲染核心、网络栈 | **LGPL v3**（开源选项）/ 商业双授权 |
 | [cpp-mcp](./third_party/cpp-mcp/) | MCP 协议实现 | MIT |
 | [cpp-httplib](./third_party/httplib.h) | HTTP 服务 | MIT |
-| [html2md](./third_party/html2md.cpp) / [table](./third_party/table.cpp) | HTML→Markdown 转换 | MIT |
+| [Turndown / turndown-plugin-gfm](./third_party/markdown/) | 默认 DOM→Markdown 转换与 GFM 规则 | MIT |
+| [html2md](./third_party/html2md.cpp) / [table](./third_party/table.cpp) | `legacy_cpp` 兼容转换与故障回退 | MIT |
 | [qaes](./third_party/qaes/) | AES 加密 | Public Domain |
 | [Mozilla Readability](./third_party/readability/) | 正文提取 | Apache License 2.0 |
-
-

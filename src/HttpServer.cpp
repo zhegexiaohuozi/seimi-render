@@ -274,8 +274,11 @@ std::string HttpServer::jsonStateResp(const RenderQueue::Snapshot& s, OutputMask
         }
         if ((outMask & static_cast<OutputMask>(Output::Markdown)) && !s.markdown.isEmpty()) {
             out += ",\"markdown\":\"" + esc(s.markdown) + "\"";
-            // 可观测性：实际使用的算法。请求 readability 但非文章页时会回退 raw/conservative。
+            // 可观测性：实际使用的算法。请求 readability 但非文章页时会回退 conservative。
             out += ",\"md_algorithm_used\":\"" + std::string(mdAlgorithmName(s.mdAlgorithmUsed)) + "\"";
+        }
+        if ((outMask & static_cast<OutputMask>(Output::Markdown)) && !s.markdownMeta.isEmpty()) {
+            out += ",\"markdown_meta\":" + QJsonDocument(s.markdownMeta).toJson(QJsonDocument::Compact).toStdString();
         }
         if ((outMask & static_cast<OutputMask>(Output::Pdf)) && !s.pdfData.isEmpty()) {
             out += ",\"has_pdf\":true,\"pdf_bytes\":" + std::to_string(s.pdfData.size());
@@ -913,6 +916,17 @@ void HttpServer::registerRoutes() {
         ImageFormat imgFmt = parseImageFormat(obj.value(QStringLiteral("format")));
         // markdown 正文提取算法：conservative/readability。默认 conservative（零误伤）。
         MdAlgorithm mdAlg = parseMdAlgorithm(obj.value(QStringLiteral("md_algorithm")));
+        MdConverter mdConv = MdConverter::Turndown;
+        if (obj.contains(QStringLiteral("md_converter"))) {
+            const QString converter = obj.value(QStringLiteral("md_converter")).toString().trimmed().toLower();
+            if (converter == QStringLiteral("legacy_cpp")) mdConv = MdConverter::LegacyCpp;
+            else if (converter != QStringLiteral("turndown")) {
+                res.status = 400;
+                res.set_content(R"({"error":"md_converter must be turndown or legacy_cpp"})",
+                                "application/json; charset=utf-8");
+                return;
+            }
+        }
         // 站点特定提取算法：baidu_serp（百度搜索结果页结构化提取）。默认 none。
         ExtractAlgorithm extractAlg = parseExtractAlgorithm(obj.value(QStringLiteral("extract")));
         // HAR 网络录制：record_network=true 开启该任务的 CDP 网络录制，结果走 GET /har/<id>。
@@ -931,7 +945,7 @@ void HttpServer::registerRoutes() {
 
         QString id = m_queue->submit(url, settleMs, outputs, imgFmt, mdAlg, nowMsec(),
                                      extractAlg, recordHar, execJs, execJsTimeout,
-                                     QString::fromStdString(resolvedIp));
+                                     QString::fromStdString(resolvedIp), mdConv);
         if (id.isEmpty()) {
             // 任务表过载（洪泛提交/积压）：背压拒绝，让客户端稍后重试。
             res.status = 503;

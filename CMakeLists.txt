@@ -354,6 +354,12 @@ install(DIRECTORY admin-ui/ DESTINATION admin-ui)
 install(FILES third_party/readability/extract.js
               third_party/readability/simplify.js
         DESTINATION third_party/readability)
+install(FILES third_party/markdown/convert.js
+              third_party/markdown/turndown.js
+              third_party/markdown/turndown-plugin-gfm.js
+              third_party/markdown/LICENSE.turndown
+              third_party/markdown/LICENSE.turndown-plugin-gfm
+        DESTINATION third_party/markdown)
 install(FILES third_party/stealth/stealth.js
         DESTINATION third_party/stealth)
 install(FILES third_party/serp/baidu_serp.js

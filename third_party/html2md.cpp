@@ -85,7 +85,7 @@ string toLower(const string &str) {
   string lower;
   lower.reserve(str.size());
   for (char ch : str) {
-    lower += tolower(ch);
+    lower += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   }
   return lower;
 }
@@ -410,66 +410,45 @@ void Converter::TidyAllLines(string *str) {
 }
 
 string Converter::ExtractAttributeFromTagLeftOf(const string &attr) {
-  // Extract the whole tag from current offset, e.g. from '>', backwards
-  auto tag = html_.substr(offset_lt_, index_ch_in_html_ - offset_lt_);
-  string lowerTag = toLower(tag); // Convert tag to lowercase for comparison
+  // [seimi patch] Walk complete attribute/value pairs. Substring search also
+  // matched data-href and text such as title="href='/tracking'".
+  const size_t end = index_ch_in_html_ - 1; // exclude the closing '>'
+  size_t pos = offset_lt_; // first character after '<'
+  const auto isSpace = [](char ch) {
+    return std::isspace(static_cast<unsigned char>(ch)) != 0;
+  };
+  while (pos < end && !isSpace(html_[pos]) && html_[pos] != '/')
+    ++pos; // tag name
 
-  // locate given attribute (case-insensitive)
-  auto offset_attr = lowerTag.find(attr);
-
-  if (offset_attr == string::npos)
-    return "";
-
-  // locate attribute-value pair's '='
-  auto offset_equals = tag.find('=', offset_attr);
-
-  if (offset_equals == string::npos)
-    return "";
-
-  // locate value's surrounding quotes
-  auto offset_double_quote = tag.find('"', offset_equals);
-  auto offset_single_quote = tag.find('\'', offset_equals);
-
-  bool has_double_quote = offset_double_quote != string::npos;
-  bool has_single_quote = offset_single_quote != string::npos;
-
-  if (!has_double_quote && !has_single_quote)
-    return "";
-
-  char wrapping_quote = 0;
-
-  size_t offset_opening_quote = 0;
-  size_t offset_closing_quote = 0;
-
-  if (has_double_quote) {
-    if (!has_single_quote) {
-      wrapping_quote = '"';
-      offset_opening_quote = offset_double_quote;
-    } else {
-      if (offset_double_quote < offset_single_quote) {
-        wrapping_quote = '"';
-        offset_opening_quote = offset_double_quote;
-      } else {
-        wrapping_quote = '\'';
-        offset_opening_quote = offset_single_quote;
-      }
+  while (pos < end) {
+    while (pos < end && (isSpace(html_[pos]) || html_[pos] == '/'))
+      ++pos;
+    const size_t nameStart = pos;
+    while (pos < end && !isSpace(html_[pos]) && html_[pos] != '=' &&
+           html_[pos] != '/')
+      ++pos;
+    const string name = toLower(html_.substr(nameStart, pos - nameStart));
+    while (pos < end && isSpace(html_[pos]))
+      ++pos;
+    if (pos == end || html_[pos] != '=') {
+      if (name == attr)
+        return ""; // a boolean attribute has no value
+      continue;
     }
-  } else {
-    // has only single quote
-    wrapping_quote = '\'';
-    offset_opening_quote = offset_single_quote;
+    ++pos;
+    while (pos < end && isSpace(html_[pos]))
+      ++pos;
+    const char quote = pos < end && (html_[pos] == '\'' || html_[pos] == '"')
+                           ? html_[pos++] : 0;
+    const size_t valueStart = pos;
+    while (pos < end && (quote ? html_[pos] != quote : !isSpace(html_[pos])))
+      ++pos;
+    if (name == attr)
+      return html_.substr(valueStart, pos - valueStart);
+    if (quote && pos < end)
+      ++pos;
   }
-
-  if (offset_opening_quote == string::npos)
-    return "";
-
-  offset_closing_quote = tag.find(wrapping_quote, offset_opening_quote + 1);
-
-  if (offset_closing_quote == string::npos)
-    return "";
-
-  return tag.substr(offset_opening_quote + 1,
-                    offset_closing_quote - 1 - offset_opening_quote);
+  return "";
 }
 
 void Converter::TurnLineIntoHeader1() {
@@ -532,6 +511,9 @@ void Converter::OnHasEnteredTag() {
   offset_lt_ = index_ch_in_html_;
   is_in_tag_ = true;
   is_closing_tag_ = false;
+  attribute_quote_ = 0;
+  is_before_attribute_value_ = false;
+  is_in_unquoted_attribute_value_ = false;
   prev_tag_ = current_tag_;
   current_tag_ = "";
 
@@ -552,21 +534,39 @@ Converter *Converter::UpdatePrevChFromMd() {
 }
 
 bool Converter::ParseCharInTag(char ch) {
-  static bool skipping_leading_whitespace = true;
-
-  if (ch == '/' && !is_in_attribute_value_) {
+  // [seimi patch] A quote only terminates its own quoted value; neither '>'
+  // nor '/' inside a value may end the tag. Unquoted URLs also contain '/'.
+  if (attribute_quote_) {
+    if (ch == attribute_quote_)
+      attribute_quote_ = 0;
+    current_tag_ += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return true;
+  }
+  if (is_in_unquoted_attribute_value_ &&
+      std::isspace(static_cast<unsigned char>(ch)))
+    is_in_unquoted_attribute_value_ = false;
+  if (is_before_attribute_value_ &&
+      !std::isspace(static_cast<unsigned char>(ch)) && ch != '>') {
+    is_before_attribute_value_ = false;
+    if (ch == '\'' || ch == '"') {
+      attribute_quote_ = ch;
+      current_tag_ += ch;
+      return true;
+    }
+    is_in_unquoted_attribute_value_ = true;
+  }
+  if (ch == '/' && !is_in_unquoted_attribute_value_) {
     is_closing_tag_ = current_tag_.empty();
     is_self_closing_tag_ = !is_closing_tag_;
-    skipping_leading_whitespace = true; // Reset for next tag
     return true;
   }
 
   if (ch == '>') {
     // Trim trailing whitespace by removing characters from current_tag_
-    while (!current_tag_.empty() && std::isspace(current_tag_.back())) {
+    while (!current_tag_.empty() &&
+           std::isspace(static_cast<unsigned char>(current_tag_.back()))) {
       current_tag_.pop_back();
     }
-    skipping_leading_whitespace = true; // Reset for next tag
     if (!is_self_closing_tag_)
       return OnHasLeftTag();
     else {
@@ -577,30 +577,13 @@ bool Converter::ParseCharInTag(char ch) {
     }
   }
 
-  if (ch == '"') {
-    if (is_in_attribute_value_) {
-      is_in_attribute_value_ = false;
-    } else {
-      size_t pos = current_tag_.length();
-      while (pos > 0 && isspace(current_tag_[pos - 1])) {
-        pos--;
-      }
-      if (pos > 0 && current_tag_[pos - 1] == '=') {
-        is_in_attribute_value_ = true;
-      }
-    }
-    skipping_leading_whitespace = false; // Stop skipping after attribute
-    return true;
-  }
+  if (ch == '=' && !is_in_unquoted_attribute_value_)
+    is_before_attribute_value_ = true;
 
-  // Handle whitespace: skip leading whitespace, keep others
-  if (isspace(ch) && skipping_leading_whitespace) {
+  if (std::isspace(static_cast<unsigned char>(ch)) && current_tag_.empty()) {
     return true; // Ignore leading whitespace
   }
-
-  // Once we encounter a non-whitespace character, stop skipping
-  skipping_leading_whitespace = false;
-  current_tag_ += tolower(ch);
+  current_tag_ += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   return false;
 }
 
@@ -614,7 +597,7 @@ bool Converter::OnHasLeftTag() {
       return true;
 
   // Extract tag name without Split() - just find first space
-  size_t space_pos = current_tag_.find(' ');
+  size_t space_pos = current_tag_.find_first_of(" \t\n\r\f");
   if (space_pos != string::npos) {
     current_tag_ = current_tag_.substr(0, space_pos);
   }

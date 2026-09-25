@@ -59,7 +59,8 @@ static QByteArray outputMaskNames(OutputMask mask) {
 QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs,
                             ImageFormat imageFormat, MdAlgorithm mdAlgorithm, qint64 nowMsec,
                             ExtractAlgorithm extractAlgorithm, bool recordHar,
-                            QString execJs, int execJsTimeoutMsec, QString resolvedIp) {
+                            QString execJs, int execJsTimeoutMsec, QString resolvedIp,
+                            MdConverter mdConverter) {
     QMutexLocker locker(&m_mutex);
 
     // 过载背压：任务表已满（洪泛提交/积压未消化），拒绝新提交。调用方据此回 503。
@@ -79,7 +80,8 @@ QString RenderQueue::submit(QString url, int settleDelayMsec, OutputMask outputs
 
     auto task = RenderTaskPtr::create(id, std::move(url), nowMsec, settleDelayMsec,
                                       outputs, imageFormat, mdAlgorithm, extractAlgorithm, recordHar,
-                                      std::move(execJs), execJsTimeoutMsec, std::move(resolvedIp));
+                                      std::move(execJs), execJsTimeoutMsec, std::move(resolvedIp),
+                                      mdConverter);
     m_tasks.insert(id, task);
     m_pendingIds.push_back(id);
 
@@ -266,6 +268,7 @@ void RenderQueue::reportSucceeded(const QString& id, const RenderResult& result,
                     t.resolvedImageFmt = result.imageFmt;
                     t.imageTruncated = result.imageTruncated;
                     t.mdAlgorithmUsed = result.mdAlgorithmUsed;
+                    t.markdownMeta = result.markdownMeta;
                     t.serpJson = result.serpJson;
                     t.jsJson = result.jsJson;
                     t.finalUrl = result.finalUrl;
@@ -336,6 +339,7 @@ RenderQueue::Snapshot RenderQueue::snapshot(const QString& id) const {
     s.resolvedImageFmt = t.resolvedImageFmt;
     s.imageTruncated = t.imageTruncated;
     s.mdAlgorithmUsed = t.mdAlgorithmUsed;
+    s.markdownMeta = t.markdownMeta;
     s.serpJson = t.serpJson;
     s.jsJson = t.jsJson;
     s.finalUrl = t.finalUrl;

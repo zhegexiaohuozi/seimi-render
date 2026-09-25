@@ -96,6 +96,11 @@ if exist "%ROOT_DIR%\admin-ui" (
 if exist "%ROOT_DIR%\third_party\readability" (
     xcopy /y /e /i "%ROOT_DIR%\third_party\readability" "%DIST_DIR%\third_party\readability\" >nul
 )
+if not exist "%DIST_DIR%\third_party\markdown" mkdir "%DIST_DIR%\third_party\markdown"
+for %%F in (convert.js turndown.js turndown-plugin-gfm.js LICENSE.turndown LICENSE.turndown-plugin-gfm) do (
+    copy /y "%ROOT_DIR%\third_party\markdown\%%F" "%DIST_DIR%\third_party\markdown\" >nul
+    if errorlevel 1 exit /b 1
+)
 if exist "%ROOT_DIR%\third_party\stealth" (
     xcopy /y /e /i "%ROOT_DIR%\third_party\stealth" "%DIST_DIR%\third_party\stealth\" >nul
 )
