@@ -19,9 +19,11 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPainter>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QStringList>
@@ -65,10 +67,27 @@ static QString sanitizeForLog(const QString& s) {
     return out;
 }
 
-// Readability 包装器（extract.js）的静态缓存，首次 extractReadability 调用时从磁盘加载。
-QString RenderWorker::s_readabilityJs;
-// DOM 简化器（simplify.js）的静态缓存，首次 extractSimplifiedHtml 调用时从磁盘加载。
-QString RenderWorker::s_simplifyJs;
+// 仅 GUI 线程使用；部署目录优先，源码路径用于开发构建。失败不缓存，便于补齐资源后重试。
+static QString markdownScript(const QString& relativePath) {
+    static QHash<QString, QString> cache;
+    if (cache.contains(relativePath)) return cache.value(relativePath);
+    const QStringList roots = {
+        QCoreApplication::applicationDirPath() + QStringLiteral("/third_party/"),
+#ifdef SEIMI_ADMIN_UI_SRC_DIR
+        QStringLiteral(SEIMI_ADMIN_UI_SRC_DIR) + QStringLiteral("/../third_party/"),
+#endif
+    };
+    for (const QString& root : roots) {
+        QFile file(root + relativePath);
+        if (QFileInfo(file).isFile() && file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            const QString source = QString::fromUtf8(file.readAll());
+            if (!source.isEmpty()) cache.insert(relativePath, source);
+            return source;
+        }
+    }
+    return {};
+}
+
 QHash<QString, QString> RenderWorker::s_serpJsCache;
 // 视口是否用 stealth 统一尺寸（由 RenderPool::start 设置一次，所有 worker 共享）。
 bool RenderWorker::s_stealthViewport = false;
@@ -107,6 +126,7 @@ void RenderWorker::assign(RenderTaskPtr task) {
     m_task = std::move(task);
     m_busy = true;
     m_collectStarted = false;
+    m_preparingCollect = false;
     m_pendingCollect = 0;
     m_retryCount = 0;
     m_sorryHits = 0;
@@ -119,6 +139,7 @@ void RenderWorker::assign(RenderTaskPtr task) {
 // 每任务/每尝试一个全新 view（持有 page）。用 view 而非裸 page 是为了 QWidget::grab() 截图
 //（QWebEnginePage 在 Qt6 无 grabToImage）。
 void RenderWorker::startAttempt() {
+    m_preparingCollect = false;
     m_phase = "load";
     m_view = new QWebEngineView(m_profile, nullptr);
     // 视口尺寸：stealth 开启时统一 1920×1080（与 screen 指纹一致），否则 1280×2000。
@@ -159,7 +180,6 @@ void RenderWorker::startAttempt() {
 
 void RenderWorker::onLoadFinished(bool ok) {
     if (!m_busy || !m_task || !m_page) return;
-
     // Google 反爬 sorry 页：最终 URL 命中 /sorry 即判定（先于一切其他分支，零额外异步）。
     if (isGoogleSorryUrl(m_page->url())) {
         handleSorryDetected();
@@ -181,14 +201,19 @@ void RenderWorker::onLoadFinished(bool ok) {
         return;
     }
 
+    if (m_preparingCollect || m_collectStarted) return;
+
     if (!ok) {
         // loadFinished(false) 触发条件宽泛：主文档失败、任意子资源失败、JS challenge 中间态
         // 都会触发。后两者主文档其实已就绪。先探测 DOM：body >= 512 字节（远大于真错误页如
         // Google 404 的 ~260 字节）视为可采集，继续 settle；否则判失败。
+        const auto task = m_task;
+        const QPointer<QWebEnginePage> page = m_page;
+        const QPointer<RenderWorker> worker = this;
         m_page->runJavaScript(
             QStringLiteral("(document.body&&document.body.innerHTML.length)||0"),
-            [this](const QVariant& v) {
-                if (!m_busy || !m_task || !m_page) return;
+            [this, task, page, worker](const QVariant& v) {
+                if (!worker || !m_busy || m_task != task || !page || m_page != page || m_preparingCollect || m_collectStarted) return;
                 int bodyLen = v.toInt();
                 static constexpr int kMinViableBodyLen = 512;
                 if (bodyLen >= kMinViableBodyLen) {
@@ -217,7 +242,8 @@ void RenderWorker::onLoadTimeout() {
 
 void RenderWorker::onSettleElapsed() {
     if (!m_busy || !m_task || !m_page) return;
-    if (m_collectStarted) return;
+    if (m_collectStarted || m_preparingCollect) return;
+    m_preparingCollect = true;
     m_phase = "collect";
     // 激活懒加载图片：很多新闻/SPA 站用 lazy-loading，图片只在滚动进视口时加载。
     // 注入 JS 把常见 lazy 属性拷回 src 并滚动触发，回调里再 collect。
@@ -246,20 +272,19 @@ void RenderWorker::activateLazyImagesAndScroll() {
           return n;
         })()
     )");
-    m_page->runJavaScript(js, [this](const QVariant&) {
-        if (!m_busy || !m_task || !m_page) { return; }
+    const auto task = m_task;
+    const QPointer<QWebEnginePage> page = m_page;
+    const QPointer<RenderWorker> worker = this;
+    m_page->runJavaScript(js, [this, task, page, worker](const QVariant&) {
+        if (!worker || !m_busy || m_task != task || !page || m_page != page || !m_preparingCollect) return;
         // 被激活的图片要发网络请求，给 2500ms 让请求发出再采集。markdown 按算法分流：
         // Readability 走正文提取，Conservative 走 DOM 简化，其余直接采集。
-        QTimer::singleShot(2500, this, [this]() {
-            if (!m_busy || !m_task || !m_page) return;
+        QTimer::singleShot(2500, this, [this, task, page, worker]() {
+            if (!worker || !m_busy || m_task != task || !page || m_page != page || !m_preparingCollect) return;
             if (m_task->extractAlgorithm != ExtractAlgorithm::None) {
-                extractSerp();              // SERP 结构化提取（与 markdown 互斥）
+                extractSerp();              // 结构化结果完成后，collect() 接续可选 Markdown
             } else if (m_task->wants(Output::Markdown)) {
-                if (m_task->mdAlgorithm == MdAlgorithm::Readability) {
-                    extractReadability();        // 正文定位（概率性，质量高）
-                } else {
-                    extractSimplifiedHtml();     // conservative 新实现：DOM 简化（默认）
-                }
+                extractMarkdown();
             } else {
                 collect();
             }
@@ -267,139 +292,121 @@ void RenderWorker::activateLazyImagesAndScroll() {
     });
 }
 
-// Readability 正文提取：注入 extract.js 抽正文 HTML 存 m_readabilityHtml，完成调 collect()。
-// extract.js 首次从 third_party/readability/extract.js 加载并缓存（二进制同级优先，源码目录回退）。
-// 找不到或 JS 失败时 m_readabilityHtml 留空，tryFinishCollect 回退保守策略。
-void RenderWorker::extractReadability() {
-    if (!m_busy || !m_task || !m_page) { collect(); return; }
-
-    // 首次使用：加载 extract.js（二进制同级优先，源码目录回退）。
-    if (s_readabilityJs.isEmpty()) {
-        QStringList candidates = {
-            QCoreApplication::applicationDirPath() + QStringLiteral("/third_party/readability/extract.js"),
-#ifdef SEIMI_ADMIN_UI_SRC_DIR
-            QStringLiteral(SEIMI_ADMIN_UI_SRC_DIR) + QStringLiteral("/../third_party/readability/extract.js"),
-#endif
-        };
-        for (const QString& path : candidates) {
-            // QFileInfo::isFile 确保是文件而非目录（防路径被解析成目录导致 open 异常）。
-            QFileInfo fi(path);
-            if (!fi.isFile()) continue;
-            QFile f(path);
-            if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                s_readabilityJs = QString::fromUtf8(f.readAll());
-                break;
-            }
-        }
-        if (s_readabilityJs.isEmpty()) {
-            // extract.js 找不到：回退保守策略（静默降级）。
-            collect();
-            return;
-        }
+// JS 变量和分块结果始终留在 ApplicationWorld，页面脚本不能覆盖转换器/伪造结果。
+void RenderWorker::extractMarkdown(bool legacyFallback, const QString& fallbackReason) {
+    if (!m_busy || !m_task || !m_page) return;
+    m_phase = "markdown";
+    m_markdownPayload.clear();
+    m_markdownMeta = {};
+    const bool legacy = legacyFallback || m_task->mdConverter == MdConverter::LegacyCpp;
+    const QString entry = markdownScript(QStringLiteral("markdown/convert.js"));
+    if (entry.isEmpty()) {
+        finishFailure(QStringLiteral("markdown conversion unavailable: missing third_party/markdown/convert.js"));
+        return;
     }
-
-    // 注入 extract.js（IIFE）。结果分块存 window.__seimiReadability，返回值仅状态 JSON（不截断）。
-    // C++ 逐块 runJavaScript 读取拼接。
-    m_page->runJavaScript(s_readabilityJs, [this](const QVariant& v) {
-        if (!m_busy || !m_task || !m_page) { collect(); return; }
-        const QString s = v.toString();
-        const QJsonDocument doc = QJsonDocument::fromJson(s.toUtf8());
-        if (!doc.isObject()) { collect(); return; }
-        QJsonObject o = doc.object();
-        if (!o.value(QStringLiteral("ok")).toBool()) {
-            // 非文章页/异常：m_readabilityHtml 留空，回退保守策略。
-            collect();
+    QString source;
+    if (m_task->mdAlgorithm == MdAlgorithm::Readability) {
+        // 复用 vendored Readability 定义，跳过旧 extract.js 的 HTML 序列化适配层。
+        const QString wrapper = markdownScript(QStringLiteral("readability/extract.js"));
+        const QString begin = QStringLiteral("// [[[ READABILITY_BEGIN ]]]");
+        const QString end = QStringLiteral("// [[[ READABILITY_END ]]]");
+        const qsizetype start = wrapper.indexOf(begin);
+        const qsizetype stop = wrapper.indexOf(end);
+        if (start >= 0 && stop > start)
+            source += wrapper.mid(start + begin.size(), stop - start - begin.size());
+        // Readability 缺失由 JS 显式回退 conservative，并在 metadata 说明。
+    }
+    if (!legacy) {
+        const QString turndown = markdownScript(QStringLiteral("markdown/turndown.js"));
+        const QString gfm = markdownScript(QStringLiteral("markdown/turndown-plugin-gfm.js"));
+        if (turndown.isEmpty() || gfm.isEmpty()) {
+            extractMarkdown(true, QStringLiteral("Turndown/GFM script missing"));
             return;
         }
-        int totalChunks = o.value(QStringLiteral("totalChunks")).toInt(0);
-        if (totalChunks <= 0) { collect(); return; }
-        // 分块读取 window.__seimiReadability.chunks[i]，逐块拼接。
-        readReadabilityChunks(0, totalChunks, QString());
+        source += QLatin1Char('\n') + turndown + QLatin1Char('\n') + gfm;
+    }
+    const QJsonObject options {
+        {QStringLiteral("algorithm"), m_task->mdAlgorithm == MdAlgorithm::Readability
+             ? QStringLiteral("readability") : QStringLiteral("conservative")},
+        {QStringLiteral("converter"), legacy ? QStringLiteral("legacy_cpp") : QStringLiteral("turndown")},
+    };
+    QString expression = entry.trimmed();
+    if (expression.endsWith(QLatin1Char(';'))) expression.chop(1);
+    source = QStringLiteral("(function(){\nwindow.__seimiMarkdownOptions = ")
+        + QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact))
+        + QStringLiteral(";\n") + source + QStringLiteral("\nreturn (\n") + expression + QStringLiteral("\n);\n})();");
+    const auto task = m_task;
+    const QPointer<QWebEnginePage> page = m_page;
+    const QPointer<RenderWorker> worker = this;
+    m_page->runJavaScript(source, QWebEngineScript::ApplicationWorld,
+                         [this, task, page, worker, legacy, fallbackReason](const QVariant& value) {
+        if (!worker || !m_busy || m_task != task || !page || m_page != page || !m_preparingCollect) return;
+        QJsonObject status = QJsonDocument::fromJson(value.toString().toUtf8()).object();
+        if (!status.value(QStringLiteral("ok")).toBool()) {
+            QString reason = status.value(QStringLiteral("error")).toString();
+            if (reason.isEmpty()) reason = QStringLiteral("invalid JavaScript conversion response");
+            if (!legacy) {
+                extractMarkdown(true, reason);
+            } else {
+                finishFailure(QStringLiteral("markdown conversion failed: ") + reason);
+            }
+            return;
+        }
+        const int chunks = status.value(QStringLiteral("totalChunks")).toInt(-1);
+        const int chars = status.value(QStringLiteral("totalChars")).toInt(-1);
+        // 和 JS 上限一致；空页面的零块是成功，不等同提取失败。
+        constexpr int maxChars = 32 * 1024 * 1024;
+        if (chars < 0 || chars > maxChars || chunks < 0 || chunks > maxChars / 29999 + 1
+                || (chunks == 0) != (chars == 0)) {
+            finishFailure(QStringLiteral("markdown conversion returned invalid chunk bounds"));
+            return;
+        }
+        status.remove(QStringLiteral("ok"));
+        status.remove(QStringLiteral("totalChunks"));
+        status.remove(QStringLiteral("totalChars"));
+        if (!fallbackReason.isEmpty()) {
+            QJsonArray warnings = status.value(QStringLiteral("warnings")).toArray();
+            warnings.append(QStringLiteral("turndown_failed: ") + fallbackReason);
+            status.insert(QStringLiteral("warnings"), warnings);
+            QString reason = status.value(QStringLiteral("fallback_reason")).toString();
+            if (!reason.isEmpty()) reason += QStringLiteral("; ");
+            status.insert(QStringLiteral("fallback_reason"), reason + QStringLiteral("turndown: ") + fallbackReason);
+        }
+        m_markdownMeta = status;
+        m_markdownPayload.reserve(chars);
+        readMarkdownChunks(0, chunks, chars);
     });
 }
 
-// 分块读取 Readability 结果（规避 runJavaScript 大返回值截断）。
-void RenderWorker::readReadabilityChunks(int idx, int total, const QString& acc) {
-    if (!m_busy || !m_task || !m_page) { collect(); return; }
-    if (idx >= total) {
-        m_readabilityHtml = acc;
+void RenderWorker::readMarkdownChunks(int idx, int total, int totalChars) {
+    if (!m_busy || !m_task || !m_page) return;
+    if (idx == total) {
+        if (m_markdownPayload.size() != totalChars) {
+            finishFailure(QStringLiteral("markdown result incomplete (page navigated or chunks truncated)"));
+            return;
+        }
+        m_page->runJavaScript(QStringLiteral("delete window.__seimiMarkdown; delete window.__seimiMarkdownOptions;"),
+                             QWebEngineScript::ApplicationWorld);
         collect();
         return;
     }
-    // null 防御：页面重载致 window 变量丢失则回退保守策略。
-    QString js = QStringLiteral(
-        "(window.__seimiReadability && window.__seimiReadability.chunks ? "
-        "window.__seimiReadability.chunks[%1] : null)").arg(idx);
-    m_page->runJavaScript(js, [this, idx, total, acc](const QVariant& v) {
-        if (!m_busy || !m_task || !m_page) { collect(); return; }
-        if (v.isNull()) { collect(); return; }  // window 变量丢失，回退
-        readReadabilityChunks(idx + 1, total, acc + v.toString());
-    });
-}
-
-// conservative 路径：在 document 深拷贝上删 script/style/template/iframe/link 等噪音，
-// 简化后 HTML 存 m_simplifiedHtml 后调 collect()。simplify.js 用 cloneNode 不动 live DOM，
-// 截图/html 输出不受影响。加载/JS 失败则留空，回退 m_collectedHtml。
-void RenderWorker::extractSimplifiedHtml() {
-    if (!m_busy || !m_task || !m_page) { collect(); return; }
-
-    // 首次使用：加载 simplify.js。
-    if (s_simplifyJs.isEmpty()) {
-        QStringList candidates = {
-            QCoreApplication::applicationDirPath() + QStringLiteral("/third_party/readability/simplify.js"),
-#ifdef SEIMI_ADMIN_UI_SRC_DIR
-            QStringLiteral(SEIMI_ADMIN_UI_SRC_DIR) + QStringLiteral("/../third_party/readability/simplify.js"),
-#endif
-        };
-        for (const QString& path : candidates) {
-            QFileInfo fi(path);
-            if (!fi.isFile()) continue;
-            QFile f(path);
-            if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                s_simplifyJs = QString::fromUtf8(f.readAll());
-                break;
-            }
-        }
-        if (s_simplifyJs.isEmpty()) {
-            // simplify.js 找不到：回退原始 DOM（等价旧行为，静默降级）。
-            collect();
+    const QString source = QStringLiteral(
+        "(window.__seimiMarkdown && window.__seimiMarkdown.chunks ? "
+        "window.__seimiMarkdown.chunks[%1] : null)").arg(idx);
+    const auto task = m_task;
+    const QPointer<QWebEnginePage> page = m_page;
+    const QPointer<RenderWorker> worker = this;
+    m_page->runJavaScript(source, QWebEngineScript::ApplicationWorld,
+                         [this, task, page, worker, idx, total, totalChars](const QVariant& value) {
+        if (!worker || !m_busy || m_task != task || !page || m_page != page || !m_preparingCollect) return;
+        const QString chunk = value.toString();
+        if (!value.isValid() || value.isNull() || chunk.isEmpty() || chunk.size() > 30000
+                || m_markdownPayload.size() + chunk.size() > totalChars) {
+            finishFailure(QStringLiteral("markdown result chunk lost or invalid (page navigated during extraction)"));
             return;
         }
-    }
-
-    // 注入 simplify.js（IIFE）。结果分块存 window.__seimiSimplify，返回值仅状态 JSON。
-    m_page->runJavaScript(s_simplifyJs, [this](const QVariant& v) {
-        if (!m_busy || !m_task || !m_page) { collect(); return; }
-        const QString s = v.toString();
-        const QJsonDocument doc = QJsonDocument::fromJson(s.toUtf8());
-        if (!doc.isObject()) { collect(); return; }
-        QJsonObject o = doc.object();
-        if (!o.value(QStringLiteral("ok")).toBool()) {
-            // 简化失败：m_simplifiedHtml 留空，回退原始 DOM。
-            collect();
-            return;
-        }
-        int totalChunks = o.value(QStringLiteral("totalChunks")).toInt(0);
-        if (totalChunks <= 0) { collect(); return; }
-        readSimplifyChunks(0, totalChunks, QString());
-    });
-}
-
-// 分块读取 simplify 结果（与 readReadabilityChunks 同协议，规避大返回值截断）。
-void RenderWorker::readSimplifyChunks(int idx, int total, const QString& acc) {
-    if (!m_busy || !m_task || !m_page) { collect(); return; }
-    if (idx >= total) {
-        m_simplifiedHtml = acc;
-        collect();
-        return;
-    }
-    QString js = QStringLiteral(
-        "(window.__seimiSimplify && window.__seimiSimplify.chunks ? "
-        "window.__seimiSimplify.chunks[%1] : null)").arg(idx);
-    m_page->runJavaScript(js, [this, idx, total, acc](const QVariant& v) {
-        if (!m_busy || !m_task || !m_page) { collect(); return; }
-        if (v.isNull()) { collect(); return; }  // window 变量丢失，回退
-        readSimplifyChunks(idx + 1, total, acc + v.toString());
+        m_markdownPayload += chunk;
+        readMarkdownChunks(idx + 1, total, totalChars);
     });
 }
 
@@ -650,20 +657,26 @@ void RenderWorker::readExecJsChunks(int idx, int total, const QString& acc) {
 // settle 到期后发起采集。grab 同步、toHtml 异步，用 pendingCollect 协调：先同步截图，
 // 再 toHtml，回调到达后收尾。page/view 在 toHtml 回调返回前不能销毁。
 void RenderWorker::collect() {
+    if (!m_busy || !m_task || !m_page || m_collectStarted) return;
+    // SERP 可以和 Markdown 组合请求；提取失败时同样应提供正常的页面 Markdown。
+    if (m_task->wants(Output::Markdown) && m_markdownMeta.isEmpty()) {
+        extractMarkdown();
+        return;
+    }
     m_collectStarted = true;
+    m_phase = "collect";
     // 最终 URL 在此刻定格（settle 已结束、采集尚未开始）：重定向/SSO/登录墙跳转的
     // 可见性载体，透出到 final_url / auth_wall。
     m_finalUrl = m_page->url().toString();
     m_collectedHtml.clear();
     m_collectedPdf.clear();
     m_collectedImage.clear();
-    // 不清 m_readabilityHtml / m_simplifiedHtml：它们在 collect 前由 extract* 准备好，
-    // 在 assign/destroyPage 时复位。
+    // Markdown 已在 collect 前完成；payload/meta 在 destroyPage 时复位。
     m_stitchCanvas = QImage();
     m_stitchY = 0;
     m_pendingCollect = 0;
 
-    // 1) HTML（始终采集；markdown 转换也依赖它）。
+    // 1) HTML（始终采集，用于 HTML 输出及 Chromium 错误页检测）。
     ++m_pendingCollect;
     m_page->toHtml([this](const QString& html) {
         if (m_busy && m_task && !m_task->done) onHtmlCollected(html);
@@ -736,24 +749,25 @@ void RenderWorker::tryFinishCollect() {
     RenderQueue::RenderResult result;
     result.html = m_collectedHtml;
 
-    // markdown 输入源三档优先级（html 输出始终是完整 DOM，不受算法影响）：
-    //   1) Readability：算法=Readability 且抽取成功 → m_readabilityHtml（正文）
-    //   2) Simplified：算法=Conservative 且简化成功 → m_simplifiedHtml
-    //   3) Raw DOM 兜底：m_collectedHtml
-    if (m_task->wants(Output::Markdown) && !m_collectedHtml.isEmpty()) {
-        bool usedReadability = (m_task->mdAlgorithm == MdAlgorithm::Readability
-                                && !m_readabilityHtml.isEmpty());
-        bool usedSimplified  = (!usedReadability && !m_simplifiedHtml.isEmpty());
-        const QString& mdSource = usedReadability ? m_readabilityHtml
-                               : usedSimplified  ? m_simplifiedHtml
-                                                 : m_collectedHtml;
-        // 实际算法三态如实标注（旧代码把 raw 兜底也标 conservative，对客户端失实）。
-        result.mdAlgorithmUsed = usedReadability ? MdAlgorithm::Readability
-                             : usedSimplified  ? MdAlgorithm::Conservative
-                                               : MdAlgorithm::Raw;
-        bool ok = false;
-        std::string md = html2md::Convert(mdSource.toStdString(), &ok);
-        result.markdown = ok ? QString::fromStdString(md) : QString();
+    if (m_task->wants(Output::Markdown) && !m_markdownMeta.isEmpty()) {
+        result.markdownMeta = m_markdownMeta;
+        result.mdAlgorithmUsed = m_markdownMeta.value(QStringLiteral("extractor")).toString() == QStringLiteral("readability")
+            ? MdAlgorithm::Readability : MdAlgorithm::Conservative;
+        if (m_markdownMeta.value(QStringLiteral("converter")).toString() == QStringLiteral("legacy_cpp")) {
+            bool ok = false;
+            QElapsedTimer timer;
+            timer.start();
+            const std::string md = html2md::Convert(m_markdownPayload.toStdString(), &ok);
+            if (!ok) {
+                finishFailure(QStringLiteral("legacy_cpp markdown conversion failed"));
+                return;
+            }
+            result.markdown = QString::fromStdString(md);
+            result.markdownMeta.insert(QStringLiteral("conversion_ms"),
+                result.markdownMeta.value(QStringLiteral("conversion_ms")).toDouble() + timer.nsecsElapsed() / 1e6);
+        } else {
+            result.markdown = m_markdownPayload;
+        }
     }
 
     // SERP 结构化提取结果透传（仅 extract != None 且提取成功时）。
@@ -868,6 +882,8 @@ QString RenderWorker::netDiagSuffix() const {
 
 // 命中 Google sorry 页：退避重试（全新 page），耗尽则标记 blocked 失败。
 void RenderWorker::handleSorryDetected() {
+    // 取消本次 preparation，退避期间旧 JS/懒加载回调不得继续采集。
+    m_preparingCollect = false;
     ++m_sorryHits;
     m_task->blockAttempts = m_sorryHits;   // 写入任务表，待 Metrics blocked 计数消费（设计文档 C4，Task 4）
 
@@ -922,6 +938,7 @@ void RenderWorker::destroyPage() {
     m_loadTimer.stop();
     m_settleTimer.stop();
     m_collectStarted = false;
+    m_preparingCollect = false;
     m_pendingCollect = 0;
     // 复位截图状态，避免残留影响下个任务。
     m_collectedImage.clear();
@@ -929,8 +946,8 @@ void RenderWorker::destroyPage() {
     m_stitchY = 0;
     m_resolvedImageFmt = ImageFormat::Png;
     m_imageTruncated = false;
-    m_readabilityHtml.clear();
-    m_simplifiedHtml.clear();
+    m_markdownPayload.clear();
+    m_markdownMeta = {};
     m_serpJsonResult.clear();
     m_execJsResult.clear();
     m_execJsError.clear();

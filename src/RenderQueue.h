@@ -44,7 +44,7 @@ public:
                    ExtractAlgorithm extractAlgorithm = ExtractAlgorithm::None,
                    bool recordHar = false,
                    QString execJs = QString(), int execJsTimeoutMsec = 10000,
-                   QString resolvedIp = QString());
+                   QString resolvedIp = QString(), MdConverter mdConverter = MdConverter::Turndown);
 
     // 消费者：GUI 渲染线程【非阻塞】取一个 Pending 任务并置 Running。
     // 队列空时立即返回 nullptr——供事件循环回调轮询，绝不阻塞。
@@ -59,6 +59,7 @@ public:
         ImageFormat imageFmt{ImageFormat::Png};  // 截图实际编码格式（供 /image 路由设 Content-Type）
         bool imageTruncated{false};              // 截图是否因超高度上限被截断
         MdAlgorithm mdAlgorithmUsed{MdAlgorithm::Conservative};  // markdown 实际算法（可观测性）
+        QJsonObject markdownMeta;          // markdown 提取/转换诊断（未请求 markdown 时为空）
         QString serpJson;                   // SERP 结构化提取结果 JSON（extract!=None 且成功时填）
         QString jsJson;                     // exec_js 结果值的 JSON 文本（空=void/未请求）
         QString finalUrl;                   // 渲染结束时页面实际 URL（重定向/SSO/登录墙跳转可见）
@@ -83,6 +84,7 @@ public:
         ImageFormat resolvedImageFmt{ImageFormat::Png};  // 截图实际编码格式
         bool imageTruncated = false;       // 截图是否因超高度上限被截断
         MdAlgorithm mdAlgorithmUsed{MdAlgorithm::Conservative};  // markdown 实际算法
+        QJsonObject markdownMeta;          // markdown 提取/转换诊断
         QString serpJson;                   // SERP 提取结果 JSON（成功时）
         QString jsJson;                     // exec_js 结果值的 JSON 文本（成功时；空=void/未请求）
         QString finalUrl;                   // 渲染结束时页面实际 URL（成功与失败都可能有值）

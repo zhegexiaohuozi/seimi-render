@@ -232,6 +232,9 @@ After syncing, you can view the cookies the render service currently holds on th
 | `url` | The submitted URL |
 | `state` | `pending` / `running` / `succeeded` / `failed` |
 | `html` | The fully rendered HTML (present only on `succeeded`) |
+| `markdown` | Extracted and converted Markdown (returned for `output=markdown` when successful content is nonempty) |
+| `md_algorithm_used` | Actual content extractor, preserving the existing field: `conservative` / `readability` / `raw`; returned with nonempty Markdown |
+| `markdown_meta` | Markdown diagnostics: `extractor`, `converter`, `warnings` (array), and `conversion_ms`, plus `fallback_reason` when a fallback occurs. Included only in successful Markdown results; retained even when Markdown is empty |
 | `error` | Failure reason (present only on `failed`). **Anti-bot-block failures** have an `error` starting with `blocked:`, typically `blocked: google /sorry/ page (2 retries exhausted)` (hit Google's verification page → automatic backoff retry → retries exhausted → blocked) |
 | `blocked` | Boolean, `true` only when `state=failed` and the failure was caused by an anti-bot block (typical scenario: Google `/sorry/` verification page with retries exhausted). Together with the `blocked:` prefix on `error` above, callers can explicitly distinguish "anti-bot block" from "timeout / network error" |
 | `elapsed_ms` | Elapsed time from render start to now (ms) |
@@ -258,9 +261,43 @@ curl -X POST http://localhost:8088/render \
 ```
 
 Request parameters:
+
 - `url` (required): an http/https address
+- `output` (optional, default `html`): `html` / `markdown` / `pdf` / `screenshot`, as a comma-separated combination or array
+- `md_algorithm` (optional, default `conservative`): content selection. `conservative` cleans the full-page DOM; `readability` locates the article body and falls back to `conservative` when extraction fails
+- `md_converter` (optional, default `turndown`): format conversion. `turndown` uses the DOM with Turndown/GFM; `legacy_cpp` selects the previous C++ converter for compatibility comparisons. Independent of `md_algorithm`; affects Markdown only. Invalid values or non-string values return 400
 - `settle_ms` (optional, default 2000): ms to wait for JS execution after `loadFinished` (0–30000); for content-heavy pages like Sohu, 2500+ is recommended
 - `long_poll_ms` (optional, default 0): ms to long-poll for the result (>0 blocks until complete or timeout, max 60000)
+
+### Markdown extraction and conversion
+
+The default pipeline is **content selection → DOM normalization → Turndown + GFM → Markdown**. `md_algorithm` still selects the full page or article body; `md_converter` independently selects the converter. Extraction and default conversion run in Qt WebEngine's isolated JavaScript `ApplicationWorld`, using the rendered DOM. No Node.js runtime is required. Full HTML output retains the original page content.
+
+`legacy_cpp` receives the same selected, normalized DOM so converter outputs can be compared. A failure in the default converter can fall back to `legacy_cpp`: `markdown_meta.converter` identifies the actual converter, while `warnings` and `fallback_reason` describe the fallback. Readability falling back to conservative extraction is reported in the same metadata. Failure of the shared extraction pipeline fails the task instead of returning a misleading empty success.
+
+```bash
+curl -X POST http://localhost:8088/render \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/article","output":"markdown","md_algorithm":"readability","md_converter":"turndown","long_poll_ms":45000}'
+```
+
+Example successful response (selected fields):
+
+```json
+{
+  "state": "succeeded",
+  "markdown": "# Article\n\nText...",
+  "md_algorithm_used": "readability",
+  "markdown_meta": {
+    "extractor": "readability",
+    "converter": "turndown",
+    "warnings": [],
+    "conversion_ms": 12
+  }
+}
+```
+
+After asynchronous submission, `/result/:id?output=markdown` returns the same diagnostics. WebSocket `finished` events also include `markdown_meta`. MCP `render_url` / `get_web_content` include it before the content, and `get_render_result` preserves the HTTP result JSON.
 
 ### Query status
 
@@ -562,8 +599,8 @@ seimi-render ships with an **MCP (Model Context Protocol) server** (default port
 | tool | Purpose | Required params | Optional params |
 |------|------|----------|----------|
 | `browser_search` | Keyword search: builds a search-engine URL and renders it, returning a result list. **Preferred when no URL is given and the user just wants to "search / look up".** | `query` | `engine` (google/bing/baidu/duckduckgo, default google), `settle_ms` (2500), `timeout_ms` (45000) |
-| `get_web_content` | Read a single article body: uses readability to extract clean markdown (stripping nav/ads/sidebar). **Preferred when a specific URL is given to read in full.** | `url` | `md_algorithm` (readability/conservative, default readability), `settle_ms` (2500), `timeout_ms` (45000) |
-| `render_url` | Full-featured renderer: any URL, any output combo. **Use when you need PDF/screenshot/raw HTML / a hand-specified search-engine URL / a custom settle.** | `url` | `output` (markdown/html/pdf/screenshot comma combo, default markdown), `md_algorithm` (conservative/readability, default conservative), `format` (auto/png/jpg, screenshot only), `settle_ms` (2500), `timeout_ms` (45000), `record_network` (false, enables HAR network recording; see [Network recording & HAR export](#network-recording--har-export-record_network)) |
+| `get_web_content` | Read a single article body: uses readability to extract clean markdown (stripping nav/ads/sidebar). **Preferred when a specific URL is given to read in full.** | `url` | `md_algorithm` (readability/conservative, default readability), `md_converter` (turndown/legacy_cpp, default turndown), `settle_ms` (2500), `timeout_ms` (45000) |
+| `render_url` | Full-featured renderer: any URL, any output combo. **Use when you need PDF/screenshot/raw HTML / a hand-specified search-engine URL / a custom settle.** | `url` | `output` (markdown/html/pdf/screenshot comma combo, default markdown), `md_algorithm` (conservative/readability, default conservative), `md_converter` (turndown/legacy_cpp, default turndown), `format` (auto/png/jpg, screenshot only), `settle_ms` (2500), `timeout_ms` (45000), `record_network` (false, enables HAR network recording; see [Network recording & HAR export](#network-recording--har-export-record_network)) |
 | `get_har` | Fetch a task's network-recording HAR by task_id: pairs with `render_url`'s `record_network=true`, returning standard HAR 1.2 JSON | `task_id` | — |
 | `get_render_result` | Fetch the result of an already-submitted task by task_id: poll after `render_url` times out returning `running`, or re-fetch a finished artifact. | `task_id` | `output` (markdown/html/screenshot/pdf, default markdown), `timeout_ms` (5000) |
 
@@ -760,7 +797,7 @@ sequenceDiagram
 
     A->>M: tools/call get_web_content {url:"https://.../article"}
     M->>H: POST /render {url, output:markdown,<br/>md_algorithm:"readability", long_poll_ms:45000}
-    Note over H: render + Readability body locating<br/>(non-article pages auto-fallback conservative/raw)
+    Note over H: render + Readability body locating<br/>(non-article pages auto-fallback conservative)<br/>DOM normalization + Turndown/GFM
     H-->>M: {state:succeeded, markdown:"# Title\n\nBody...",<br/>md_algorithm_used:"readability"}
     M-->>A: content:[text "[get_web_content url=... md=readability]\n\n# Title\n\nBody..."]
 ```
@@ -847,6 +884,9 @@ Connect to `ws://localhost:8089/` (text frames, JSON encoded). The model is **re
 |------|------|------|------|
 | `action` | string | yes | fixed `"render"` |
 | `url` | string | yes | an http/https address |
+| `output` | string or array | no | `html` (default), `markdown`, `pdf`, `screenshot`; combinations use a comma-separated string or array |
+| `md_algorithm` | string | no | Markdown content extraction: `conservative` (default) / `readability`, matching HTTP |
+| `md_converter` | string | no | Markdown converter: `turndown` (default) / `legacy_cpp`, matching HTTP; invalid values return an `error` event |
 | `settle_ms` | int | no | ms to wait for JS execution after loadFinished (0–30000, default 2000) |
 
 On receipt the server submits a task to the render queue, **auto-subscribes this connection to it**, and immediately replies `created`; on completion it pushes `finished`. Real example:
@@ -876,7 +916,7 @@ The server sends four message kinds, distinguished by the `event` field:
 |---------|----------|----------|
 | `created` | `render` request accepted and submitted to the render queue | `task_id`, `url` |
 | `subscribed` | `subscribe` request is valid and the subscription succeeded | `task_id` |
-| `finished` | the subscribed task reaches a terminal state (success or failure), **proactive push** | `task_id`, `state` |
+| `finished` | the subscribed task reaches a terminal state (success or failure), **proactive push** | `task_id`, `state`; successful Markdown results also include `md_algorithm_used` and `markdown_meta` |
 | `error` | the request is invalid (missing field / not JSON / illegal URL / unknown action) | `message` |
 
 Real example (full interaction rendering the Sohu homepage over WS, one connection throughout):
@@ -1103,6 +1143,7 @@ This project uses the following third-party components, each under its own licen
 | [Qt 6](https://www.qt.io/) (Qt WebEngine / Network / WebSockets etc.) | Chromium render core, network stack | **LGPL v3** (open-source option) / commercial dual-licensed |
 | [cpp-mcp](../third_party/cpp-mcp/) | MCP protocol implementation | MIT |
 | [cpp-httplib](../third_party/httplib.h) | HTTP service | MIT |
-| [html2md](../third_party/html2md.cpp) / [table](../third_party/table.cpp) | HTML→Markdown conversion | MIT |
+| [Turndown / turndown-plugin-gfm](../third_party/markdown/) | Default DOM→Markdown conversion and GFM rules | MIT |
+| [html2md](../third_party/html2md.cpp) / [table](../third_party/table.cpp) | `legacy_cpp` compatibility conversion and failure fallback | MIT |
 | [qaes](../third_party/qaes/) | AES encryption | Public Domain |
 | [Mozilla Readability](../third_party/readability/) | Body extraction | Apache License 2.0 |

@@ -16,6 +16,7 @@
 #include <mcp_tool.h>
 
 #include <chrono>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <ctime>
@@ -82,6 +83,31 @@ static std::string base64Encode(const std::string& in) {
     if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
     while (out.size() % 4) out.push_back('=');
     return out;
+}
+
+static std::string parseMdConverter(const mcp::json& params) {
+    const auto it = params.find("md_converter");
+    if (it == params.end()) return "turndown";
+    if (!it->is_string()) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params,
+                                 "'md_converter' must be turndown or legacy_cpp");
+    }
+    std::string value = it->get<std::string>();
+    const auto first = value.find_first_not_of(" \t\r\n");
+    const auto last = value.find_last_not_of(" \t\r\n");
+    value = first == std::string::npos ? std::string() : value.substr(first, last - first + 1);
+    for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (value != "turndown" && value != "legacy_cpp") {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params,
+                                 "'md_converter' must be turndown or legacy_cpp");
+    }
+    return value;
+}
+
+static std::string markdownMetadataText(const mcp::json& response) {
+    const auto it = response.find("markdown_meta");
+    if (it == response.end() || !it->is_object() || it->empty()) return {};
+    return "[markdown_meta: " + it->dump() + "]\n\n";
 }
 
 // 内部实现：持有 cpp-mcp server 实例与渲染 API 的连接信息。
@@ -209,9 +235,14 @@ bool McpServer::start(const std::string& host, int port,
             "Combinations allowed, e.g. 'markdown,screenshot'. Default markdown.",
             false)
         .with_string_param("md_algorithm",
-            "Markdown extraction algorithm: 'conservative' (default, zero "
-            "false-positive, keeps full DOM) or 'readability' (article-focused, "
+            "Markdown extraction algorithm: 'conservative' (default, cleans the "
+            "full-page DOM) or 'readability' (article-focused, "
             "strips non-content). Only affects markdown output.",
+            false)
+        .with_string_param("md_converter",
+            "Markdown converter: 'turndown' (default, DOM-based Turndown + GFM) "
+            "or 'legacy_cpp' (compatibility comparison). Independent of md_algorithm. "
+            "The response includes markdown_meta with the actual converter and any fallback.",
             false)
         .with_string_param("format",
             "Screenshot encoding: 'auto' (default, smart pick by image ratio), "
@@ -240,6 +271,8 @@ bool McpServer::start(const std::string& host, int port,
             "Timeout for exec_js in milliseconds (default 10000, clamped to 1000-30000).",
             false)
         .build();
+    renderTool.parameters_schema["properties"]["md_converter"]["enum"] = {"turndown", "legacy_cpp"};
+    renderTool.parameters_schema["properties"]["md_converter"]["default"] = "turndown";
 
     m_impl->srv->register_tool(renderTool,
         [impl](const mcp::json& params, const std::string&) -> mcp::json {
@@ -265,6 +298,7 @@ bool McpServer::start(const std::string& host, int port,
             int settle = params.value("settle_ms", 2500);
             int timeout = params.value("timeout_ms", 45000);
             std::string mdAlg = params.value("md_algorithm", "conservative");
+            std::string mdConv = parseMdConverter(params);
             std::string fmt = params.value("format", "auto");
 
             // 组装 /render 的 output 规格（逗号分隔，与 HTTP 接口一致）
@@ -281,6 +315,7 @@ bool McpServer::start(const std::string& host, int port,
                 {"settle_ms", settle},
                 {"long_poll_ms", timeout},
                 {"md_algorithm", mdAlg},
+                {"md_converter", mdConv},
                 {"format", fmt},
             };
             bool recordNetwork = params.value("record_network", false);
@@ -364,6 +399,7 @@ bool McpServer::start(const std::string& host, int port,
                     if (j.contains("md_algorithm_used")) {
                         textPart += "[md_algorithm: " + j.value("md_algorithm_used", std::string()) + "]\n\n";
                     }
+                    textPart += markdownMetadataText(j);
                     textPart += md.empty() ? "(markdown empty)" : md;
                 } else if (wantHtml) {
                     std::string html = j.value("html", std::string());
@@ -474,8 +510,7 @@ bool McpServer::start(const std::string& host, int port,
 
             // 文本输出直接返回
             if (!wantShot && !wantPdf) {
-                // 文本分支响应体即为最终内容（非 JSON）。无法可靠解析 state，
-                // 只记录返回字节数即可。
+                // 原样保留 HTTP 结果 JSON，含 markdown_meta 的转换/回退诊断。
                 mcpLog("get_render_result task_id=%s -> returned %zu bytes (text)",
                        task_id.c_str(), resp.size());
                 return toTextContent(resp);
@@ -727,6 +762,7 @@ bool McpServer::start(const std::string& host, int port,
                        engine.c_str(), query.c_str(), task_id.c_str(), md.size());
                 std::string text = "[browser_search engine=" + engine +
                                    " query=\"" + query + "\"]\n\n";
+                text += markdownMetadataText(j);
                 text += md.empty() ? "(no results / empty page)" : md;
                 return toTextContent(text);
             } catch (...) {
@@ -752,8 +788,12 @@ bool McpServer::start(const std::string& host, int port,
         .with_string_param("url", "The http(s) URL of the article/page to read")
         .with_string_param("md_algorithm",
             "Markdown extraction: 'readability' (default, article body only — "
-            "best for news/blogs/papers) or 'conservative' (full DOM, zero "
-            "false-positive — use when readability drops content you need).",
+            "best for news/blogs/papers) or 'conservative' (cleans the full-page "
+            "DOM — use when readability drops content you need).",
+            false)
+        .with_string_param("md_converter",
+            "Markdown converter: 'turndown' (default, DOM-based Turndown + GFM) "
+            "or 'legacy_cpp' (compatibility comparison). Independent of md_algorithm.",
             false)
         .with_number_param("settle_ms",
             "Milliseconds to wait after load for JS/ajax (default 2500)",
@@ -762,6 +802,8 @@ bool McpServer::start(const std::string& host, int port,
             "Max milliseconds to wait (default 45000; raise to 60000 for slow "
             "sites)", false)
         .build();
+    readerTool.parameters_schema["properties"]["md_converter"]["enum"] = {"turndown", "legacy_cpp"};
+    readerTool.parameters_schema["properties"]["md_converter"]["default"] = "turndown";
 
     m_impl->srv->register_tool(readerTool,
         [impl](const mcp::json& params, const std::string&) -> mcp::json {
@@ -771,6 +813,7 @@ bool McpServer::start(const std::string& host, int port,
                                          "'url' is required");
             }
             std::string mdAlg = params.value("md_algorithm", "readability");
+            std::string mdConv = parseMdConverter(params);
             int settle = params.value("settle_ms", 2500);
             int timeout = params.value("timeout_ms", 45000);
             mcp::json body = {
@@ -779,6 +822,7 @@ bool McpServer::start(const std::string& host, int port,
                 {"settle_ms", settle},
                 {"long_poll_ms", timeout},
                 {"md_algorithm", mdAlg},
+                {"md_converter", mdConv},
             };
             mcpLog("get_web_content url=%s md_algorithm=%s settle_ms=%d timeout_ms=%d",
                    url.c_str(), mdAlg.c_str(), settle, timeout);
@@ -814,6 +858,7 @@ bool McpServer::start(const std::string& host, int port,
                     text += " md=" + j.value("md_algorithm_used", std::string());
                 }
                 text += "]\n\n";
+                text += markdownMetadataText(j);
                 text += md.empty() ? "(empty content — the page may be non-article; "
                                    "retry render_url with md_algorithm='conservative')"
                                    : md;

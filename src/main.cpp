@@ -10,9 +10,10 @@
 //                ├─ WsServer    (WebSocket 推送，信号槽)
 //                └─ HttpServer 跑在独立 std::thread，通过线程安全 RenderQueue 交互
 // 启动先起 QApplication 让 Chromium 子进程就绪，再起渲染池/HTTP/WS；退出反向关闭。
-
 #include "HttpServer.h"
 #include "McpServer.h"
+#include "AppConfig.h"
+#include <QDir>
 #include "CookieStore.h"
 #include "Environment.h"
 #include "HarRecorder.h"
@@ -20,21 +21,30 @@
 #include "ProxyConfig.h"
 #include "RenderPool.h"
 #include "RenderQueue.h"
+#include "UpdateManager.h"
 #include "WsServer.h"
+#include "gui/GuiApp.h"
+#include "gui/LogModel.h"
 
 #include <QApplication>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QHostAddress>
 #include <QMessageLogContext>
+#include <QStringList>
 #include <QTimer>
+#include <QVariantMap>
 #include <QWebEngineUrlScheme>
 
+#include <algorithm>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -54,11 +64,31 @@
 
 namespace seimi {
 
+// config.json 文件态（GUI 设置页的编辑对象；默认构造 = 全默认/未指定）。
+// 启动期在 main 里由 AppConfig::load 填充后存入，GuiApp 构造时取走副本。
+static AppConfig g_appConfig;
+// 实际生效的数据目录（经 config.json data_dir 一跳重定向后的值；GUI 表单展示用）。
+static QString g_effectiveDataDir;
+
+// 优雅退出信号桥：SIGINT/SIGTERM / Windows 控制台事件 → QueuedConnection 进事件循环
+// → aboutToQuit 关机链（queue.stop → pool.stop → http/mcp 停 → cookie/metrics 落盘）。
+// 此前 Ctrl+C 是硬杀，cookies.dat/metrics.json 的退出前 flush 全部丢失。
+static QCoreApplication* g_appForQuit = nullptr;
+static void requestGracefulQuit() {
+    if (!g_appForQuit) return;
+    QMetaObject::invokeMethod(g_appForQuit, &QCoreApplication::quit, Qt::QueuedConnection);
+}
+#ifdef _WIN32
+static BOOL WINAPI consoleCtrlHandler(DWORD) { requestGracefulQuit(); return TRUE; }
+#else
+static void posixSignalHandler(int) { requestGracefulQuit(); }
+#endif
+
 // Qt 消息处理器：降噪。被渲染的重 SPA（gemini/doubao 等）会刷大量噪声——
 // Chromium 转发的网页 console（"js:" 前缀，CSP/废弃 API 警告等）、Chromium 安全告警
-//（"Mixed Content:" 等）、网页 JS 未捕获错误（裸 "Error:" 行）全是网页/Chromium 背景噪声，
+//（"Mixed Content:" 等）、网页 JS 未捕获错误（裁 "Error:" 行）全是网页/Chromium 背景噪声，
 // 与渲染正确性无关。默认静音；--verbose-chromium 时全量透传。
-// 用 Qt 消息处理器（而非 --log-level）是因为这些转发都走 Qt 日志系统，--log-level 管不到。
+// 用 Qt 消息处理器（而非 --log-level）是因为这些转发都走 Qt 日志系统，-log-level 管不到。
 static bool g_verboseChromium = false;
 static void noiseFilter(QtMsgType type, const QMessageLogContext& ctx, const QString& msg) {
     const QByteArray raw = msg.toUtf8();
@@ -88,6 +118,7 @@ static void noiseFilter(QtMsgType type, const QMessageLogContext& ctx, const QSt
         }
     }
     // 其余消息（含 seimi-render 自己的 stdout/stderr 输出、真正的 ERROR/FATAL）照常打印。
+    LogModel::bridgeAppend(type, QString::fromLatin1(ctx.category), msg); // GUI 日志页（无实例时零成本）
     fprintf(stderr, "%s\n", raw.constData());
 }
 
@@ -104,7 +135,7 @@ struct Config {
     bool windowed = false;        // 强制原生窗口平台（调试用）；默认 offscreen
     bool noSandbox = false;       // Chromium --no-sandbox（WSL2/容器/root 必需）
     bool sandboxExplicit = false; // --sandbox 显式给定（用于覆盖 root 自动判定）
-    bool verboseChromium = false; // --verbose-chromium：调低 Chromium 日志级别看详细日志
+    bool verboseChromium = false; // --verbose-chromium：调试 Chromium 日志级别看详细日志
     std::string adminPassword;    // --password / --password-file / SEIMI_PASSWORD（空=不启用密码保护）
     std::string passwordFile;     // --password-file <path>：从文件读首行作密码（避免进 ps 命令行）
     bool adminEnabled = true;     // --no-admin：关闭内置管理界面
@@ -121,6 +152,10 @@ struct Config {
     std::string warmupUrl = "https://www.google.com/";  // --warmup-url 自定义预热目标
     int remoteDebugPort = 0;      // Chromium --remote-debugging-port（HAR 网络录制必需；0=不开）
     std::string dataDir;          // --data-dir：持久化目录（cookies.dat / seimi.key / metrics.json）。空=默认(bin 同级 data/)
+    bool uiEnabled = false;       // --gui：启用原生桌面控制台（QML + 托盘）。Windows 桌面双击
+                                   //（零参数、无终端）默认进 GUI（--headless 显式退出）；无头服务不变。
+    bool uiDemo = false;          // --ui-demo[=<page>]：GUI 追加「控件陈列室」页并直达指定页（验收用）。
+    std::string uiDemoPage = "gallery"; // dashboard/settings/update/logs/cookies/gallery
 };
 
 static void printUsage() {
@@ -135,6 +170,15 @@ static void printUsage() {
         "  --settle-ms <n>       default JS settle delay after load (default 2000)\n"
         "  --load-timeout-ms <n> per-task load timeout (default 20000)\n"
         "  --windowed            force native windowed QPA platform (default: offscreen for headless service)\n"
+        "  --gui                 launch native desktop console (QML UI + system tray).\n"
+        "                        On Windows, double-clicking the exe (zero args, no\n"
+        "                        parent terminal) also defaults to GUI. Settings changed\n"
+        "                        in the GUI persist to data/config.json (priority: CLI\n"
+        "                        flags > config.json > defaults).\n"
+        "  --headless            force headless service mode (also --no-gui). Use to\n"
+        "                        opt out of the double-click-GUI default from a desktop\n"
+        "                        shortcut. Terminal/server/container launches are always\n"
+        "                        headless regardless.\n"
         "  --no-sandbox          disable Chromium sandbox (WSL2/container/root often need this)\n"
         "  --sandbox             force Chromium sandbox on (overrides auto-detect when running as root)\n"
         "  --verbose-chromium    show Chromium/web console logs (default: known web noise filtered out)\n"
@@ -217,7 +261,7 @@ static bool editDistanceAtMostOne(const QString& a, const QString& b) {
 // scheme 缺省视为 http。未知 scheme 不再静默按 HTTP（真实排障撞过：socket5:// 拼写错误
 // 静默按 HTTP 代理，恰好混合端口能用，纯 SOCKS 端口则全部流量静默失败）：
 //   1) 常见拼写纠错表（socket5/socks5h/sock5 → socks5，编辑距离 2 兜不住的真实 typo）；
-//   2) 编辑距离 ≤1 命中已知 scheme 也纠正（htp/socks6 类）；
+//   2) 编辑距离 ≤2 命中已知 scheme 也纠正（htp/socks6 类）；
 //   3) https 特例：WARN 后按 HTTP（Qt 无 https 代理支持，纠正成 http 反而言过其实）；
 //   4) 其余 WARN 后按 HTTP 维持容错（混合端口下可能歪打正着，不拦死服务）。
 // 解析失败（无 host/port）WARN 后返回 Direct。
@@ -315,7 +359,7 @@ static ProxySpec parseProxyUrl(const std::string& s) {
     return spec;
 }
 
-static Config parseArgs(int argc, char** argv) {
+static Config parseArgs(int argc, char** argv, AppConfig::CliOverrides& ov) {
     Config c;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -323,30 +367,39 @@ static Config parseArgs(int argc, char** argv) {
             if (i + 1 < argc) { out = std::atoi(argv[++i]); }
         };
         if (a == "--help" || a == "-h") { printUsage(); std::exit(0); }
-        else if (a == "--http-port" && i + 1 < argc) c.httpPort = std::atoi(argv[++i]);
-        else if (a == "--ws-port" && i + 1 < argc)   c.wsPort = std::atoi(argv[++i]);
-        else if (a == "--mcp-port" && i + 1 < argc)  c.mcpPort = std::atoi(argv[++i]);
-        else if (a == "--host" && i + 1 < argc) { c.host = argv[++i]; c.hostExplicit = true; }
-        else if (a == "--concurrency") next(c.concurrency);
-        else if (a == "--http-threads") next(c.httpThreads);
-        else if (a == "--settle-ms") next(c.settleDefaultMs);
-        else if (a == "--load-timeout-ms" && i + 1 < argc) c.loadTimeoutMs = std::atoll(argv[++i]);
+        else if (a == "--http-port" && i + 1 < argc) { c.httpPort = std::atoi(argv[++i]); ov.httpPort = true; }
+        else if (a == "--ws-port" && i + 1 < argc)   { c.wsPort = std::atoi(argv[++i]); ov.wsPort = true; }
+        else if (a == "--mcp-port" && i + 1 < argc)  { c.mcpPort = std::atoi(argv[++i]); ov.mcpPort = true; }
+        else if (a == "--host" && i + 1 < argc) { c.host = argv[++i]; c.hostExplicit = true; ov.host = true; }
+        else if (a == "--concurrency") { next(c.concurrency); ov.concurrency = true; }
+        else if (a == "--http-threads") { next(c.httpThreads); ov.httpThreads = true; }
+        else if (a == "--settle-ms") { next(c.settleDefaultMs); ov.settleMs = true; }
+        else if (a == "--load-timeout-ms" && i + 1 < argc) { c.loadTimeoutMs = std::atoll(argv[++i]); ov.loadTimeoutMs = true; }
         else if (a == "--windowed") c.windowed = true;
+        else if (a == "--gui") c.uiEnabled = true;
+        else if (a == "--headless" || a == "--no-gui") c.uiEnabled = false;   // 双击默认 GUI 的显式退出开关
+        else if (a.rfind("--ui-demo", 0) == 0) {
+            c.uiEnabled = true; c.uiDemo = true;
+            if (a.size() > 10) c.uiDemoPage = a.substr(10);   // --ui-demo=settings
+        }
         else if (a == "--no-sandbox") { c.noSandbox = true; c.sandboxExplicit = true; }
         else if (a == "--sandbox")    { c.noSandbox = false; c.sandboxExplicit = true; }
         else if (a == "--verbose-chromium") c.verboseChromium = true;
-        else if (a == "--password" && i + 1 < argc) c.adminPassword = argv[++i];
-        else if (a == "--password-file" && i + 1 < argc) c.passwordFile = argv[++i];
-        else if (a == "--no-admin")   c.adminEnabled = false;
-        else if (a == "--no-ssrf")    c.ssrfGuardEnabled = false;
-        else if (a == "--trusted-proxy" && i + 1 < argc) c.trustedProxies = argv[++i];
-        else if (a == "--proxy" && i + 1 < argc) c.initialProxy = parseProxyUrl(argv[++i]);
-        else if (a == "--proxy-bypass" && i + 1 < argc) c.proxyBypass = argv[++i];
-        else if (a == "--no-stealth") c.stealthEnabled = false;
-        else if (a == "--no-warmup") c.warmupEnabled = false;
-        else if (a == "--warmup-url" && i + 1 < argc) c.warmupUrl = argv[++i];
-        else if (a == "--remote-debugging-port" && i + 1 < argc) c.remoteDebugPort = std::atoi(argv[++i]);
-        else if (a == "--data-dir" && i + 1 < argc) c.dataDir = argv[++i];
+        else if (a == "--password" && i + 1 < argc) { c.adminPassword = argv[++i]; ov.password = true; }
+        else if (a == "--password-file" && i + 1 < argc) { c.passwordFile = argv[++i]; ov.password = true; }
+        else if (a == "--no-admin")   { c.adminEnabled = false; ov.adminEnabled = true; }
+        else if (a == "--no-ssrf")    { c.ssrfGuardEnabled = false; ov.ssrfGuard = true; }
+        else if (a == "--trusted-proxy" && i + 1 < argc) { c.trustedProxies = argv[++i]; ov.trustedProxies = true; }
+        else if (a == "--proxy" && i + 1 < argc) { c.initialProxy = parseProxyUrl(argv[++i]); ov.proxy = true; }
+        else if (a == "--proxy-bypass" && i + 1 < argc) { c.proxyBypass = argv[++i]; ov.proxyBypass = true; }
+        else if (a == "--no-stealth") { c.stealthEnabled = false; ov.stealth = true; }
+        else if (a == "--no-warmup")  { c.warmupEnabled = false; ov.warmup = true; }
+        else if (a == "--warmup-url" && i + 1 < argc) { c.warmupUrl = argv[++i]; ov.warmupUrl = true; }
+        else if (a == "--remote-debugging-port" && i + 1 < argc) { c.remoteDebugPort = std::atoi(argv[++i]); ov.remoteDebugPort = true; }
+        else if (a == "--data-dir" && i + 1 < argc) { c.dataDir = argv[++i]; ov.dataDir = true; }
+        else if (a == "--apply-update" || a == "--updated-from") {
+            // 由 main() 最前置分支处理；parseArgs 静默吞掉其余参数。
+        }
     }
     c.concurrency   = std::max(1, c.concurrency);
     c.httpThreads   = std::max(2, c.httpThreads);
@@ -367,10 +420,65 @@ static Config parseArgs(int argc, char** argv) {
 
 } // namespace seimi
 
+// 「双击默认 GUI」判定结果：Windows 桌面双击/Run 对话框启动（零参数、无终端父进程、
+// 无 std 重定向）时为 true，由 main() 在 parseArgs 后叠加到 cfg.uiEnabled。
+// 终端 ./seimi-render.exe、重定向/服务包装器启动、非 Windows 平台恒为 false。
+static bool g_desktopAutoGui = false;
+
+#ifdef _WIN32
+// GUI 子系统的控制台归属（双模式：桌面 GUI 与无头服务共用一个 exe）：
+//   1) std 句柄已有效（终端里跑且带重定向 `> log`）→ Redirected：不碰控制台，输出走文件/管道；
+//   2) 无有效句柄 + 父进程有控制台（终端里直接跑）→ ParentConsole：AttachConsole 挂回父终端，
+//      banner/日志照常显示；
+//   3) 无有效句柄 + 无父终端（双击/Run 对话框）→ Detached：guiIfDetached 时不建控制台
+//      （桌面 GUI 是唯一可见存在）；无头模式 AllocConsole 自建（与旧控制台子系统一致）。
+// 返回启动来源，调用方据此落实「双击默认 GUI」；之后统一切 UTF-8 代码页。
+enum class WinLaunchCtx { Redirected, ParentConsole, Detached };
+static WinLaunchCtx setupWindowsConsole(bool guiIfDetached) {
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    const bool haveRedirect = out != NULL && out != INVALID_HANDLE_VALUE;
+    if (haveRedirect) return WinLaunchCtx::Redirected;
+
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+        return WinLaunchCtx::ParentConsole;
+    }
+    if (!guiIfDetached) {
+        AllocConsole();
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+    }
+    return WinLaunchCtx::Detached;
+}
+#endif
+
 int main(int argc, char** argv) {
     using namespace seimi;
 
 #ifdef _WIN32
+    // --apply-update 子进程保持零输出零控制台（在控制台策略之前判断）。
+    bool applyUpdateMode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--apply-update") == 0) applyUpdateMode = true;
+    }
+    if (!applyUpdateMode) {
+        bool guiFlag = false, headlessFlag = false;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--gui") == 0) guiFlag = true;
+            else if (std::strcmp(argv[i], "--headless") == 0
+                     || std::strcmp(argv[i], "--no-gui") == 0) headlessFlag = true;
+        }
+        // 「双击默认 GUI」：零参数 + 无终端父进程 + 无 std 重定向 = 桌面双击/Run 对话框。
+        // 预判传给 setup 决定是否建控制台，再用返回的启动来源确认——终端里 ./seimi-render.exe
+        //（ParentConsole）与重定向启动（Redirected）都会收回，服务/容器部署行为不变。
+        const bool autoGuiCandidate = !guiFlag && !headlessFlag && argc == 1;
+        const WinLaunchCtx launchCtx = setupWindowsConsole(autoGuiCandidate);
+        g_desktopAutoGui = autoGuiCandidate && launchCtx == WinLaunchCtx::Detached;
+    }
+
     // Windows 控制台默认代码页 936(GBK)，把 qWarning/mcpLog/fprintf 输出的 UTF-8 字节
     // 当 GBK 解释 → 含中文的日志（如未 URL-encode 的 url）乱码。
     // 切到 UTF-8 代码页。只影响当前进程的控制台，进程退出后不改变系统默认。
@@ -379,10 +487,22 @@ int main(int argc, char** argv) {
     SetConsoleCP(CP_UTF8);
 #endif
 
-    Config cfg = parseArgs(argc, argv);
+    // --apply-update 子命令：更新交接的子进程模式（纯文件操作 + 启动新版本），
+    // 必须在 QApplication/Chromium 之前的最早分支处理。父进程退出后由它做目录交换。
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--apply-update") == 0) {
+            QStringList applyArgs;
+            for (int j = 1; j < argc; ++j) applyArgs << QString::fromLocal8Bit(argv[j]);
+            return runApplyUpdate(applyArgs);
+        }
+    }
+
+    AppConfig::CliOverrides cliOv;
+    Config cfg = parseArgs(argc, argv, cliOv);
+    // Windows 桌面双击（零参数、Detached）默认进 GUI；--headless/--no-gui 已在预扫描排除。
+    if (g_desktopAutoGui && !cfg.uiEnabled) cfg.uiEnabled = true;
     g_verboseChromium = cfg.verboseChromium;
     qInstallMessageHandler(noiseFilter);  // 安装降噪过滤器（在 QApplication 之前）
-
     // warmup URL 校验：仅 http/https（运维配置项，不过 SSRF——同 --proxy 语义）。
     if (cfg.warmupEnabled
         && cfg.warmupUrl.rfind("http://", 0) != 0
@@ -391,9 +511,80 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ---------- 配置持久化（data/config.json，优先级 默认 < 文件 < CLI）----------
+    // 注意时机：合并必须发生在 Chromium flag 注入之前——proxy-bypass/stealth/CDP 端口
+    // 都参与启动期 flag 快照。dataDir 此时 QApplication 未建，按 argv[0] 推 bin 目录
+    //（QApplication 建立后 applicationDirPath 与之一致）。
+    {
+        QString preDataDir = !cfg.dataDir.empty()
+            ? QString::fromStdString(cfg.dataDir)
+            : QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath() + QStringLiteral("/data");
+        // 上次更新残留清理（<binDir>.old / updater 副本）；失败仅告警。
+        cleanupUpdateResidue(QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath(), preDataDir);
+        AppConfig appCfg = AppConfig::load(preDataDir);
+        // —— 文件值叠加（仅 CLI 未显式覆盖的字段）——
+        if (appCfg.host && !cliOv.host) cfg.host = appCfg.host->toStdString();
+        if (appCfg.httpPort && !cliOv.httpPort) cfg.httpPort = *appCfg.httpPort;
+        if (appCfg.wsPort && !cliOv.wsPort) cfg.wsPort = *appCfg.wsPort;
+        if (appCfg.mcpPort && !cliOv.mcpPort) cfg.mcpPort = *appCfg.mcpPort;
+        if (appCfg.concurrency && !cliOv.concurrency) cfg.concurrency = *appCfg.concurrency;
+        if (appCfg.httpThreads && !cliOv.httpThreads) cfg.httpThreads = *appCfg.httpThreads;
+        if (appCfg.settleMs && !cliOv.settleMs) cfg.settleDefaultMs = *appCfg.settleMs;
+        if (appCfg.loadTimeoutMs && !cliOv.loadTimeoutMs) cfg.loadTimeoutMs = *appCfg.loadTimeoutMs;
+        if (appCfg.adminEnabled && !cliOv.adminEnabled) cfg.adminEnabled = *appCfg.adminEnabled;
+        if (appCfg.ssrfGuard && !cliOv.ssrfGuard) cfg.ssrfGuardEnabled = *appCfg.ssrfGuard;
+        if (appCfg.stealth && !cliOv.stealth) cfg.stealthEnabled = *appCfg.stealth;
+        if (appCfg.warmup && !cliOv.warmup) cfg.warmupEnabled = *appCfg.warmup;
+        if (appCfg.warmupUrl && !cliOv.warmupUrl) cfg.warmupUrl = appCfg.warmupUrl->toStdString();
+        if (appCfg.remoteDebugPort && !cliOv.remoteDebugPort) cfg.remoteDebugPort = *appCfg.remoteDebugPort;
+        if (appCfg.trustedProxies && !cliOv.trustedProxies) cfg.trustedProxies = appCfg.trustedProxies->toStdString();
+        if (appCfg.proxyBypass && !cliOv.proxyBypass) cfg.proxyBypass = appCfg.proxyBypass->toStdString();
+        if (appCfg.proxy && !cliOv.proxy
+            && cfg.initialProxy.type == ProxySpec::Type::Direct) {
+            cfg.initialProxy = *appCfg.proxy;
+        }
+        // 密码：--password/--password-file/SEIMI_PASSWORD 之后，config.json 兜底。
+        if (cfg.adminPassword.empty() && appCfg.password) {
+            cfg.adminPassword = appCfg.password->toStdString();
+        }
+        // —— 数据目录重定向（一跳）：config.json 指定的 data_dir 只重定向「数据落盘」
+        //    （cookies/metrics/anomalies/updates），config.json 本身留在引导目录——
+        //    保证重定向永远一跳可解、无环。CLI --data-dir 显式给定时整体让位。
+        QString effectiveDataDir = preDataDir;
+        if (!cliOv.dataDir && appCfg.dataDirOverride && !appCfg.dataDirOverride->trimmed().isEmpty()) {
+            const QString redirected = appCfg.dataDirOverride->trimmed();
+            if (QDir(redirected).absolutePath() != QDir(preDataDir).absolutePath()) {
+                effectiveDataDir = redirected;
+                cfg.dataDir = effectiveDataDir.toStdString();
+                std::fprintf(stdout, "[config] data dir redirected by config.json: %s -> %s\n",
+                             qPrintable(QDir(preDataDir).absolutePath()),
+                             qPrintable(QDir(effectiveDataDir).absolutePath()));
+            }
+        }
+        // 二次钳制（文件值与 CLI 同一护栏）。
+        cfg.concurrency = std::max(1, cfg.concurrency);
+        cfg.httpThreads = std::max(2, cfg.httpThreads);
+        cfg.settleDefaultMs = std::max(0, cfg.settleDefaultMs);
+        cfg.loadTimeoutMs = std::max(1000LL, cfg.loadTimeoutMs);
+        cfg.httpPort = std::clamp(cfg.httpPort, 1, 65535);
+        cfg.wsPort = std::clamp(cfg.wsPort, 1, 65535);
+        cfg.mcpPort = std::clamp(cfg.mcpPort, 1, 65535);
+        cfg.remoteDebugPort = std::clamp(cfg.remoteDebugPort, 0, 65535);
+        // GUI 模式需要展示文件态配置（SettingsPage 编辑对象），存到 main 作用域。
+        // （appCfg 的 m_dataDir/m_filePath 保持引导目录：后续 save() 永远写回引导
+        //   config.json，data_dir 指针不丢失；数据文件走 effectiveDataDir。）
+        g_appConfig = appCfg;
+        g_effectiveDataDir = effectiveDataDir;
+        // 更新残留清理跟随实际生效目录（updater 副本/ .old 住在 effective/updates）。
+        if (effectiveDataDir != preDataDir) {
+            cleanupUpdateResidue(QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath(),
+                                 effectiveDataDir);
+        }
+    }
+
     // 平台选择：无头渲染服务默认 offscreen（无窗口、不依赖窗口系统、事件循环稳定）。
-    // --windowed 强制原生平台（调试看真实窗口）。
-    if (!cfg.windowed) {
+    // --gui 启用原生桌面控制台（QML 窗口 + 托盘，需要真实平台）；--windowed 调试用。
+    if (!cfg.windowed && !cfg.uiEnabled) {
         qputenv("QT_QPA_PLATFORM", "offscreen");
     }
 
@@ -440,7 +631,6 @@ int main(int argc, char** argv) {
 
     // 网络代理：经 QNetworkProxy 运行时动态配置（见 ProxyConfig）。
     // Qt WebEngine 轮询全局应用代理，运行时修改后 Chromium 在数秒内切换。具体 apply 由 RenderPool GUI 线程定时器驱动。
-
     // --proxy-bypass 分流的渲染侧实现：实测（2026-09-15）QtWebEngine 渲染网络栈**不**按请求
     // 查询 QNetworkProxyFactory（只轮询全局单值 applicationProxy），QNetworkProxyFactory 只对
     // QNAM（POST /fetch）生效。要让 Chromium 渲染按 host 分流，唯一路径是 Chromium 原生
@@ -474,9 +664,10 @@ int main(int argc, char** argv) {
     // backing store，而 view->grab() 读的正是 backing store → 截图空白。
     // 注入 --disable-gpu 强制软件合成，帧光栅化进 backing store，grab() 才能取到真实像素。
     // 平台差异：Linux/WSL/容器无 GPU 或驱动不全，必须软件渲染；macOS Metal 合成同样不落
-    // backing store，需软件渲染；Windows DirectX offscreen 合成会回读 backing store，截图正常，不注入。
+    // backing store，需软件渲染；Windows DirectX offscreen 合成会回写 backing store，截图正常，不注入。
+    // GUI 模式（--gui）不注入：QML 场景图需要 GPU。
     // 用户可通过 QTWEBENGINE_CHROMIUM_FLAGS 覆盖（已含相关 flag 则不重复注入）。
-    if (!cfg.windowed) {
+    if (!cfg.windowed && !cfg.uiEnabled) {
         QByteArray existing = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
 #if defined(__linux__) || defined(__APPLE__)
         if (existing.indexOf("--disable-gpu") < 0
@@ -514,7 +705,6 @@ int main(int argc, char** argv) {
 
         // UA 统一：--user-agent flag / setHttpUserAgent / JS Worker 包装三条路径均无法覆盖
         // Worker context UA（QtWebEngine 已知残留），文档层 UA 已统一 142，详见 stealth.js 注释。
-
         // 禁用产生额外网络请求/发现协议的 features，减少指纹面：
         // Translate（翻译弹窗+语言检测请求）、OptimizationHints（向 Google 取优化提示）、
         // MediaRouter/DialMediaRouteProvider（局域网媒体设备发现，暴露网络环境）。
@@ -532,6 +722,16 @@ int main(int argc, char** argv) {
     // WebEngine 需要在 GUI 线程运行；必须用 QApplication（而非 QCoreApplication）。
     QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
     QApplication app(argc, argv);
+
+    // 优雅退出：接管 SIGINT/SIGTERM / Windows 控制台事件（Ctrl+C、关控制台窗口、
+    // 服务停止），转入事件循环走 aboutToQuit 关机链。
+    g_appForQuit = &app;
+#ifdef _WIN32
+    SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+#else
+    std::signal(SIGINT, posixSignalHandler);
+    std::signal(SIGTERM, posixSignalHandler);
+#endif
 
     // 持久化目录：--data-dir 显式给定；缺省 = 二进制同级 data/。
     // 存放 cookies.dat（加密 cookie）/ seimi.key（机器绑定盐）/ metrics.json（累计指标）。
@@ -777,6 +977,80 @@ int main(int argc, char** argv) {
             "      Without it, all clients share the proxy's address for login throttling.\n");
     }
     std::fflush(stdout);
+
+    // ---------- 原生 GUI（--gui）：QML 控制台 + 托盘 ----------
+    // 装配点在全部服务组件就绪之后、pool.start() 之前；GUI 独占持有 config.json 文件态，
+    // 页面数据经线程安全快照 API 读取，不触碰 WebEngine。
+    std::unique_ptr<GuiApp> gui;
+    if (cfg.uiEnabled) {
+        QVariantMap effective;
+        effective.insert(QStringLiteral("host"), QString::fromStdString(cfg.host));
+        effective.insert(QStringLiteral("httpPort"), cfg.httpPort);
+        effective.insert(QStringLiteral("wsPort"), cfg.wsPort);
+        effective.insert(QStringLiteral("mcpPort"), cfg.mcpPort);
+        effective.insert(QStringLiteral("concurrency"), cfg.concurrency);
+        effective.insert(QStringLiteral("httpThreads"), cfg.httpThreads);
+        effective.insert(QStringLiteral("settleMs"), cfg.settleDefaultMs);
+        effective.insert(QStringLiteral("loadTimeoutMs"), double(cfg.loadTimeoutMs));
+        effective.insert(QStringLiteral("password"), QString::fromStdString(cfg.adminPassword));
+        effective.insert(QStringLiteral("adminEnabled"), cfg.adminEnabled);
+        effective.insert(QStringLiteral("ssrfGuard"), cfg.ssrfGuardEnabled);
+        effective.insert(QStringLiteral("stealth"), cfg.stealthEnabled);
+        effective.insert(QStringLiteral("warmup"), cfg.warmupEnabled);
+        effective.insert(QStringLiteral("warmupUrl"), QString::fromStdString(cfg.warmupUrl));
+        effective.insert(QStringLiteral("remoteDebugPort"), cfg.remoteDebugPort);
+        effective.insert(QStringLiteral("trustedProxies"), QString::fromStdString(cfg.trustedProxies));
+        const ProxySpec pxy = proxyConfig.snapshot();
+        const char* pxyType = pxy.type == ProxySpec::Type::Socks5 ? "socks5"
+                            : pxy.type == ProxySpec::Type::Http   ? "http" : "direct";
+        effective.insert(QStringLiteral("proxyType"), QLatin1String(pxyType));
+        effective.insert(QStringLiteral("proxyHost"), QString::fromStdString(pxy.host));
+        effective.insert(QStringLiteral("proxyPort"), int(pxy.port));
+        effective.insert(QStringLiteral("proxyUser"), QString::fromStdString(pxy.user));
+        effective.insert(QStringLiteral("proxyPass"), QString::fromStdString(pxy.pass));
+        effective.insert(QStringLiteral("proxyBypass"), QString::fromStdString(cfg.proxyBypass));
+        effective.insert(QStringLiteral("dataDir"), g_effectiveDataDir);
+
+        QVariantMap cliFlags;
+        auto putFlag = [&](const char* k, bool v) { cliFlags.insert(QLatin1String(k), v); };
+        putFlag("host", cliOv.host);           putFlag("httpPort", cliOv.httpPort);
+        putFlag("wsPort", cliOv.wsPort);       putFlag("mcpPort", cliOv.mcpPort);
+        putFlag("concurrency", cliOv.concurrency);
+        putFlag("httpThreads", cliOv.httpThreads);
+        putFlag("settleMs", cliOv.settleMs);   putFlag("loadTimeoutMs", cliOv.loadTimeoutMs);
+        putFlag("password", cliOv.password);   putFlag("adminEnabled", cliOv.adminEnabled);
+        putFlag("ssrfGuard", cliOv.ssrfGuard); putFlag("trustedProxies", cliOv.trustedProxies);
+        putFlag("proxy", cliOv.proxy);         putFlag("proxyBypass", cliOv.proxyBypass);
+        putFlag("stealth", cliOv.stealth);     putFlag("warmup", cliOv.warmup);
+        putFlag("warmupUrl", cliOv.warmupUrl); putFlag("remoteDebugPort", cliOv.remoteDebugPort);
+        putFlag("dataDir", cliOv.dataDir);
+
+        GuiApp::Params gp;
+        gp.cfg = g_appConfig;
+        gp.effectiveSettings = effective;
+        gp.cliFlags = cliFlags;
+        gp.dataDir = dataDir;
+        gp.queue = &queue;
+        gp.proxy = &proxyConfig;
+        gp.cookies = &cookies;
+        gp.mcp = &mcp;
+        gp.env = &env;
+        gp.host = QString::fromStdString(cfg.host);
+        gp.httpPort = cfg.httpPort;
+        gp.wsPort = cfg.wsPort;
+        gp.mcpPort = cfg.mcpPort;
+        gp.password = QString::fromStdString(cfg.adminPassword);
+        gp.windowed = cfg.windowed;
+        gp.uiDemo = cfg.uiDemo;
+        gp.uiDemoPage = QString::fromStdString(cfg.uiDemoPage);
+        gui = std::make_unique<GuiApp>(gp);
+        gui->start();
+#ifdef _WIN32
+        // 桌面模式释放控制台：Explorer 双击启动不再弹黑窗，日志改走 GUI 日志页。
+        // （终端里启动时本进程脱离终端，终端本身不受影响；headless 模式不释放。）
+        ::FreeConsole();
+#endif
+    }
 
     // 启动渲染池（必须在事件循环开始前建好 page，由 start() 完成）。
     pool.start();

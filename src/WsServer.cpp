@@ -207,6 +207,16 @@ void WsServer::handleRender(QWebSocket* sock, const QJsonObject& obj) {
         QString t = obj.value(QStringLiteral("md_algorithm")).toString().trimmed().toLower();
         if (t == QStringLiteral("readability"))   mdAlg = MdAlgorithm::Readability;
     }
+    MdConverter mdConv = MdConverter::Turndown;
+    if (obj.contains(QStringLiteral("md_converter"))) {
+        const QString converter = obj.value(QStringLiteral("md_converter")).toString().trimmed().toLower();
+        if (converter == QStringLiteral("legacy_cpp")) mdConv = MdConverter::LegacyCpp;
+        else if (converter != QStringLiteral("turndown")) {
+            sendJson(sock, {{QStringLiteral("event"), QStringLiteral("error")},
+                            {QStringLiteral("message"), QStringLiteral("md_converter must be turndown or legacy_cpp")}});
+            return;
+        }
+    }
 
     // exec_js：settle 后在页面主世界执行调用方 JS（与 HTTP /render 同语义）。
     // 代码体上限 1MB + 超时钳制 1~30s。
@@ -223,7 +233,7 @@ void WsServer::handleRender(QWebSocket* sock, const QJsonObject& obj) {
     // 因此后续 finished 推送会通过 notifyFinished 回到这个连接。
     QString taskId = m_queue->submit(url, settleMs, outputs, imgFmt, mdAlg, nowMsec(),
                                      ExtractAlgorithm::None, false, execJs, execJsTimeout,
-                                     QString::fromStdString(resolvedIp));
+                                     QString::fromStdString(resolvedIp), mdConv);
     if (taskId.isEmpty()) {
         // 任务表过载（洪泛提交/积压）：背压拒绝，让客户端稍后重试。
         sendJson(sock, {{QStringLiteral("event"), QStringLiteral("error")},
@@ -284,6 +294,11 @@ void WsServer::notifyFinished(const QString& taskId, const QString& state, bool 
     // 登录态可见性：final_url 一直透出；auth_wall 命中时透出（正常内容页不打扰）。
     if (!finalUrl.isEmpty()) msg.insert(QStringLiteral("final_url"), finalUrl);
     if (authWall) msg.insert(QStringLiteral("auth_wall"), true);
+    const RenderQueue::Snapshot result = m_queue->snapshot(taskId);
+    if ((result.outputs & static_cast<OutputMask>(Output::Markdown)) && !result.markdownMeta.isEmpty()) {
+        msg.insert(QStringLiteral("md_algorithm_used"), QString::fromLatin1(mdAlgorithmName(result.mdAlgorithmUsed)));
+        msg.insert(QStringLiteral("markdown_meta"), result.markdownMeta);
+    }
 
     // 拷贝列表：发送可能触发对端关闭 → 修改原列表
     QList<QWebSocket*> subs = it.value();

@@ -5,6 +5,7 @@
 
 #include <QByteArray>
 #include <QElapsedTimer>
+#include <QJsonObject>
 #include <QString>
 
 #include <atomic>
@@ -55,8 +56,7 @@ enum class ImageFormat : std::uint8_t {
 enum class MdAlgorithm : std::uint8_t {
     Conservative,  // 保守：DOM 简化（删 script/style/nav/iframe 等噪音）后转 markdown
     Readability,   // Mozilla Readability 正文定位：剔除导航/侧栏/版权，质量高但概率性
-    Raw,           // 原始完整 DOM 直接转 markdown（Readability/Conservative 抽取失败时的兜底）
-                   //   —— 仅作为实际算法（mdAlgorithmUsed）的取值，不可作为请求算法。
+    Raw,           // 保留历史 mdAlgorithmUsed 值的兼容性；不可作为请求算法。
 };
 
 inline const char* mdAlgorithmName(MdAlgorithm a) {
@@ -68,7 +68,21 @@ inline const char* mdAlgorithmName(MdAlgorithm a) {
     return "unknown";
 }
 
-// 站点特定结构化提取算法（与 MdAlgorithm 正交：MdAlgorithm 管 HTML→markdown 转换策略，
+// 内容选择与格式转换独立：同一个 DOM 提取结果可交给不同转换器作兼容性对比。
+enum class MdConverter : std::uint8_t {
+    Turndown,   // 默认：在 WebEngine 的隔离世界中运行 Turndown + GFM
+    LegacyCpp,  // 兼容：使用旧 html2md C++ 转换器
+};
+
+inline const char* mdConverterName(MdConverter c) {
+    switch (c) {
+        case MdConverter::Turndown:  return "turndown";
+        case MdConverter::LegacyCpp: return "legacy_cpp";
+    }
+    return "unknown";
+}
+
+// 站点特定结构化提取算法（与 MdAlgorithm 正交：MdAlgorithm 管正文选择策略，
 // ExtractAlgorithm 管"识别页面类型并结构化抽取"）。仅 extract != None 时有意义。
 enum class ExtractAlgorithm : std::uint8_t {
     None,        // 默认：不做 SERP 提取（现有行为不变）
@@ -100,6 +114,7 @@ struct RenderTask {
     const OutputMask outputs;         // 请求的输出类型位标记
     const ImageFormat imageFormat;    // 截图编码格式（仅 wants(Screenshot) 时有意义）
     const MdAlgorithm mdAlgorithm;    // markdown 正文提取算法（仅 wants(Markdown) 时有意义）
+    const MdConverter mdConverter;    // markdown 格式转换器（独立于正文提取算法）
     const ExtractAlgorithm extractAlgorithm;  // 站点特定提取算法（默认 None，不影响现有行为）
     const bool recordHar;             // 是否录制网络并产出 HAR（需启动 --remote-debugging-port）
     const QString execJs;             // settle 后在页面主世界执行的 JS（空=不执行）。最后一个
@@ -118,6 +133,7 @@ struct RenderTask {
     bool imageTruncated{false};       // 截图是否因超高度上限被截断（无限滚动页防护）
     // markdown 实际使用的算法（可观测性）：可能因 Readability 判定非文章页而回退 conservative。
     MdAlgorithm mdAlgorithmUsed{MdAlgorithm::Conservative};
+    QJsonObject markdownMeta;         // extractor/converter/warnings/fallback_reason/conversion_ms
     QString serpJson;                  // SERP 结构化提取结果 JSON 字符串（extract!=None 且成功时填）
     QString jsJson;                    // exec_js 结果值的 JSON 文本（execJs 非空且成功时填；
                                        //   空 = void 或未请求。是合法 JSON 值文本，嵌入响应时裸拼）
@@ -137,7 +153,7 @@ struct RenderTask {
                ImageFormat imgFmt = ImageFormat::Auto, MdAlgorithm mdAlg = MdAlgorithm::Conservative,
                ExtractAlgorithm extractAlg = ExtractAlgorithm::None, bool recordHarFlag = false,
                QString execJsCode = QString(), int execJsTimeoutMs = 10000,
-               QString resolvedIpStr = QString())
+               QString resolvedIpStr = QString(), MdConverter mdConv = MdConverter::Turndown)
         : id(std::move(id_))
         , url(std::move(url_))
         , createdAtMsec(createdAt)
@@ -145,6 +161,7 @@ struct RenderTask {
         , outputs(outs)
         , imageFormat(imgFmt)
         , mdAlgorithm(mdAlg)
+        , mdConverter(mdConv)
         , extractAlgorithm(extractAlg)
         , recordHar(recordHarFlag)
         , execJs(std::move(execJsCode))

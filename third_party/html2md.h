@@ -385,7 +385,9 @@ private:
   size_t index_ch_in_html_ = 0;
 
   bool is_closing_tag_ = false;
-  bool is_in_attribute_value_ = false;
+  char attribute_quote_ = 0;
+  bool is_before_attribute_value_ = false;
+  bool is_in_unquoted_attribute_value_ = false;
   bool is_in_code_ = false;
   bool is_in_list_ = false;
   bool is_in_p_ = false;
@@ -419,7 +421,7 @@ private:
 
   std::string html_;
 
-  uint16_t offset_lt_ = 0;
+  size_t offset_lt_ = 0;
   std::string current_tag_;
   std::string prev_tag_;
 
@@ -646,8 +648,7 @@ private:
   inline static bool TagContainsAttributesToHide(std::string *tag) {
     using std::string;
 
-    return (*tag).find(" aria=\"hidden\"") != string::npos ||
-           (*tag).find("display:none") != string::npos ||
+    return (*tag).find("display:none") != string::npos ||
            (*tag).find("visibility:hidden") != string::npos ||
            (*tag).find("opacity:0") != string::npos ||
            (*tag).find("Details-content--hidden-not-important") != string::npos;

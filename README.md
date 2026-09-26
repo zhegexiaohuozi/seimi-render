@@ -24,6 +24,7 @@
 - **网络失败自诊断**：网络类失败的 `error` 附带 proxy 快照、目标解析 IP 与针对性 hint（fake-ip 段劫持、代理够不着内网、代理切换过渡期），agent 读错误即可自修复，不必碰壁求助人工。
 - **代理分流（`--proxy-bypass`）**：内网+外网混合目标场景，指定域名/CIDR 直连、其余走代理（`QNetworkProxyFactory` per-host 分流）。
 - **多种渲染输出**：html、markdown、pdf、png/jpg、搜索结果json结构化。
+- **原生桌面控制台（`--gui`）**：QML + Material 风格的跨平台本地操作台（概览/设置/更新/日志/登录态五页 + 系统托盘 + 深浅双主题 + 中英双语），带应用内自更新（检查 → sha256 校验 → 自动应用，安装版/绿色版双路径）。默认不启用，无头服务行为零变化；与浏览器管理后台（admin-ui）分工互补——GUI 管本机，admin-ui 管远端。
 - **无头运行**：默认 offscreen 平台，无需显示器,不会干扰本地浏览器操作，本地操作也不会干扰浏览结果获取。
 - **基础防浏览器指纹识别**：基础反爬识别能力。
 
@@ -44,11 +45,13 @@
 
 ### 构建打包
 
-| 平台 | 命令 |
-|------|------|
-| Windows | `scripts\package-windows.bat` |
-| Linux   | `sh scripts\package-linux.sh` |
-| macOS   | `sh scripts\package.sh` |
+| 平台 | 命令 | 产物 |
+|------|------|------|
+| Windows | `scripts\package-windows.bat` | 绿色版 zip（windeployqt 含 QML 模块）；本机装有 NSIS 时额外产出 per-user 安装器 `-setup.exe` |
+| Linux   | `sh scripts\package-linux.sh` | 自包含 tar.gz（qmlimportscanner 收集 QML 模块 + 打包后 GUI 加载冒烟） |
+| macOS   | `sh scripts\package.sh` | .app bundle zip（macdeployqt `-qmldir` 部署 QML 模块） |
+
+> 打包脚本会自动把 QML 模块（QtQuick/Controls 等）打进分发版并做校验——`--gui` 的 QML 源码虽编在二进制 qrc 里，但模块实现（样式/控件插件）运行时按 import path 解析，漏拷的表现是 `--gui` 白屏（构建期无报错），Windows/macOS 由部署工具扫描、Linux 由脚本静态清单 + 冒烟双保险兜住。
 
 ## 免构建直接下载地址
 
@@ -126,6 +129,8 @@ curl -X POST http://localhost:8088/render \
 | `--settle-ms <n>` | `2000` | 默认 JS settle 延时，`loadFinished` 后等待 JS 执行的毫秒数（0–30000） |
 | `--load-timeout-ms <n>` | `20000` | 单任务总超时（毫秒） |
 | `--windowed` | offscreen | 强制原生窗口 QPA 平台；默认 offscreen 无头模式 |
+| `--gui` | 关闭 | 启动原生桌面控制台（QML 窗口 + 系统托盘，详见 [原生桌面控制台](#原生桌面控制台---gui)）。不与 offscreen 冲突：显式 `--gui` 时不注入 offscreen 平台。**Windows 桌面双击（零参数、无终端父进程）默认进 GUI** |
+| `--headless` | — | 强制无头服务模式（`--no-gui` 同义）。用于从桌面快捷方式显式退出「双击默认 GUI」；终端 / 重定向 / 服务包装器 / 容器启动本来就恒为无头 |
 | `--no-sandbox` | 关闭 | 禁用 Chromium sandbox；WSL2 / 容器 / root 常需开启 |
 | `--sandbox` | 关闭 | 强制启用 Chromium sandbox（覆盖 root 自动判定） |
 | `--verbose-chromium` | 关闭 | 显示 Chromium / web console 日志（默认过滤已知噪音） |
@@ -141,8 +146,15 @@ curl -X POST http://localhost:8088/render \
 | `--no-warmup` | 关闭（warmup 开启） | 关闭启动 Google 会话预热。默认开启：进程启动时先以隐藏 page 加载一次 `--warmup-url`（默认 https://www.google.com/）拿到 NID/CONSENT 等会话 cookie，**再**启动 dispatch 定时器接业务请求——冷启动零 cookie 直打搜索是 Google 风控的最高危窗口，预热能显著降低首条搜索的 sorry 概率 |
 | `--warmup-url <url>` | `https://www.google.com/` | 会话预热目标 URL（必须 http/https）。仅在 warmup 开启时使用；一般无需改，特殊环境（如走代理时 google.com 不通）可换成能稳定返回 google 域 cookie 的镜像。warmup 自带失败自适应：连续 3 次预热失败（约 90min，Google 不可达）会自动暂停 30min 周期、改用 5min 低频探活；探活成功立即恢复正常周期。状态变化在服务日志里以 `[warmup] SUSPENDED` / `[warmup] RESUMED` 标记 |
 | `--remote-debugging-port <n>` | —（关闭） | 开启 Chromium 远程调试端口，启用 **HAR 网络录制**能力（详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network)）。开启后 stealth 的 `AutomationControlled` 标记会被自动跳过（调试模式与反爬互斥），并显著打印警告。**生产环境请勿对外暴露此端口**——它授予完整的浏览器控制权 |
-| `--data-dir <path>` | `<binary_dir>/data` | 持久化目录（`cookies.dat` 加密 cookie / `seimi.key` 机器绑定盐 / `metrics.json` 累计指标 / `anomalies/anomaly-YYYYMMDD.jsonl` 请求异常明细日志）。容器化或只读部署（二进制目录不可写）时需显式指定到可写卷 |
+| `--data-dir <path>` | `<binary_dir>/data` | 持久化目录（`cookies.dat` 加密 cookie / `seimi.key` 机器绑定盐 / `metrics.json` 累计指标 / `anomalies/anomaly-YYYYMMDD.jsonl` 请求异常明细日志 / `config.json` 持久化配置）。容器化或只读部署（二进制目录不可写）时需显式指定到可写卷 |
+| `--apply-update <dir> <appDir> <exe>` | — | **内部子命令**（更新管理器自动调用，勿手工使用）：更新交接子进程模式，做绿色版目录交换与回滚 |
 | `--help` | — | 显示帮助信息 |
+
+### 配置文件（`data/config.json`）
+
+除命令行外，服务参数可持久化在 `data/config.json`（GUI 设置页保存即写此文件；手工编辑亦可）。**优先级：内置默认 < `config.json` < 命令行显式 flag**——被命令行覆盖的字段在 GUI 设置页显示「CLI 覆盖」徽标且不可改。文件损坏时自动回退默认值并打告警，不会拒绝启动。
+
+可配置字段即命令行参数全集（`host` / `http_port` / `ws_port` / `mcp_port` / `concurrency` / `http_threads` / `settle_ms` / `load_timeout_ms` / `password` / `admin_ui` / `ssrf_guard` / `trusted_proxies` / `proxy` / `proxy_bypass` / `stealth` / `warmup` / `warmup_url` / `remote_debug_port`），另有 `gui.*` 段存 GUI 偏好（主题/语言/侧栏折叠/更新通道/manifest 地址）。注意：`password` 为明文存储（与本文件其它字段一致，靠文件系统权限保护；对安全敏感的部署请改用 `--password-file` / `SEIMI_PASSWORD`，二者优先级高于 config.json）。
 
 ### 并发与吞吐（`--concurrency`）
 
@@ -175,6 +187,58 @@ seimi-render 内置一个浏览器管理控制台(`GET /`,访问根路径即打�
 | **接口文档** | 交互式 API 文档:左目录按「HTTP REST / MCP 工具 / WebSocket」分组(18 HTTP 端点 + 6 MCP 工具 + WS 的 render/subscribe/auth),右详情含参数表、curl/JSON 示例、响应示例与错误码,均可一键复制。 | <a href="docs/images/api-docs.png" target="_blank"><img src="docs/images/api-docs.png" width="420" alt="接口文档"></a> |
 
 > cookie 同步来源见上文 [浏览器插件](#浏览器插件) 章节。管理界面是纯静态资源([`admin-ui/`](admin-ui/)),随二进制打包分发,不依赖外部服务。远程访问需显式 `--host 0.0.0.0` 并强烈建议配置 `--password`(管理界面可改代理、注入 cookie,是高权限入口)。
+
+## 原生桌面控制台（`--gui`）
+
+除浏览器管理后台外，seimi-render 还内置一个**原生桌面控制台**：QML + Qt Quick Controls 2（Material 风格）实现的本地操作台，`--gui` 启动。两者分工——**admin-ui 管远端服务器部署，原生 GUI 管本机**：
+
+```bash
+# Windows / Linux 绿色版
+./seimi-render --gui
+# macOS
+./seimi-render.app/Contents/MacOS/seimi-render --gui
+```
+
+| 页面 | 能力 |
+|------|------|
+| **概览** | KPI（成功率/吞吐/P90 延迟/队列）、渲染负载进度条、代理与 MCP 会话等摘要卡、域名分布 Top-N；侧栏底部实时吞吐曲线（60s 窗口） |
+| **设置** | 网络端口与绑定地址、并发/线程/超时、密码、SSRF 与 stealth 开关、数据目录、代理（保存即热生效）；被命令行覆盖的字段显示「CLI 覆盖」不可改，需重启的字段带「重启后生效」徽标；保存写入 `data/config.json` |
+| **更新** | 当前版本/构建信息、检查更新 → 下载（进度+速率）→ sha256 校验 → 自动应用；更新说明中英双语展示 |
+| **日志** | 运行日志实时流（5000 条环形缓冲）、级别过滤、关键字过滤、自动滚动 |
+| **登录态** | 域名→cookie 数量表、清空会话/永久删除（双重确认）、浏览器插件配对指引（地址+token 一键复制） |
+
+- **系统托盘**：关窗即最小化到托盘（首次气泡提示），托盘菜单提供显示主窗口 / 打开 Web 控制台 / 检查更新 / 退出。
+- **主题与语言**：浅色/深色双主题（跟随系统 + 手动切换）、中英双语即时切换，偏好持久化。
+- **双击即 GUI（Windows）**：桌面双击 / `Win+R` 直接运行 exe（零参数、无终端父进程、无 std 重定向）时**默认进入 GUI**——桌面用户的自然预期。终端里 `./seimi-render.exe`、重定向/服务包装器（`> log`）、容器与服务器部署**恒为无头服务**（启动来源可区分，行为零变化）。要「带参数的快捷方式仍走无头」或显式退出该默认，给快捷方式加 `--headless`（或 `--no-gui`）。
+- **不变式**：`--gui` 不影响无头服务——服务/容器/终端启动行为与既往完全一致（offscreen、无窗口、无托盘，仅 Windows 桌面双击默认进 GUI 这一例外）。GUI 模式下服务与渲染能力照常工作（同一进程共享 GUI 线程事件循环）。
+
+### 应用内自更新
+
+更新管理器读取一个静态 manifest JSON（默认指向发布站，可在更新页改），schema：
+
+```json
+{
+  "version": "1.4.0",
+  "channel": "stable",
+  "notes_zh": "更新说明（中文）",
+  "notes_en": "Release notes (English)",
+  "assets": {
+    "windows-x64": {
+      "installer": {"url": "https://.../seimi-render-1.4.0-win-x64-setup.exe", "sha256": "...", "size": 123456789},
+      "portable":  {"url": "https://.../seimi-render-1.4.0-win-x64.zip",      "sha256": "...", "size": 123456789}
+    },
+    "macos-universal": {...}, "linux-x64": {...}
+  }
+}
+```
+
+应用策略自动区分两种安装形态：
+
+- **安装版**（NSIS setup 安装，安装目录带 `.seimi-install-manifest` 标记）：下载 installer 资产 → sha256 校验 → 重新运行安装器静默重装（NSIS `/S`，per-user 免 UAC）→ 重启。
+- **绿色版**（zip/tar 解压直接运行）：下载压缩包 → 校验 → 解包暂存 → 拉起 `--apply-update` 交接子进程 → 主进程退出 → 子进程做**目录交换**（旧目录改 `.old`，新目录上位，失败自动回滚）→ 启动新版本 → 下次启动清理 `.old` 残留。
+
+下载校验失败、交换失败均有明确报错并可重试（失败 ≠ 跳过版本）。托管 manifest 的推荐位置是官网仓库（seimi-render-website）随版本发布一并更新。
+
 
 ## 浏览器插件
 
@@ -244,6 +308,9 @@ seimi-render 默认Chromum内核渲染,没有你的登录态。要渲染「登�
 | `url` | 提交的 URL |
 | `state` | `pending` / `running` / `succeeded` / `failed` |
 | `html` | 渲染后的完整 HTML（仅 `succeeded` 时有） |
+| `markdown` | 提取并转换后的 Markdown（请求 `output=markdown` 且成功产出非空内容时返回） |
+| `md_algorithm_used` | 实际内容提取算法，保留原有字段：`conservative` / `readability` / `raw`；有非空 Markdown 时返回 |
+| `markdown_meta` | Markdown 诊断对象：`extractor`、`converter`、`warnings`（数组）、`conversion_ms`；发生回退时附 `fallback_reason`。仅返回 Markdown 的成功结果包含此字段，即使 Markdown 为空也保留诊断 |
 | `js_result` | `exec_js` 的执行结果（任意 JSON 值：对象/数组/字符串/数字/null）。仅请求了 `exec_js` 且脚本有返回值时出现；脚本无返回值（void）时该字段不出现；脚本异常/超时则任务 `failed`，`error` 以 `exec_js` 开头 |
 | `error` | 失败原因（仅 `failed` 时有）。**反爬拦截类失败**的 `error` 以 `blocked:` 开头，典型形如 `blocked: google /sorry/ page (2 retries exhausted)`（命中 Google 验证页 → 自动退避重试 → 重试耗尽判 blocked） |
 | `blocked` | 布尔，仅在 `state=failed` 且失败因反爬拦截时为 `true`（典型场景：Google `/sorry/` 验证页重试耗尽）。配合上面的 `error` 前缀 `blocked:`，调用方可显式区分「反爬拦截」与「超时/网络错」两条失败路径 |
@@ -273,7 +340,11 @@ curl -X POST http://localhost:8088/render \
 ```
 
 请求参数：
+
 - `url`（必填）：http/https 地址
+- `output`（可选，默认 `html`）：`html` / `markdown` / `pdf` / `screenshot`，支持逗号组合或数组
+- `md_algorithm`（可选，默认 `conservative`）：内容选择策略。`conservative` 清理整页 DOM；`readability` 定位文章正文，识别失败时回退 `conservative`
+- `md_converter`（可选，默认 `turndown`）：格式转换器。`turndown` 使用 DOM + Turndown/GFM；`legacy_cpp` 使用旧 C++ 转换器做兼容性对比。与 `md_algorithm` 独立，仅影响 Markdown；非法值或非字符串返回 400
 - `settle_ms`（可选，默认 2000）：`loadFinished` 后等待 JS 执行的毫秒数（0–30000）；搜狐这类内容多的页面建议 2500+
 - `long_poll_ms`（可选，默认 0）：长轮询等待结果的毫秒数（>0 时阻塞至完成或超时，上限 60000）
 - `exec_js`（可选）：页面加载 + settle 后在页面主世界执行的 JS 代码（≤1MB）。代码在 async 函数体内运行：裸表达式片段自动作为结果（如 `1+1` → `js_result:2`），多语句/含 `await` 用 `return` 显式回传（结果需可 JSON 序列化，上限 16MB）；无返回值 = void（响应无 `js_result` 字段）。脚本抛错/超时/语法错误 → 任务 `failed`，`error` 形如 `exec_js error: <原因>`（含精确的语法错误信息）。可用来在已登录页面同源调用站点 API（`fetch` 自动带 cookie）
@@ -291,6 +362,36 @@ curl -X POST http://localhost:8088/render -H "Content-Type: application/json" -d
   "long_poll_ms": 60000}'
 # => {"state":"succeeded","js_result":{...接口返回的 JSON...},"elapsed_ms":...}
 ```
+
+### Markdown 提取与转换
+
+默认流程是 **内容选择 → DOM 规范化 → Turndown + GFM → Markdown**。`md_algorithm` 继续决定选择整页内容还是文章正文，`md_converter` 单独决定转换器；两者可任意组合。提取和默认转换都在 Qt WebEngine 的 `ApplicationWorld` 隔离 JS 世界中完成，使用渲染后的 DOM，不需要 Node.js 运行时。完整 HTML 输出仍保持原页面内容。
+
+`legacy_cpp` 复用同一份选择、规范化后的 DOM，便于比较转换差异。默认转换器故障时可回退到 `legacy_cpp`，响应的 `markdown_meta.converter` 标明实际转换器，`warnings` 与 `fallback_reason` 说明原因；Readability 无法识别正文时同样记录回退到 conservative 的原因。共享提取流程不可用时任务失败，不返回看似正常的空结果。
+
+```bash
+curl -X POST http://localhost:8088/render \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/article","output":"markdown","md_algorithm":"readability","md_converter":"turndown","long_poll_ms":45000}'
+```
+
+成功响应示例（字段节选）：
+
+```json
+{
+  "state": "succeeded",
+  "markdown": "# Article\n\nText...",
+  "md_algorithm_used": "readability",
+  "markdown_meta": {
+    "extractor": "readability",
+    "converter": "turndown",
+    "warnings": [],
+    "conversion_ms": 12
+  }
+}
+```
+
+异步提交后用 `/result/:id?output=markdown` 获取同样的诊断。WebSocket 的 `finished` 推送也携带 `markdown_meta`；MCP 的 `render_url` / `get_web_content` 将其作为正文前的诊断信息返回，`get_render_result` 保留 HTTP 结果 JSON。
 
 ### 查询状态
 
@@ -655,9 +756,9 @@ seimi-render 内置一个 **MCP（Model Context Protocol）server**（默认端�
 | tool | 作用 | 必填参数 | 可选参数 |
 |------|------|----------|----------|
 | `browser_search` | 关键词搜索：自动构造搜索引擎 URL 并渲染，返回结果列表。**没给具体 URL、只想「搜一下/查一下」时优先用** | `query` | `engine`(google/bing/baidu/duckduckgo，默认 google)、`settle_ms`(2500)、`timeout_ms`(45000) |
-| `get_web_content` | 读单篇文章正文：用 readability 提取干净 markdown（去导航/广告/侧栏）。**给了具体 URL 要读全文时优先用** | `url` | `md_algorithm`(readability/conservative，默认 readability)、`settle_ms`(2500)、`timeout_ms`(45000) |
+| `get_web_content` | 读单篇文章正文：用 readability 提取干净 markdown（去导航/广告/侧栏）。**给了具体 URL 要读全文时优先用** | `url` | `md_algorithm`(readability/conservative，默认 readability)、`md_converter`(turndown/legacy_cpp，默认 turndown)、`settle_ms`(2500)、`timeout_ms`(45000) |
 | `fetch_url` | 轻量直取：带登录态 cookie + 全局代理直接请求 JSON/REST 端点，返回原始响应体（不走浏览器渲染，百毫秒级）。**目标是 API/JSON 端点时优先用** | `url` | `method`(GET/POST/PUT/PATCH/DELETE/HEAD，默认 GET)、`body`(请求体，默认按 JSON 发)、`headers`(请求头对象，显式 Cookie 覆盖登录态)、`timeout_ms`(15000)、`response_format`(text 默认/base64 二进制安全——附件下载场景，>50MB 拒绝) |
-| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000)、`record_network`(false，开启 HAR 网络录制，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network))、`exec_js`、`exec_js_timeout_ms` |
+| `render_url` | 全功能渲染器：任意 URL、任意输出组合。**需要 PDF/截图/原始 HTML/手动指定搜索引擎 URL/自定义 settle 时用** | `url` | `output`(markdown/html/pdf/screenshot 逗号组合，默认 markdown)、`md_algorithm`(conservative/readability，默认 conservative)、`md_converter`(turndown/legacy_cpp，默认 turndown)、`format`(auto/png/jpg，仅影响截图)、`settle_ms`(2500)、`timeout_ms`(45000)、`record_network`(false，开启 HAR 网络录制，详见 [网络录制与 HAR 导出](#网络录制与-har-导出-record_network))、`exec_js`、`exec_js_timeout_ms` |
 | `get_har` | 按 task_id 取网络录制 HAR：配合 `render_url` 的 `record_network=true` 使用，返回标准 HAR 1.2 JSON | `task_id` | — |
 | `get_render_result` | 按 task_id 补取已提交任务的结果：`render_url` 超时返回 `running` 后轮询，或重新拉取已完成产物 | `task_id` | `output`(markdown/html/screenshot/pdf，默认 markdown)、`timeout_ms`(5000) |
 
@@ -855,7 +956,7 @@ sequenceDiagram
 
     A->>M: tools/call get_web_content {url:"https://.../article"}
     M->>H: POST /render {url, output:markdown,<br/>md_algorithm:"readability", long_poll_ms:45000}
-    Note over H: 渲染 + Readability 正文定位<br/>（非文章页自动回退 conservative/raw）
+    Note over H: 渲染 + Readability 正文定位<br/>（非文章页自动回退 conservative）<br/>DOM 规范化 + Turndown/GFM
     H-->>M: {state:succeeded, markdown:"# 标题\n\n正文...",<br/>md_algorithm_used:"readability"}
     M-->>A: content:[text "[get_web_content url=... md=readability]\n\n# 标题\n\n正文..."]
 ```
@@ -945,6 +1046,7 @@ curl -X DELETE http://localhost:8088/cookies
 | `settle_ms` | int | 否 | loadFinished 后等待 JS 执行的毫秒数（0–30000，默认 2000） |
 | `output` | string \| array | 否 | 产物类型，逗号分隔串（`"html,markdown,pdf,screenshot"`）或数组（与 HTTP `/render` 同语义；`md`/`image`/`png`/`jpg` 为别名）。默认 `html` |
 | `md_algorithm` | string | 否 | markdown 算法：`conservative`（默认）/ `readability`（与 HTTP 同语义） |
+| `md_converter` | string | 否 | Markdown 转换器：`turndown`（默认）/ `legacy_cpp`（与 HTTP 同语义）；非法值返回 `error` |
 | `format` | string | 否 | 截图编码：`auto`（默认）/ `png` / `jpg`（与 HTTP 同语义） |
 
 服务端收到后向渲染队列提交任务，**自动把本连接订阅到该任务**，并立即回 `created`；渲染完成时推送 `finished`。真实示例：
@@ -974,7 +1076,7 @@ curl -X DELETE http://localhost:8088/cookies
 |---------|----------|----------|
 | `created` | `render` 请求已受理并提交到渲染队列 | `task_id`、`url` |
 | `subscribed` | `subscribe` 请求合法，订阅成功 | `task_id` |
-| `finished` | 订阅的任务到达终态（成功或失败），**主动推送** | `task_id`、`state` |
+| `finished` | 订阅的任务到达终态（成功或失败），**主动推送** | `task_id`、`state`；Markdown 成功结果附 `md_algorithm_used`、`markdown_meta` |
 | `authorized` | 启用密码且鉴权通过（连接 URL `?token=` 或 `auth` 动作）；未启用密码时 `auth` 动作也会回此 | — |
 | `error` | 请求非法（缺字段 / 非 JSON / URL 非法 / 未知 action） | `message` |
 
@@ -1208,8 +1310,7 @@ sequenceDiagram
 | [Qt 6](https://www.qt.io/)（Qt WebEngine / Network / WebSockets 等） | Chromium 渲染核心、网络栈 | **LGPL v3**（开源选项）/ 商业双授权 |
 | [cpp-mcp](./third_party/cpp-mcp/) | MCP 协议实现 | MIT |
 | [cpp-httplib](./third_party/httplib.h) | HTTP 服务 | MIT |
-| [html2md](./third_party/html2md.cpp) / [table](./third_party/table.cpp) | HTML→Markdown 转换 | MIT |
+| [Turndown / turndown-plugin-gfm](./third_party/markdown/) | 默认 DOM→Markdown 转换与 GFM 规则 | MIT |
+| [html2md](./third_party/html2md.cpp) / [table](./third_party/table.cpp) | `legacy_cpp` 兼容转换与故障回退 | MIT |
 | [qaes](./third_party/qaes/) | AES 加密 | Public Domain |
 | [Mozilla Readability](./third_party/readability/) | 正文提取 | Apache License 2.0 |
-
-

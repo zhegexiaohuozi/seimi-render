@@ -125,3 +125,4 @@ roo-code-settings.json
 .faiss/
 .qdrant/
 *.har
+/.mimosa

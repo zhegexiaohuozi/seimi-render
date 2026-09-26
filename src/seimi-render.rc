@@ -1,0 +1,8 @@
+/* SPDX-FileCopyrightText: 2026 wanghaomiao.cn
+   SPDX-License-Identifier: Apache-2.0
+
+   Windows exe 嵌入图标（资源管理器/任务栏 Dock 图标来源）。
+   与 admin-ui 品牌同源：admin-ui/favicon.ico（16/32/48）。
+   运行时窗口/托盘图标另由 GuiApp 用 admin-ui/logo.png（512px）设置。
+*/
+IDI_ICON1 ICON "../admin-ui/favicon.ico"
