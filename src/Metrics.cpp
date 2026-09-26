@@ -155,7 +155,8 @@ Metrics::Snapshot Metrics::snapshot(int maxDomains) const {
         all.push_back({kv.first, kv.second.total, kv.second.succeeded, kv.second.failed, kv.second.blocked});
     }
     std::sort(all.begin(), all.end(), [](const DomainStat& a, const DomainStat& b) {
-        return a.total > b.total;   // 按 total 倒序
+        if (a.total != b.total) return a.total > b.total;   // 按请求数降序
+        return a.host < b.host;                             // 同请求数按域名字典序（稳定次级排序）
     });
     if (maxDomains > 0 && int(all.size()) > maxDomains) {
         all.resize(maxDomains);
@@ -330,7 +331,10 @@ bool Metrics::parse(const QByteArray& json, std::int64_t schemaVersion) {
         e.total = e.c.total;
         if (!e.host.empty()) sorted.push_back(std::move(e));
     }
-    std::sort(sorted.begin(), sorted.end(), [](const D& a, const D& b) { return a.total > b.total; });
+    std::sort(sorted.begin(), sorted.end(), [](const D& a, const D& b) {
+        if (a.total != b.total) return a.total > b.total;
+        return a.host < b.host;   // 与 snapshot() 同序：请求数降序 + 域名字典序
+    });
     for (auto& e : sorted) {
         if (static_cast<int>(m_domains.size()) >= kMaxHosts) break;
         m_domains.emplace(std::move(e.host), e.c);

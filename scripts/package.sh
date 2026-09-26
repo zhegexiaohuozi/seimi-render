@@ -110,8 +110,12 @@ compute_qt_fingerprint() {
         && proc_ok=1 || proc_ok=0
     [[ -f "$BUNDLE_APP/Contents/PlugIns/platforms/libqoffscreen.dylib" ]] \
         && offscreen_ok=1 || offscreen_ok=0
+    # QML 模块（QtQuick/Controls 等，-qmldir 部署到 Resources/qml）：缺失=GUI 白屏，
+    # 必须纳入指纹——否则增量缓存会跳过 macdeployqt，漏部署无感。
+    [[ -d "$BUNDLE_APP/Contents/Resources/qml/QtQuick/Controls" ]] \
+        && qml_ok=1 || qml_ok=0
     qt_mtime="$(stat -f '%m' "$QT_PREFIX/lib/QtCore.framework/QtCore" 2>/dev/null || echo 0)"
-    echo "${qt_ver}|${fw_list}|proc=${proc_ok}|offscreen=${offscreen_ok}|mtime=${qt_mtime}"
+    echo "${qt_ver}|${fw_list}|proc=${proc_ok}|offscreen=${offscreen_ok}|qml=${qml_ok}|mtime=${qt_mtime}"
 }
 
 # 主二进制的 Qt 依赖是否全部已就位于 bundle，且不残留构建机绝对路径。
@@ -168,9 +172,12 @@ else
     # 过滤 macdeployqt stderr 的已知噪声（真正的 fatal 错误仍会显示）：
     #   - "Cannot resolve rpath @rpath/Qt(Svg|VirtualKeyboard)..." 是运行时按需 dlopen
     #     的可选模块，不在 LC_LOAD_DYLIB 里，Qt 工具误报 ERROR，部署照常完成。
+    # -qmldir：扫描源 qml/ 的 import，把 QtQuick/Controls/Layouts 等 QML 模块部署进
+    # bundle Resources/qml/（GUI 模式运行时按 QLibraryInfo 解析）。漏部署=--gui 白屏。
     MDQ_ERR_TMP="$(mktemp -t seimi_mdq_err.XXXXXX)"
     "$MACDEPLOYQT" "$BUNDLE_APP" \
         -always-overwrite \
+        -qmldir="$ROOT_DIR/qml" \
         -verbose=1 \
         -no-codesign \
         -executable="$BUNDLE_APP/Contents/MacOS/seimi-render" 2>"$MDQ_ERR_TMP"
@@ -372,6 +379,12 @@ echo "  -- WebEngineProcess helper --"
 ls "$BUNDLE_APP/Contents/Frameworks/QtWebEngineCore.framework/Helpers/QtWebEngineProcess.app/Contents/MacOS/QtWebEngineProcess" 2>/dev/null && echo "  [OK] QtWebEngineProcess bundled" || echo "  [WARN] QtWebEngineProcess not found in bundle"
 echo "  -- cocoa platform plugin (macOS default) --"
 ls "$BUNDLE_APP/Contents/PlugIns/platforms/libqcocoa.dylib" 2>/dev/null && echo "  [OK] cocoa plugin bundled" || echo "  [WARN] cocoa plugin missing"
+echo "  -- QML modules (--gui console) --"
+if [[ -d "$BUNDLE_APP/Contents/Resources/qml/QtQuick/Controls" ]]; then
+    echo "  [OK] QML QtQuick.Controls bundled"
+else
+    echo "  [WARN] QML modules missing under Resources/qml -- --gui will show a blank window"
+fi
 echo "  -- codesign verification --"
 if codesign --verify --deep "$BUNDLE_APP" 2>/dev/null; then
     echo "  [OK] bundle signature valid (ad-hoc)"

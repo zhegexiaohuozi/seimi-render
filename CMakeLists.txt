@@ -148,6 +148,11 @@ find_package(Qt6 REQUIRED COMPONENTS
     WebSockets
     WebEngineCore
     WebEngineWidgets
+    Qml
+    Quick
+    QuickControls2
+    QuickLayouts
+    Svg
 )
 
 qt_standard_project_setup()
@@ -272,6 +277,10 @@ target_link_libraries(seimi-mcp PUBLIC Threads::Threads)
 # ---------- 可执行目标 ----------
 add_executable(seimi-render
     src/main.cpp
+    src/AppConfig.h
+    src/AppConfig.cpp
+    src/UpdateManager.h
+    src/UpdateManager.cpp
     src/RenderTask.h
     src/RenderQueue.h
     src/RenderQueue.cpp
@@ -300,9 +309,91 @@ add_executable(seimi-render
     src/HarStore.cpp
     src/HarRecorder.h
     src/HarRecorder.cpp
+    src/gui/GuiApp.h
+    src/gui/GuiApp.cpp
+    src/gui/FaIconProvider.h
+    src/gui/GuiPrefs.h
+    src/gui/GuiPrefs.cpp
+    src/gui/Theme.h
+    src/gui/Theme.cpp
+    src/gui/ServiceInfo.h
+    src/gui/ServiceInfo.cpp
+    src/gui/DashboardModel.h
+    src/gui/DashboardModel.cpp
+    src/gui/SettingsModel.h
+    src/gui/SettingsModel.cpp
+    src/gui/CookiesModel.h
+    src/gui/CookiesModel.cpp
+    src/gui/LogModel.h
+    src/gui/LogModel.cpp
+    src/gui/TrayController.h
+    src/gui/TrayController.cpp
     third_party/html2md.cpp
     third_party/table.cpp
     third_party/qaes/qaesencryption.cpp
+)
+
+# ---------- 原生 GUI（--gui）QML 资源 ----------
+# 单二进制：QML 编进 qrc（qrc:/qml/…，PREFIX "/" + 源相对路径拼接），运行时无外部 .qml 依赖。
+# qmldir 声明 Strings 单例（pragma Singleton）；组件经同目录隐式解析（components/）。
+# 组件体系（Clash Verge Rev 截图节奏起步包移植）：UiText/UiIcon/UiButton/NavItem/
+# StatusBadge/UiCard/MetricCell/RatioBar/AccordionCard/MiniChart + 表单辅助 + 弹层。
+qt_add_resources(seimi-render "seimi_gui_qml"
+    PREFIX "/"
+    FILES
+        qml/Main.qml
+        qml/qmldir
+        qml/Strings.qml
+        qml/components/UiText.qml
+        qml/components/UiIcon.qml
+        qml/components/FaIcon.qml
+        qml/components/UiButton.qml
+        qml/components/NavItem.qml
+        qml/components/StatusBadge.qml
+        qml/components/UiCard.qml
+        qml/components/MetricCell.qml
+        qml/components/RatioBar.qml
+        qml/components/AccordionCard.qml
+        qml/components/MiniChart.qml
+        qml/components/Toast.qml
+        qml/components/UiTextField.qml
+        qml/components/UiTextInput.qml
+        qml/components/UiComboBox.qml
+        qml/components/UiSwitch.qml
+        qml/components/UiCheckBox.qml
+        qml/components/UiSpinBox.qml
+        qml/components/SettingsSection.qml
+        qml/components/SettingRow.qml
+        qml/components/ConfirmPopup.qml
+        qml/components/FieldLabel.qml
+        qml/pages/DashboardPage.qml
+        qml/pages/SettingsPage.qml
+        qml/pages/UpdatePage.qml
+        qml/pages/LogsPage.qml
+        qml/pages/CookiesPage.qml
+        qml/pages/ControlsGallery.qml
+        # 导航图标资产：Font Awesome Free 6.7.2 官方原始 SVG（编入 qrc，运行时无外部依赖）。
+        # 来源/授权见 third_party/FontAwesome/README.md 与 LICENSE.txt。
+        third_party/FontAwesome/house.svg
+        third_party/FontAwesome/sliders.svg
+        third_party/FontAwesome/arrows-rotate.svg
+        third_party/FontAwesome/file-lines.svg
+        third_party/FontAwesome/lock.svg
+        third_party/FontAwesome/microchip.svg
+        # 页面业务图标（概览卡片/指标/表单辅助/主题切换等）
+        third_party/FontAwesome/server.svg
+        third_party/FontAwesome/network-wired.svg
+        third_party/FontAwesome/chart-line.svg
+        third_party/FontAwesome/chevron-down.svg
+        third_party/FontAwesome/check.svg
+        third_party/FontAwesome/clock.svg
+        third_party/FontAwesome/link.svg
+        third_party/FontAwesome/globe.svg
+        third_party/FontAwesome/triangle-exclamation.svg
+        third_party/FontAwesome/moon.svg
+        third_party/FontAwesome/sun.svg
+        # 应用品牌图标（favicon.svg 与 admin-ui 同源；窗口/托盘/侧栏共用）
+        admin-ui/favicon.svg
 )
 
 target_include_directories(seimi-render PRIVATE
@@ -319,9 +410,29 @@ target_link_libraries(seimi-render PRIVATE
     Qt6::WebSockets
     Qt6::WebEngineCore
     Qt6::WebEngineWidgets
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::QuickLayouts
+    Qt6::Svg
     Threads::Threads
     seimi-mcp
 )
+
+# Windows：exe 嵌入 admin-ui 同源图标（资源管理器/任务栏）；project() 限定了
+# LANGUAGES CXX，RC 语言需显式启用才能编译 .rc。
+if(WIN32)
+    enable_language(RC)
+    target_sources(seimi-render PRIVATE src/seimi-render.rc)
+endif()
+
+# Windows：GUI 子系统（双击/快捷方式启动不弹控制台窗）。保留 main() 入口：
+# MSVC 对 WINDOWS 子系统默认找 WinMain，显式指回 mainCRTStartup。
+# 双模式的控制台归属在 main.cpp 启动期处理（终端跑/重定向/无头双击三种路径）。
+if(WIN32 AND MSVC)
+    set_target_properties(seimi-render PROPERTIES WIN32_EXECUTABLE TRUE)
+    target_link_options(seimi-render PRIVATE "/ENTRY:mainCRTStartup")
+endif()
 
 # macOS：产出 .app bundle（QtWebEngine 需 bundle 结构，macdeployqt 打包依赖）。
 if(APPLE)
