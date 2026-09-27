@@ -9,6 +9,19 @@ const TOKEN_KEY = 'seimi_token';
 const getToken = () => sessionStorage.getItem(TOKEN_KEY);
 const setToken = (t) => t ? sessionStorage.setItem(TOKEN_KEY, t) : sessionStorage.removeItem(TOKEN_KEY);
 
+// 渲染测试台（工作台）状态。
+// 注意：必须在下方 init IIFE 之前声明——init 会同步调用 bindRenderForm()，
+// 此时文件中后部的 const 声明尚处 TDZ，晚于此处声明会抛 ReferenceError 导致整页空白。
+const wb = {
+  phase: 'idle',          // idle | loading | done | failed
+  stale: false,           // done/failed 后配置又变了：结果保留但标注属于旧配置
+  result: null,           // /render 响应（done/failed 时有效）
+  submittedSig: '',       // 提交时的请求体签名（检测配置漂移）
+  activeTab: 'html',      // html | markdown | pdf | screenshot | extract | request
+  mode: 'source',         // source | preview（html / markdown 通用）
+};
+const RENDER_MAX_LINES = 4000;   // 源码视图最多渲染的行数（超长 HTML 的 DOM 保护；复制/下载仍用全文）
+
 // 带 token 的 fetch 包装
 async function api(url, opts = {}) {
   const headers = { ...(opts.headers || {}) };
@@ -27,17 +40,19 @@ async function api(url, opts = {}) {
   bindRenderForm();
   bindCookieClear();
   bindCopyButtons();
-  bindResultCopy();
   bindApiTabs();
   bindLangToggle();
   bindDomainSort();   // 域名分布表头排序
-  // 语言切换时重渲染动态部分（统计/cookie/MCP/API 示例；docs 若已渲染则重渲）。
+  // 语言切换时重渲染动态部分（统计/cookie/MCP/API 示例/渲染工作台；docs 若已渲染则重渲）。
   window.i18n.onLanguageChange(() => {
     if (!document.getElementById('app').classList.contains('hidden')) {
       loadStats();
       loadCookies();
       loadMcpConfig();
       renderApiExample();
+      syncControls();       // 渲染工作台：联动说明文案 + 状态徽标/底栏 + 结果区
+      updateStatusUI();
+      renderWorkbench();
       if (docsRendered && window.renderDocs) window.renderDocs();
     }
   });
@@ -489,19 +504,27 @@ function renderMcp(m) {
     '<p class="muted small" style="margin-top:10px">' + t('mcp.desc') + '</p>';
 }
 
-// ---------- 页签 2：渲染测试台 ----------
+// ---------- 页签 2：渲染测试台（工作台） ----------
+// 状态机：idle（未开始）→ loading（已提交，等待响应）→ done / failed。
+// done/failed 后修改配置会置 stale（结果保留但标注属于旧配置），不静默清除。
+// 状态对象 wb 与 RENDER_MAX_LINES 已在文件顶部声明（init IIFE 同步调用本区函数，需避开 TDZ）。
+
 function bindRenderForm() {
+  // —— 提交渲染 ——
   document.getElementById('render-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const { url } = readRenderForm();
-    if (!url) return;
+    if (wb.phase === 'loading') return;          // 重复提交防护
+    if (!validateRenderInput()) return;
     const body = buildRenderBody();
-    const btn = document.getElementById('render-submit');
-    const statusEl = document.getElementById('render-status');
-    const resultEl = document.getElementById('render-result');
-    btn.disabled = true; btn.textContent = t('render.submitting');
-    statusEl.className = 'render-status'; statusEl.textContent = t('render.status.working');
-    resultEl.innerHTML = '';
+    wb.submittedSig = JSON.stringify(body);
+    wb.phase = 'loading';
+    wb.stale = false;
+    wb.result = null;
+    wb.mode = 'source';
+    wb.activeTab = body.extract ? 'extract' : (body.output.split(',')[0] || 'request');
+    syncSubmitButton();
+    updateStatusUI();
+    renderWorkbench();
     try {
       const r = await api('/render', {
         method: 'POST',
@@ -509,44 +532,108 @@ function bindRenderForm() {
         body: JSON.stringify(body),
       });
       const d = await r.json();
-      if (d.state === 'succeeded') {
-        statusEl.className = 'render-status ok';
-        statusEl.textContent = t('render.status.ok', { ms: d.elapsed_ms, id: d.task_id });
-        renderResult(d, body.output);
-      } else {
-        statusEl.className = 'render-status err';
-        statusEl.textContent = t('render.status.fail', {
-          state: (d.state === 'failed' ? t('render.status.failed') : t('render.status.incomplete')),
-          err: (d.error || d.state), ms: d.elapsed_ms,
-        });
-      }
+      wb.result = d;
+      wb.phase = (d.state === 'succeeded') ? 'done' : 'failed';
     } catch (err) {
-      statusEl.className = 'render-status err';
-      statusEl.textContent = t('render.status.reqFail') + err.message;
+      wb.result = { state: 'failed', error: String(err && err.message || err), elapsed_ms: 0 };
+      wb.phase = 'failed';
     } finally {
-      btn.disabled = false; btn.textContent = t('render.btn');
+      refreshStale();        // 请求期间用户可能改了配置
+      syncSubmitButton();
+      updateStatusUI();
+      renderWorkbench();
     }
   });
 
-  // 拷贝 curl 命令：按当前表单参数生成等价的 POST /render curl。
+  // —— 复制 curl 命令：按当前表单参数生成等价的 POST /render curl（与真实提交共用 buildRenderBody）——
   document.getElementById('render-copy-curl').addEventListener('click', async () => {
     const { url } = readRenderForm();
     const body = buildRenderBody();
-    const btn = document.getElementById('render-copy-curl');
     // URL 为空时给出占位示例，确保拷出的命令可直接跑。
     if (!url) body.url = 'https://example.com/';
-    const base = window.location.origin;
-    const tok = getToken();
-    const authHeader = tok ? ` -H "Authorization: Bearer ${tok}"` : '';
-    const curl = `curl -X POST ${base}/render \\
-  -H "Content-Type: application/json"${authHeader} \\
-  -d '${JSON.stringify(body)}'`;
+    const curl = buildCurlCommand(body);
     const ok = await copyText(curl);
-    const orig = btn.textContent;
-    btn.textContent = ok ? t('render.curlDone') : t('render.curlFail');
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
+    toastWorkbench(ok ? t('render.curlDone') : t('render.curlFail'));
   });
+
+  // —— 配置联动 + 结果过期标注 ——
+  document.querySelectorAll('#render-settings input, #render-settings select').forEach(el => {
+    el.addEventListener('change', () => { syncControls(); refreshStale(); renderWorkbench(); });
+  });
+  document.getElementById('render-url').addEventListener('input', () => {
+    const panel = document.getElementById('url-panel');
+    const errEl = document.getElementById('render-url-error');
+    panel.classList.remove('invalid');
+    errEl.hidden = true;
+    refreshStale();
+  });
+
+  // —— 重置配置（不动 URL；默认值与原表单一致）——
+  document.getElementById('render-reset').addEventListener('click', () => {
+    document.getElementById('render-settle').value = '2000';
+    document.getElementById('render-longpoll').value = '30000';
+    document.getElementById('render-extract').value = '';
+    document.getElementById('out-html').checked = true;
+    document.getElementById('out-markdown').checked = false;
+    document.getElementById('out-pdf').checked = false;
+    document.getElementById('out-screenshot').checked = false;
+    const md = document.querySelector('input[name="md-alg"][value="conservative"]');
+    if (md) md.checked = true;
+    const shot = document.querySelector('input[name="shot-fmt"][value="auto"]');
+    if (shot) shot.checked = true;
+    syncControls();
+    refreshStale();
+    renderWorkbench();
+    toastWorkbench(t('render.cfg.resetDone'));
+  });
+
+  // —— 结果标签切换（点击 + 键盘导航）——
+  document.querySelectorAll('#result-tabs .result-tab').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+  document.getElementById('result-tabs').addEventListener('keydown', (e) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    const tabs = [...document.querySelectorAll('#result-tabs .result-tab')].filter(b => !b.disabled && !b.hidden);
+    const i = tabs.findIndex(b => b.dataset.tab === wb.activeTab);
+    let next = i;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = tabs.length - 1;
+    else next = (i + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    e.preventDefault();
+    switchTab(tabs[next].dataset.tab);
+    tabs[next].focus();
+  });
+
+  // —— 左栏「查看请求配置」：跳到请求配置标签（窄屏滚动到结果区）——
+  document.getElementById('view-request-config').addEventListener('click', () => {
+    switchTab('request');
+    if (window.innerWidth <= 760) {
+      document.getElementById('render-result').scrollIntoView({
+        behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+        block: 'center',
+      });
+    }
+  });
+
+  // —— Ctrl/⌘ + Enter 快捷提交 ——
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      const panel = document.getElementById('tab-render');
+      if (panel && panel.classList.contains('active')) {
+        e.preventDefault();
+        document.getElementById('render-form').requestSubmit();
+      }
+    }
+  });
+  // —— Mac 显示 ⌘ ——
+  if (/Mac|iPhone|iPad/.test(navigator.platform)) {
+    const k = document.getElementById('url-mod-key');
+    if (k) k.textContent = '⌘';
+  }
+
+  syncControls();
+  updateStatusUI();
+  renderWorkbench();
 }
 
 // 读取渲染表单参数（提交渲染与拷贝 curl 共用，保证两者生成的请求体一致）。
@@ -561,12 +648,12 @@ function readRenderForm() {
   if (document.getElementById('out-screenshot').checked) outputs.push('screenshot');
   const shotFmt = document.querySelector('input[name="shot-fmt"]:checked');
   const mdAlg = document.querySelector('input[name="md-alg"]:checked');
-  const extractEl = document.querySelector('input[name="extract"]:checked');
+  const extractEl = document.getElementById('render-extract');
   const extractVal = extractEl ? extractEl.value : '';
   return { url, settle, longpoll, outputs, shotFmt, mdAlg, extractVal };
 }
 
-// 由表单参数组装 /render 请求体。
+// 由表单参数组装 /render 请求体（与后端接口协议一致，改版未改动任何字段）。
 function buildRenderBody() {
   const { url, settle, longpoll, outputs, shotFmt, mdAlg, extractVal } = readRenderForm();
   const body = {
@@ -577,67 +664,628 @@ function buildRenderBody() {
   if (extractVal) body.extract = extractVal;
   return body;
 }
-function renderResult(d, output) {
-  const el = document.getElementById('render-result');
-  const wantHtml = output.includes('html');
-  const wantMd = output.includes('markdown');
-  const wantPdf = output.includes('pdf');
-  const wantShot = output.includes('screenshot');
-  let html = '';
-  // PDF 下载链接（带 token，浏览器可直接打开）
+
+// 生成与页面提交完全一致的 curl 命令。
+function buildCurlCommand(body) {
+  const base = window.location.origin;
   const tok = getToken();
-  if (wantPdf && d.has_pdf) {
-    const pdfUrl = `/pdf/${d.task_id}` + (tok ? `?token=${encodeURIComponent(tok)}` : '');
-    html += `<p style="margin-bottom:12px"><a href="${pdfUrl}" target="_blank" style="color:var(--primary)">${t('render.pdfDownload', { bytes: d.pdf_bytes })}</a></p>`;
+  const authHeader = tok ? ` -H "Authorization: Bearer ${tok}"` : '';
+  return `curl -X POST ${base}/render \\
+  -H "Content-Type: application/json"${authHeader} \\
+  -d '${JSON.stringify(body)}'`;
+}
+
+// 提交前校验：URL 必须是合法 http/https；输出与站点提取至少选一项。
+function validateRenderInput() {
+  const { url, outputs, extractVal } = readRenderForm();
+  let err = '';
+  if (url) {
+    try {
+      const u = new URL(url);
+      if (!/^https?:$/.test(u.protocol) || !u.hostname) throw new Error('bad');
+    } catch (_) { err = t('render.urlError'); }
+  } else {
+    err = t('render.urlError');
   }
-  // 截图（PNG/JPEG）—— 内联预览 + 下载链接。所见即所得，区别于 PDF 的打印输出。
-  // 格式由后端智能选择或用户指定，读 image_format 动态显示。
-  if (wantShot && d.has_image) {
-    const imgUrl = `/image/${d.task_id}` + (tok ? `?token=${encodeURIComponent(tok)}` : '');
-    const fmtUpper = (d.image_format || 'png').toUpperCase();
-    const algNote = d.image_format === 'jpeg' ? t('render.shotNote.jpeg') : t('render.shotNote.lossless');
-    html += `<h4 style="margin:8px 0;font-size:13px">${t('render.shotPreview', { fmt: fmtUpper, bytes: d.image_bytes, note: algNote })}</h4>`;
-    html += `<img src="${imgUrl}" style="max-width:100%;border:1px solid var(--border);border-radius:6px;margin-bottom:8px" alt="screenshot">`;
-    html += `<p style="margin-bottom:12px"><a href="${imgUrl}" target="_blank" style="color:var(--primary)">${t('render.shotDownload', { fmt: fmtUpper, bytes: d.image_bytes })}</a></p>`;
-  }
-  // SERP 结构化提取结果（extract != none 时后端返回 serp_json 对象）。
-  // 优先展示：搜索结果页场景下 markdown/html 是噪声，serp_json 才是干净的结构化数据。
-  if (d.serp_json) {
-    const sj = d.serp_json;
-    if (sj.blocked) {
-      html += `<h4 style="margin:8px 0;font-size:13px;color:var(--danger)">${t('render.serp.blocked')}</h4>`;
-      html += `<p class="muted">${t('render.serp.blockedDesc')}</p>`;
-    } else {
-      const results = sj.results || [];
-      const adsPart = (sj.meta && sj.meta.ads_filtered) ? t('render.serp.adsFiltered', { n: sj.meta.ads_filtered }) : '';
-      html += `<h4 style="margin:8px 0;font-size:13px">${t('render.serp.results', { n: results.length, ads: adsPart })}</h4>`;
-      // 编号列表
-      if (results.length) {
-        html += `<div class="code-block"><pre>${esc(results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}${r.is_redirect ? '  ' + t('render.serp.redirect') : ''}${r.source ? '\n   [' + r.source + ']' : ''}${r.snippet ? '\n   ' + r.snippet : ''}`).join('\n\n'))}</pre></div>`;
-      }
-      // 原始 JSON（折叠，便于精确查看）
-      html += `<details style="margin-top:8px"><summary class="muted" style="cursor:pointer">${t('render.serp.rawJson')}</summary><div class="code-block" style="margin-top:4px"><button type="button" class="btn-copy" data-copy-action>${t('common.copy')}</button><pre>${esc(JSON.stringify(sj, null, 2))}</pre></div></details>`;
+  if (!err && !outputs.length && !extractVal) err = t('render.noOutputSelected');
+  const panel = document.getElementById('url-panel');
+  const errEl = document.getElementById('render-url-error');
+  panel.classList.toggle('invalid', !!err);
+  errEl.hidden = !err;
+  if (err) errEl.textContent = err;
+  return !err;
+}
+
+// 配置区联动：关联设置按需出现；Markdown 与站点提取互斥（禁用并说明，不静默改选择）。
+function syncControls() {
+  const c = readRenderForm();
+  const mdOn = c.outputs.includes('markdown');
+  const siteOn = !!c.extractVal;
+  const mdLabel = document.getElementById('out-markdown-label');
+  const siteSel = document.getElementById('render-extract');
+  // 互斥表达：先选的一方生效，另一方禁用 + 说明原因。
+  siteSel.disabled = mdOn;
+  document.getElementById('out-markdown').disabled = siteOn;
+  mdLabel.title = siteOn ? t('render.mutex.mdDisabled') : '';
+  document.getElementById('site-help').textContent = mdOn ? t('render.mutex.siteDisabled') : t('render.site.help');
+  document.getElementById('format-help').textContent = siteOn ? t('render.mutex.mdDisabled') : t('render.format.help');
+  // 关联配置只在勾选对应格式后出现。
+  document.getElementById('md-options').hidden = !mdOn;
+  document.getElementById('shot-options').hidden = !c.outputs.includes('screenshot');
+  const mdVal = c.mdAlg ? c.mdAlg.value : 'conservative';
+  document.getElementById('md-help').textContent =
+    mdVal === 'conservative' ? t('render.md.conservativeHelp') : t('render.md.readabilityHelp');
+  const fmt = c.shotFmt ? c.shotFmt.value : 'auto';
+  document.getElementById('shot-help').textContent =
+    { auto: t('render.shot.autoHelp'), png: t('render.shot.pngHelp'), jpg: t('render.shot.jpgHelp') }[fmt];
+}
+
+// done/failed 后配置变化 → 标注「上次结果」；结果保留不清空。
+function refreshStale() {
+  if (wb.phase === 'done' || wb.phase === 'failed') {
+    const drifted = JSON.stringify(buildRenderBody()) !== wb.submittedSig;
+    if (drifted !== wb.stale) {
+      wb.stale = drifted;
+      updateStatusUI();
     }
   }
-  if (wantMd && d.markdown) {
-    // 用 .code-block 包裹（relative 定位），右上角放 copy 按钮，复用现有
-    // .btn-copy 样式（深色背景适配）。按钮用 data-copy-action 标记，
-    // 由 #render-result 上的事件委托统一处理（markdown 区块每次渲染动态生成）。
-    html += `<h4 style="margin:8px 0;font-size:13px">${t('render.mdLabel')}</h4>`;
-    html += `<div class="code-block"><button type="button" class="btn-copy" data-copy-action>${t('mcp.token.copy')}</button><pre>${esc(d.markdown)}</pre></div>`;
-  } else if (wantHtml && d.html) {
-    html += `<h4 style="margin-bottom:8px;font-size:13px">${t('render.htmlPreview')}</h4>`;
-    // 用 srcdoc（内联内容，非网络加载）而非 data: URL：
-    // 1) 不受 CSP frame-src 约束，后端 frame-src 可保持最严格的 'none'；
-    // 2) data: URL 有长度上限/编码膨胀，srcdoc 直接内联原始字节，支持任意大小；
-    // 3) attrEsc 只转义属性值里的引号和尖括号，保证能正确闭合 srcdoc="..."，
-    //    iframe 内部文档结构（含 <!DOCTYPE html>、<head> 等）原样保留。
-    // sandbox 不开 allow-scripts/allow-forms/allow-top-navigation，
-    // 渲染结果里的脚本/表单/外链跳转一律失效，渲染内容无法触及父页凭据。
-    html += `<iframe srcdoc="${attrEsc(d.html)}" sandbox="allow-same-origin"></iframe>`;
-  }
-  el.innerHTML = html || `<p class="muted">${t('render.noOutput')}</p>`;
 }
+
+function syncSubmitButton() {
+  const btn = document.getElementById('render-submit');
+  const label = document.getElementById('render-submit-label');
+  btn.disabled = wb.phase === 'loading';
+  label.textContent = wb.phase === 'loading' ? t('render.submitting')
+    : (wb.phase === 'done' ? t('render.again') : t('render.run'));
+}
+
+// 结果面板头部状态徽标 + 底部状态栏（全部来自真实响应）。
+function updateStatusUI() {
+  const badge = document.getElementById('render-status-badge');
+  const label = document.getElementById('render-status-label');
+  const footStatus = document.getElementById('render-footer-status');
+  const footMeta = document.getElementById('render-footer-meta');
+  let cls = 'status-badge';
+  let text = t('render.status.idle');
+  let foot = t('render.footer.ready');
+  if (wb.phase === 'loading') {
+    cls += ' loading'; text = t('render.status.loading'); foot = t('render.footer.loading');
+  } else if (wb.phase === 'done') {
+    cls += ' done'; text = t('render.status.done'); foot = t('render.footer.done');
+  } else if (wb.phase === 'failed') {
+    cls += ' error'; text = t('render.status.failed'); foot = t('render.footer.failed');
+  }
+  if (wb.stale) text += ' · ' + t('render.staleTag');
+  badge.className = cls;
+  label.textContent = text;
+  footStatus.textContent = foot;
+  footMeta.innerHTML = buildFooterMeta();
+}
+
+// 底部右侧元信息：task_id / 耗时 / 各输出体积（来自真实响应字段）。
+function buildFooterMeta() {
+  const d = wb.result;
+  if (!d) return `<span>${t('render.footer.waiting')}</span>`;
+  const parts = [];
+  if (d.task_id) parts.push(`<span>${t('render.footer.task', { id: esc(String(d.task_id)) })}</span>`);
+  if (typeof d.elapsed_ms === 'number') parts.push(`<span>${d.elapsed_ms} ms</span>`);
+  if (d.state === 'succeeded') {
+    if (d.html) parts.push(`<span>HTML ${fmtBytes(strBytes(d.html))}</span>`);
+    if (d.markdown) parts.push(`<span>MD ${fmtBytes(strBytes(d.markdown))}</span>`);
+    if (d.has_pdf) parts.push(`<span>PDF ${fmtBytes(d.pdf_bytes)}</span>`);
+    if (d.has_image) parts.push(`<span>${(d.image_format || 'png').toUpperCase()} ${fmtBytes(d.image_bytes)}</span>`);
+    if (d.serp_json) parts.push(`<span>JSON ✓</span>`);
+  }
+  if (wb.stale) parts.push(`<span>${t('render.staleTag')}</span>`);
+  return parts.map(p => `<span>${p}</span>`).join('<span class="metric-dot">·</span>');
+}
+
+// —— 标签可用性：请求配置常开；格式标签 = 当前配置包含 或 上次结果包含 ——
+function tabStates() {
+  const c = readRenderForm();
+  const d = wb.result;
+  const has = {
+    html: !!(d && d.state === 'succeeded' && d.html),
+    markdown: !!(d && d.state === 'succeeded' && d.markdown),
+    pdf: !!(d && d.has_pdf),
+    screenshot: !!(d && d.has_image),
+    extract: !!(d && d.serp_json),
+  };
+  const cfg = {
+    html: c.outputs.includes('html'),
+    markdown: c.outputs.includes('markdown'),
+    pdf: c.outputs.includes('pdf'),
+    screenshot: c.outputs.includes('screenshot'),
+    extract: !!c.extractVal,
+  };
+  return { has, cfg };
+}
+
+function refreshTabs() {
+  const { has, cfg } = tabStates();
+  document.querySelectorAll('#result-tabs .result-tab').forEach(btn => {
+    const type = btn.dataset.tab;
+    if (type === 'request') { btn.disabled = false; return; }
+    if (type === 'extract') {
+      // 有结构化结果或当前配置启用时才出现
+      btn.hidden = !(has.extract || cfg.extract);
+      btn.disabled = !(has.extract || cfg.extract);
+    } else {
+      btn.disabled = !(has[type] || cfg[type]);
+    }
+  });
+  // 当前标签不可用时回退：优先首个可用格式标签，否则请求配置
+  const active = document.getElementById('rtab-' + wb.activeTab);
+  if (!active || active.disabled || active.hidden) {
+    const order = ['html', 'markdown', 'pdf', 'screenshot', 'extract'];
+    const next = order.find(type => {
+      const el = document.getElementById('rtab-' + type);
+      return el && !el.disabled && !el.hidden;
+    });
+    wb.activeTab = next || 'request';
+  }
+}
+
+function switchTab(tab) {
+  const el = document.getElementById('rtab-' + tab);
+  if (!el || el.disabled || el.hidden) return;
+  wb.activeTab = tab;
+  wb.mode = 'source';
+  renderWorkbench();
+}
+
+// —— 主渲染：按状态与标签刷新结果面板 ——
+function renderWorkbench() {
+  refreshTabs();
+  document.querySelectorAll('#result-tabs .result-tab').forEach(btn => {
+    const active = btn.dataset.tab === wb.activeTab;
+    btn.setAttribute('aria-selected', String(active));
+    btn.tabIndex = active ? 0 : -1;
+  });
+  const body = document.getElementById('render-result');
+  body.setAttribute('aria-labelledby', 'rtab-' + wb.activeTab);
+
+  let html = '';
+  if (wb.activeTab === 'request') {
+    html = requestView();
+  } else if (wb.phase === 'idle') {
+    html = emptyView();
+  } else if (wb.phase === 'loading') {
+    html = loadingView();
+  } else if (wb.phase === 'failed') {
+    html = errorView();
+  } else {
+    html = outputView(wb.activeTab);
+  }
+  body.innerHTML = html;
+  bindResultActions();
+}
+
+// 空态：保留结果区结构，中间放克制的引导。
+function emptyView() {
+  return `<div class="empty-state">
+    <div class="empty-illustration" aria-hidden="true"><div class="empty-window"></div><div class="empty-code"><svg class="icon" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5m8-10 5 5-5 5m-3-13-2 16"/></svg></div></div>
+    <h2>${t('render.empty.title')}</h2>
+    <p>${t('render.empty.desc')}</p>
+  </div>`;
+}
+
+function loadingView() {
+  return `<div class="empty-state">
+    <div class="loading-indicator"><span class="spinner"></span></div>
+    <h2>${t('render.loading.title')}</h2>
+    <p>${t('render.loading.desc')}</p>
+  </div>`;
+}
+
+function errorView() {
+  const d = wb.result || {};
+  const lines = [];
+  if (d.error) lines.push(esc(String(d.error)));
+  if (d.final_url && d.final_url !== d.url) lines.push('final_url: ' + esc(String(d.final_url)));
+  if (d.task_id) lines.push('task_id: ' + esc(String(d.task_id)));
+  return `<div class="empty-state error">
+    <div class="empty-illustration" aria-hidden="true"><div class="empty-window"></div><div class="empty-code"><svg class="icon" viewBox="0 0 24 24"><path d="M12 8v5m0 3h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div></div>
+    <h2>${t('render.error.title')}</h2>
+    <p>${d.blocked ? t('render.error.blocked') : t('render.error.desc')}</p>
+    ${lines.length ? `<div class="error-detail">${lines.join('\n')}</div>` : ''}
+  </div>`;
+}
+
+// 各输出格式的「已生成结果」视图。
+function outputView(type) {
+  const d = wb.result || {};
+  const c = readRenderForm();
+
+  if (type === 'html') {
+    if (!d.html) return missingView('html');
+    if (wb.mode === 'preview') {
+      return toolbar('html', 'index.html', false) +
+        `<div class="code-notice">${t('render.preview.notice')}</div>` +
+        // srcdoc 内联 + sandbox 沿用原有安全隔离：渲染结果里的脚本/表单/外链跳转一律失效。
+        `<iframe class="html-frame" id="wb-html-preview" title="HTML preview" sandbox="allow-same-origin"></iframe>`;
+    }
+    return toolbar('html', filenameFor('html'), true) + codeView(d.html, 'html');
+  }
+
+  if (type === 'markdown') {
+    if (!d.markdown) return missingView('markdown');
+    const algNote = d.md_algorithm_used && d.md_algorithm_used !== (c.mdAlg ? c.mdAlg.value : 'conservative')
+      ? t('render.md.fallbackNote', { alg: esc(String(d.md_algorithm_used)) }) : '';
+    if (wb.mode === 'preview') {
+      return toolbar('markdown', filenameFor('md'), false) +
+        (algNote ? `<div class="code-notice">${algNote}</div>` : '') +
+        `<div class="md-preview" id="wb-md-preview">${renderMarkdown(d.markdown, d.url)}</div>`;
+    }
+    return toolbar('markdown', filenameFor('md'), true) +
+      (algNote ? `<div class="code-notice">${algNote}</div>` : '') +
+      codeView(d.markdown, 'markdown');
+  }
+
+  if (type === 'pdf') {
+    if (!d.has_pdf) return missingView('pdf');
+    const url = assetUrl('/pdf/', d.task_id);
+    return toolbar('pdf', 'document.pdf', false, url) +
+      `<div class="code-notice">${t('render.pdf.notice', { bytes: fmtBytes(d.pdf_bytes) })}</div>` +
+      `<iframe class="asset-frame" src="${url}" title="PDF preview"></iframe>`;
+  }
+
+  if (type === 'screenshot') {
+    if (!d.has_image) return missingView('screenshot');
+    const url = assetUrl('/image/', d.task_id);
+    const fmtUpper = (d.image_format || 'png').toUpperCase();
+    const truncated = d.image_truncated
+      ? `<div class="code-notice warn">${t('render.shot.truncated')}</div>` : '';
+    return toolbar('screenshot', 'screenshot.' + ((d.image_format === 'jpeg') ? 'jpg' : 'png'), false, url) +
+      truncated +
+      `<div class="shot-view"><img src="${url}" alt="screenshot (${fmtUpper}, ${fmtBytes(d.image_bytes)})"></div>`;
+  }
+
+  if (type === 'extract') {
+    if (!d.serp_json) return missingView('extract');
+    const sj = d.serp_json;
+    let notice;
+    if (sj.blocked) {
+      notice = `<div class="code-notice warn">${t('render.serp.blocked')} — ${t('render.serp.blockedDesc')}</div>`;
+    } else {
+      const n = (sj.results || []).length;
+      const ads = (sj.meta && sj.meta.ads_filtered) ? t('render.serp.adsFiltered', { n: sj.meta.ads_filtered }) : '';
+      notice = `<div class="code-notice">${t('render.serp.results', { n, ads })}</div>`;
+    }
+    return toolbar('extract', 'search-results.json', true) + notice + codeView(JSON.stringify(sj, null, 2), 'json');
+  }
+
+  return emptyView();
+}
+
+// 请求配置标签：展示当前配置将发出的请求体与等价 curl（执行前即可查看）。
+function requestView() {
+  const body = buildRenderBody();
+  const { url } = readRenderForm();
+  const notice = url
+    ? t('render.request.notice')
+    : t('render.request.noUrl');
+  return toolbar('request', 'request-body.json', true) +
+    `<div class="code-notice">${notice}</div>` +
+    codeView(JSON.stringify(body, null, 2), 'json') +
+    `<div class="code-notice" style="border-top:1px solid #eef0f5;border-bottom:0">${t('render.request.curlNote')}</div>` +
+    codeView(buildCurlCommand(body), 'markdown');
+}
+
+// 内容工具栏：文件名 + 源码/预览切换 + 复制 + 下载/打开。
+function toolbar(type, fileName, canCopy, assetUrlHref) {
+  const hasPreview = (type === 'html' || type === 'markdown') && wb.phase === 'done';
+  const canDownload = ['html', 'markdown', 'extract', 'request'].includes(type);
+  const modeToggle = hasPreview
+    ? `<div class="source-mode" role="group" aria-label="view mode">
+         <button type="button" id="wb-mode-source" class="${wb.mode === 'source' ? 'selected' : ''}">${t('render.mode.source')}</button>
+         <button type="button" id="wb-mode-preview" class="${wb.mode === 'preview' ? 'selected' : ''}">${t('render.mode.preview')}</button>
+       </div>`
+    : '';
+  const openBtn = assetUrlHref
+    ? `<button type="button" class="small-icon-btn" id="wb-open" title="${t('render.open')}" aria-label="${t('render.open')}">
+         <svg class="icon" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4 10 14M18 13v6H5V6h6"/></svg></button>`
+    : '';
+  return `<div class="file-toolbar">
+    <span class="file-info">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10zm0 0v7h7"/></svg>
+      <span class="file-name">${esc(fileName)}</span>
+      <span class="file-tag">${type === 'request' ? t('render.tag.current') : t('render.tag.result')}</span>
+    </span>
+    <span class="file-actions">
+      ${modeToggle}
+      ${openBtn}
+      <button type="button" class="small-icon-btn" id="wb-copy" title="${t('common.copy')}" aria-label="${t('common.copy')}" ${canCopy ? '' : 'disabled'}>
+        <svg class="icon" viewBox="0 0 24 24"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
+      </button>
+      <button type="button" class="small-icon-btn" id="wb-download" title="${t('render.download')}" aria-label="${t('render.download')}" ${canDownload ? '' : 'disabled'}>
+        <svg class="icon" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></svg>
+      </button>
+    </span>
+  </div>`;
+}
+
+// 请求了该格式但结果里没有（部分输出失败/为空）。
+function missingView(type) {
+  const names = { html: 'HTML', markdown: 'Markdown', pdf: 'PDF', screenshot: t('render.format.shot'), extract: 'JSON' };
+  return `<div class="empty-state">
+    <div class="empty-illustration" aria-hidden="true"><div class="empty-window"></div><div class="empty-code"><svg class="icon" viewBox="0 0 24 24"><path d="M12 8v5m0 3h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div></div>
+    <h2>${t('render.missing.title', { name: names[type] || type })}</h2>
+    <p>${t('render.missing.desc')}</p>
+  </div>`;
+}
+
+// —— 源码视图：行号 + 轻量语法高亮（token 级转义，不做二次替换）——
+function codeView(text, format) {
+  const lines = String(text).split('\n');
+  const shown = lines.length > RENDER_MAX_LINES;
+  const slice = shown ? lines.slice(0, RENDER_MAX_LINES) : lines;
+  const bodyHtml = slice.map((line, i) =>
+    `<div class="code-line"><span class="line-number" aria-hidden="true">${i + 1}</span><span class="line-text">${highlightLine(line, format)}</span></div>`
+  ).join('');
+  const notice = shown
+    ? `<div class="code-notice">${t('render.code.truncated', { shown: RENDER_MAX_LINES.toLocaleString('en-US'), total: lines.length.toLocaleString('en-US') })}</div>`
+    : '';
+  return notice + `<div class="code-view" data-format="${format}">${bodyHtml}</div>`;
+}
+
+function highlightLine(line, format) {
+  const pattern = format === 'json'
+    ? /"(?:\\.|[^"\\])*"|\b(?:true|false|null|-?\d+(?:\.\d+)?)\b/g
+    : format === 'html'
+      ? /<!--.*?-->|"[^"]*"|<\/?[\w!-]+|\/?>/g
+      : null;
+  if (!pattern) return esc(line);
+  let result = '';
+  let last = 0;
+  for (const m of line.matchAll(pattern)) {
+    result += esc(line.slice(last, m.index));
+    const token = m[0];
+    let cls = '';
+    if (format === 'json') {
+      cls = token.startsWith('"')
+        ? (line.slice(m.index + token.length).trimStart().startsWith(':') ? 'token-key' : 'token-string')
+        : 'token-number';
+    } else {
+      cls = token.startsWith('<!--') ? 'token-comment' : token.startsWith('"') ? 'token-string' : 'token-tag';
+    }
+    result += `<span class="${cls}">${esc(token)}</span>`;
+    last = m.index + token.length;
+  }
+  return result + esc(line.slice(last));
+}
+
+// —— 轻量 Markdown 渲染（阅读视图）——
+// 输入先整体转义，只输出我们自己的标签；链接/图片仅允许 http(s) 与相对路径（按页面 URL 解析）。
+function renderMarkdown(src, pageUrl) {
+  const lines = String(src).replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let i = 0;
+  let para = [];
+
+  const flushPara = () => {
+    if (para.length) { out.push(`<p>${inline(para.join(' '))}</p>`); para = []; }
+  };
+  // 行内：`code`、**bold**、*italic*、[text](url)、![alt](url)、裸 URL
+  function inline(s) {
+    let r = esc(s);
+    r = r.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
+    r = r.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, href) => {
+      const u = safeUrl(href, pageUrl);
+      return u ? `<img src="${u}" alt="${alt}" loading="lazy">` : esc(m);
+    });
+    r = r.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, href) => {
+      const u = safeUrl(href, pageUrl);
+      return u ? `<a href="${u}" target="_blank" rel="noopener noreferrer">${text}</a>` : esc(m);
+    });
+    r = r.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    r = r.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>');
+    r = r.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (m, pre, url) => {
+      const u = safeUrl(url, null);
+      return u ? `${pre}<a href="${u}" target="_blank" rel="noopener noreferrer">${url}</a>` : m;
+    });
+    return r;
+  }
+  function safeUrl(href, base) {
+    try {
+      const u = base ? new URL(href, base) : new URL(href);
+      return /^https?:$/.test(u.protocol) ? u.href : null;
+    } catch (_) { return null; }
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { flushPara(); i++; continue; }
+    // 围栏代码块
+    if (/^```/.test(line)) {
+      flushPara();
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++; // 跳过收尾 ```
+      out.push(`<pre><code>${esc(buf.join('\n'))}</code></pre>`);
+      continue;
+    }
+    // 标题
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flushPara(); const n = h[1].length; out.push(`<h${n}>${inline(h[2])}</h${n}>`); i++; continue; }
+    // 水平线
+    if (/^\s*([-*_])\s*(\1\s*){2,}$/.test(line)) { flushPara(); out.push('<hr>'); i++; continue; }
+    // 引用块
+    if (/^\s*>\s?/.test(line)) {
+      flushPara();
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      out.push(`<blockquote>${inline(buf.join(' '))}</blockquote>`);
+      continue;
+    }
+    // 表格（| a | b | + 分隔行）
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushPara();
+      const parseRow = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map(c => inline(c.trim()));
+      const head = parseRow(lines[i]);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) { rows.push(parseRow(lines[i])); i++; }
+      out.push('<table><thead><tr>' + head.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>' +
+        rows.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('') + '</tbody></table>');
+      continue;
+    }
+    // 无序 / 有序列表
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ul || ol) {
+      flushPara();
+      const tag = ul ? 'ul' : 'ol';
+      const re = ul ? /^\s*[-*+]\s+(.*)$/ : /^\s*\d+[.)]\s+(.*)$/;
+      out.push(`<${tag}>`);
+      while (i < lines.length) {
+        const m = lines[i].match(re);
+        if (!m) break;
+        out.push(`<li>${inline(m[1])}</li>`);
+        i++;
+      }
+      out.push(`</${tag}>`);
+      continue;
+    }
+    // 普通段落行
+    para.push(line.trim());
+    i++;
+  }
+  flushPara();
+  return out.join('\n');
+}
+
+// —— 工具栏动作绑定（每次视图重建后调用）——
+function bindResultActions() {
+  const body = document.getElementById('render-result');
+  const modeSrc = document.getElementById('wb-mode-source');
+  const modePrev = document.getElementById('wb-mode-preview');
+  if (modeSrc) modeSrc.addEventListener('click', () => { wb.mode = 'source'; renderWorkbench(); });
+  if (modePrev) modePrev.addEventListener('click', () => { wb.mode = 'preview'; renderWorkbench(); });
+
+  const iframe = document.getElementById('wb-html-preview');
+  if (iframe && wb.result && wb.result.html) iframe.srcdoc = wb.result.html;
+
+  const copyBtn = document.getElementById('wb-copy');
+  if (copyBtn && !copyBtn.disabled) {
+    copyBtn.addEventListener('click', async () => {
+      const ok = await copyText(currentTabText());
+      toastWorkbench(ok ? t('common.copied') : t('common.copyFail'));
+    });
+  }
+  const dlBtn = document.getElementById('wb-download');
+  if (dlBtn && !dlBtn.disabled) {
+    dlBtn.addEventListener('click', () => downloadCurrentOutput());
+  }
+  const openBtn = document.getElementById('wb-open');
+  if (openBtn && !openBtn.disabled) {
+    const d = wb.result || {};
+    let href = null;
+    if (wb.activeTab === 'pdf' && d.has_pdf) href = assetUrl('/pdf/', d.task_id);
+    if (wb.activeTab === 'screenshot' && d.has_image) href = assetUrl('/image/', d.task_id);
+    openBtn.addEventListener('click', () => { if (href) window.open(href, '_blank', 'noopener'); });
+  }
+}
+
+// 当前标签对应的纯文本（复制用；html/markdown/extract/request 有文本源）。
+function currentTabText() {
+  const d = wb.result || {};
+  if (wb.activeTab === 'request') return JSON.stringify(buildRenderBody(), null, 2);
+  if (wb.phase !== 'done') return '';
+  if (wb.activeTab === 'html') return d.html || '';
+  if (wb.activeTab === 'markdown') return d.markdown || '';
+  if (wb.activeTab === 'extract') return d.serp_json ? JSON.stringify(d.serp_json, null, 2) : '';
+  return '';
+}
+
+// 下载当前输出：文本类走 Blob；PDF / 截图从服务端真实端点拉取。
+async function downloadCurrentOutput() {
+  const d = wb.result || {};
+  const host = safeHostFromUrl(d.url || (readRenderForm().url));
+  try {
+    if (wb.activeTab === 'request') {
+      saveBlob(new Blob([currentTabText()], { type: 'application/json;charset=utf-8' }), 'seimi-request.json');
+    } else if (wb.activeTab === 'extract') {
+      saveBlob(new Blob([currentTabText()], { type: 'application/json;charset=utf-8' }), host + '-search.json');
+    } else if (wb.activeTab === 'html') {
+      saveBlob(new Blob([d.html || ''], { type: 'text/html;charset=utf-8' }), host + '.html');
+    } else if (wb.activeTab === 'markdown') {
+      saveBlob(new Blob([d.markdown || ''], { type: 'text/markdown;charset=utf-8' }), host + '.md');
+    } else if (wb.activeTab === 'pdf' && d.has_pdf) {
+      await downloadFromServer('/pdf/' + d.task_id, host + '-' + d.task_id + '.pdf');
+    } else if (wb.activeTab === 'screenshot' && d.has_image) {
+      const ext = d.image_format === 'jpeg' ? 'jpg' : 'png';
+      await downloadFromServer('/image/' + d.task_id, host + '-' + d.task_id + '.' + ext);
+    }
+    toastWorkbench(t('render.downloadDone'));
+  } catch (e) {
+    toastWorkbench(t('render.downloadFail'));
+  }
+}
+
+async function downloadFromServer(path, filename) {
+  const r = await api(path);
+  if (!r.ok) throw new Error('http ' + r.status);
+  saveBlob(await r.blob(), filename);
+}
+
+function saveBlob(blob, filename) {
+  const a = document.createElement('a');
+  const objectURL = URL.createObjectURL(blob);
+  a.href = objectURL;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectURL), 30000);
+}
+
+// PDF / 截图的浏览器可直开 URL（带 token query，与原实现一致）。
+function assetUrl(prefix, taskId) {
+  const tok = getToken();
+  return prefix + taskId + (tok ? `?token=${encodeURIComponent(tok)}` : '');
+}
+
+function filenameFor(kind) {
+  const host = safeHostFromUrl((wb.result && wb.result.url) || readRenderForm().url);
+  if (kind === 'html') return host + '.html';
+  if (kind === 'md') return host + '.md';
+  return 'output';
+}
+
+function safeHostFromUrl(u) {
+  try { return new URL(u).hostname.replace(/[^a-z0-9.-]/gi, '_') || 'page'; }
+  catch (_) { return 'page'; }
+}
+
+// 轻量 toast（替代 alert 的操作反馈；底部居中，自动消失）。
+let wbToastTimer = null;
+function toastWorkbench(text) {
+  let el = document.getElementById('wb-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'wb-toast';
+    el.className = 'wb-toast';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    document.body.appendChild(el);
+  }
+  clearTimeout(wbToastTimer);
+  el.textContent = text;
+  el.classList.add('show');
+  wbToastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
+// 字节数格式化。
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return v + ' B';
+  if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB';
+  return (v / (1024 * 1024)).toFixed(1) + ' MB';
+}
+// JS 字符串字节数（UTF-16 代理对按 2 字节估，仅用于展示）。
+function strBytes(s) { return String(s).length * 2; }
 
 // ---------- 页签 3：Cookie 状态 ----------
 async function loadCookies() {
@@ -744,26 +1392,6 @@ function bindCopyButtons() {
     });
   });
 }
-// 渲染结果区（markdown 等）的复制按钮：内容每次渲染动态生成，用事件委托
-// 绑定到容器上，无需重绑。按钮结构与代码块 copy 一致，复用 .btn-copy 样式。
-function bindResultCopy() {
-  const container = document.getElementById('render-result');
-  if (!container) return;
-  container.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-copy-action]');
-    if (!btn) return;
-    // 按钮与 <pre> 同处一个 .code-block 内
-    const block = btn.closest('.code-block');
-    const pre = block && block.querySelector('pre');
-    if (!pre) return;
-    const ok = await copyText(pre.textContent);
-    const orig = btn.textContent;
-    btn.textContent = ok ? t('common.copied') : t('common.copyFail');
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
-  });
-}
-
 // ---------- 接口调用示例（带 token 的 curl）----------
 let currentApiTab = 'render';
 function bindApiTabs() {
@@ -898,14 +1526,4 @@ async function copyText(text) {
 }
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-// 仅转义 HTML 属性值：必须先转义 & 和 "（否则可能闭合 srcdoc="..." 注入属性），
-// 再转义 < > 让文档内标签语法保持原样、不被属性解析器吃掉。
-// 不转义单引号（属性用双引号包裹）。
-function attrEsc(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
 }
